@@ -1,0 +1,56 @@
+#include "GaussianSplatCommon.ush"
+
+StructuredBuffer<float4> SplatPositionRadiusBuffer;
+StructuredBuffer<float4> SplatColorBuffer;
+
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+
+uint PointCount;
+float2 ViewSize;
+float ViewProjYScale;
+float4x4 ViewProjectionMatrix;
+
+float4 MainPS(float4 SvPosition : SV_POSITION) : SV_Target0
+{
+    const float2 pixel = SvPosition.xy;
+    const float2 uv = pixel / max(ViewSize, float2(1.0, 1.0));
+    float4 sceneColor = SceneColorTexture.SampleLevel(SceneColorSampler, uv, 0);
+
+    float3 accumRgb = 0;
+    float accumA = 0;
+
+    [loop]
+    for (uint i = 0; i < PointCount; ++i)
+    {
+        float4 posRad = SplatPositionRadiusBuffer[i];
+        float4 clip = mul(float4(posRad.xyz, 1.0), ViewProjectionMatrix);
+        if (clip.w <= 1e-4)
+        {
+            continue;
+        }
+
+        float2 ndc = clip.xy / clip.w;
+        if (abs(ndc.x) > 1.2 || abs(ndc.y) > 1.2)
+        {
+            continue;
+        }
+
+        float2 centerPx = float2(
+            (ndc.x * 0.5 + 0.5) * ViewSize.x,
+            (0.5 - ndc.y * 0.5) * ViewSize.y);
+
+        float radiusPx = max(1.0, posRad.w * ViewProjYScale / clip.w);
+        float2 d = (pixel - centerPx) / radiusPx;
+        float w = exp(-dot(d, d) * 2.0);
+
+        float4 c = SplatColorBuffer[i];
+        float a = saturate(c.a * w);
+        accumRgb += c.rgb * a;
+        accumA += a;
+    }
+
+    accumA = saturate(accumA);
+    float3 outRgb = lerp(sceneColor.rgb, sceneColor.rgb + accumRgb, saturate(accumA));
+    return float4(outRgb, 1.0);
+}

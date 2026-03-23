@@ -1,0 +1,11 @@
+﻿#ifndef GAUSSIAN_SPLAT_COMMON_USH
+#define GAUSSIAN_SPLAT_COMMON_USH
+
+float GaussianWeight(float2 uv, float2 center, float sigma)
+{
+	float2 d = uv - center;
+	float r2 = dot(d, d);
+	return exp(-r2 / max(1e-5, sigma));
+}
+
+#endif

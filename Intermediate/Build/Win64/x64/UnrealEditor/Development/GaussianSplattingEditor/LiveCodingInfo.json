@@ -1,0 +1,19 @@
+{
+	"RemapUnityFiles": 
+	{
+		"Module.GaussianSplattingEditor.cpp.obj": [
+			"GaussianSplatAssetFactory.gen.cpp.obj",
+			"GaussianSplattingEditor.init.gen.cpp.obj",
+			"PerModuleInline.gen.cpp.obj",
+			"GaussianSplatAssetDetails.cpp.obj",
+			"GaussianSplatComponentDetails.cpp.obj",
+			"GaussianSplatAssetFactory.cpp.obj",
+			"GaussianSplatAssetTypeActions.cpp.obj",
+			"GaussianSplattingEditorModule.cpp.obj",
+			"GaussianSplatCutoutTool.cpp.obj",
+			"GaussianSplatEdMode.cpp.obj",
+			"GaussianSplatTransformTool.cpp.obj",
+			"SGaussianSplatEditorPanel.cpp.obj"
+		]
+	}
+}

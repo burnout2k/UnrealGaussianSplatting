@@ -1,0 +1,17 @@
+{
+    "Version": "1.2",
+    "Data": {
+        "Source": "f:\\unreal projects\\test\\plugins\\unrealgaussiansplatting\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\unrealgaussiansplatting\\module.unrealgaussiansplatting.cpp",
+        "ProvidedModule": "",
+        "PCH": "f:\\unreal\\ue-5.5.4\\engine\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\unrealed\\sharedpch.unrealed.cpp20.h.pch",
+        "Includes": [
+            "f:\\unreal projects\\test\\plugins\\unrealgaussiansplatting\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\unrealgaussiansplatting\\definitions.unrealgaussiansplatting.h",
+            "f:\\unreal projects\\test\\plugins\\unrealgaussiansplatting\\intermediate\\build\\win64\\x64\\unrealeditor\\development\\unrealgaussiansplatting\\permoduleinline.gen.cpp",
+            "f:\\unreal\\ue-5.5.4\\engine\\source\\runtime\\core\\public\\hal\\permoduleinline.inl",
+            "f:\\unreal projects\\test\\plugins\\unrealgaussiansplatting\\source\\unrealgaussiansplatting\\private\\unrealgaussiansplatting.cpp",
+            "f:\\unreal projects\\test\\plugins\\unrealgaussiansplatting\\source\\unrealgaussiansplatting\\public\\unrealgaussiansplatting.h"
+        ],
+        "ImportedModules": [],
+        "ImportedHeaderUnits": []
+    }
+}

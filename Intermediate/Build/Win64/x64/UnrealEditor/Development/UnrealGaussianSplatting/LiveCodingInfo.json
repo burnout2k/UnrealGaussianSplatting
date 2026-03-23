@@ -1,0 +1,9 @@
+{
+	"RemapUnityFiles": 
+	{
+		"Module.UnrealGaussianSplatting.cpp.obj": [
+			"PerModuleInline.gen.cpp.obj",
+			"UnrealGaussianSplatting.cpp.obj"
+		]
+	}
+}

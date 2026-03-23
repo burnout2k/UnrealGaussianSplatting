@@ -1,0 +1,6 @@
+#include "GaussianSplatCommon.ush"
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+}
