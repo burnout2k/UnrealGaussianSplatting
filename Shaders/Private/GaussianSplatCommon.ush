@@ -1,11 +1,65 @@
 ﻿#ifndef GAUSSIAN_SPLAT_COMMON_USH
 #define GAUSSIAN_SPLAT_COMMON_USH
 
-float GaussianWeight(float2 uv, float2 center, float sigma)
+float3x3 MakeFloat3x3FromRows(float3 Row0, float3 Row1, float3 Row2)
 {
-	float2 d = uv - center;
-	float r2 = dot(d, d);
-	return exp(-r2 / max(1e-5, sigma));
+    return float3x3(
+        Row0.x, Row0.y, Row0.z,
+        Row1.x, Row1.y, Row1.z,
+        Row2.x, Row2.y, Row2.z);
+}
+
+float3 CalcCovariance2D(
+    float3 WorldPos,
+    float3 Cov3D0,
+    float3 Cov3D1,
+    float4x4 ViewMatrix,
+    float4x4 ProjectionMatrix,
+    float2 ViewSize)
+{
+    float3 viewPos = mul(float4(WorldPos, 1.0), ViewMatrix).xyz;
+
+    float aspect = ProjectionMatrix[0][0] / max(abs(ProjectionMatrix[1][1]), 1e-4);
+    float tanFovX = rcp(max(abs(ProjectionMatrix[0][0]), 1e-4));
+    float tanFovY = rcp(max(abs(ProjectionMatrix[1][1] * aspect), 1e-4));
+    float limX = 1.3 * tanFovX;
+    float limY = 1.3 * tanFovY;
+
+    float safeZ = max(abs(viewPos.z), 1e-4);
+    viewPos.x = clamp(viewPos.x / safeZ, -limX, limX) * safeZ;
+    viewPos.y = clamp(viewPos.y / safeZ, -limY, limY) * safeZ;
+
+    float focal = ViewSize.x * ProjectionMatrix[0][0] * 0.5;
+    float invZ = rcp(safeZ);
+    float invZ2 = invZ * invZ;
+
+    float3x3 J = MakeFloat3x3FromRows(
+        float3(focal * invZ, 0.0, -focal * viewPos.x * invZ2),
+        float3(0.0, focal * invZ, -focal * viewPos.y * invZ2),
+        float3(0.0, 0.0, 0.0));
+
+    float3x3 V = MakeFloat3x3FromRows(
+        float3(Cov3D0.x, Cov3D0.y, Cov3D0.z),
+        float3(Cov3D0.y, Cov3D1.x, Cov3D1.y),
+        float3(Cov3D0.z, Cov3D1.y, Cov3D1.z));
+    float3x3 W = (float3x3)ViewMatrix;
+    float3x3 T = mul(J, W);
+    float3x3 Cov = mul(T, mul(V, transpose(T)));
+
+    Cov[0][0] += 0.3;
+    Cov[1][1] += 0.3;
+    return float3(Cov[0][0], Cov[0][1], Cov[1][1]);
+}
+
+float3 CalcConic(float3 Cov2D)
+{
+    float det = Cov2D.x * Cov2D.z - Cov2D.y * Cov2D.y;
+    return float3(Cov2D.z, -Cov2D.y, Cov2D.x) * rcp(max(det, 1e-8));
+}
+
+float CalcPowerFromConic(float3 Conic, float2 Delta)
+{
+    return -0.5 * (Conic.x * Delta.x * Delta.x + Conic.z * Delta.y * Delta.y) + Conic.y * Delta.x * Delta.y;
 }
 
 #endif

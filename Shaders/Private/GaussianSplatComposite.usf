@@ -1,4 +1,17 @@
-float4 MainPS() : SV_Target0
+#include "/Engine/Public/Platform.ush"
+
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+Texture2D SplatTexture;
+SamplerState SplatSampler;
+
+float2 SceneColorTextureSize;
+
+float4 MainPS(float4 SvPosition : SV_POSITION) : SV_Target0
 {
-    return float4(0.0, 1.0, 0.0, 0.25);
+    const float2 uv = SvPosition.xy / max(SceneColorTextureSize, float2(1.0, 1.0));
+    const float4 sceneColor = SceneColorTexture.SampleLevel(SceneColorSampler, uv, 0);
+    const float4 splatColor = SplatTexture.SampleLevel(SplatSampler, uv, 0);
+    const float3 outRgb = sceneColor.rgb * (1.0 - saturate(splatColor.a)) + splatColor.rgb;
+    return float4(outRgb, 1.0);
 }

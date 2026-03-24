@@ -1,56 +1,188 @@
+#include "/Engine/Public/Platform.ush"
 #include "GaussianSplatCommon.ush"
 
-StructuredBuffer<float4> SplatPositionRadiusBuffer;
+StructuredBuffer<uint> SplatOrderBuffer;
+StructuredBuffer<float4> SplatPositionBuffer;
+StructuredBuffer<float4> SplatCov3D0Buffer;
+StructuredBuffer<float4> SplatCov3D1Buffer;
 StructuredBuffer<float4> SplatColorBuffer;
+StructuredBuffer<float4> SplatWorldToLocalRow0Buffer;
+StructuredBuffer<float4> SplatWorldToLocalRow1Buffer;
+StructuredBuffer<float4> SplatWorldToLocalRow2Buffer;
+StructuredBuffer<float4> SplatSHBuffer;
 
-Texture2D SceneColorTexture;
-SamplerState SceneColorSampler;
-
-uint PointCount;
+float2 ViewRectMin;
 float2 ViewSize;
-float ViewProjYScale;
+float3 ViewWorldOrigin;
+float PreExposure;
+float4x4 ViewMatrix;
+float4x4 ProjectionMatrix;
 float4x4 ViewProjectionMatrix;
 
-float4 MainPS(float4 SvPosition : SV_POSITION) : SV_Target0
+struct VSOutput
 {
-    const float2 pixel = SvPosition.xy;
-    const float2 uv = pixel / max(ViewSize, float2(1.0, 1.0));
-    float4 sceneColor = SceneColorTexture.SampleLevel(SceneColorSampler, uv, 0);
+    float4 Position : SV_POSITION;
+    float2 QuadPos : TEXCOORD0;
+    nointerpolation float4 Color : COLOR0;
+};
 
-    float3 accumRgb = 0;
-    float accumA = 0;
+static const float SH_C1 = 0.4886025;
+static const float SH_C2[5] = { 1.0925484, -1.0925484, 0.3153916, -1.0925484, 0.5462742 };
+static const float SH_C3[7] = { -0.5900436, 2.8906114, -0.4570458, 0.3731763, -0.4570458, 1.4453057, -0.5900436 };
 
-    [loop]
-    for (uint i = 0; i < PointCount; ++i)
+float3 LoadSHCoeff(uint InstanceID, uint CoeffIndex)
+{
+    return SplatSHBuffer[InstanceID * 15 + CoeffIndex].xyz;
+}
+
+float3 WorldDirToLocal(uint InstanceID, float3 WorldDir)
+{
+    return float3(
+        dot(SplatWorldToLocalRow0Buffer[InstanceID].xyz, WorldDir),
+        dot(SplatWorldToLocalRow1Buffer[InstanceID].xyz, WorldDir),
+        dot(SplatWorldToLocalRow2Buffer[InstanceID].xyz, WorldDir));
+}
+
+float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
+{
+    float3 Dir = -normalize(WorldDirToLocal(InstanceID, ViewDirWS));
+    float X = Dir.x;
+    float Y = Dir.y;
+    float Z = Dir.z;
+
+    float3 Result = BaseColor;
+    Result += SH_C1 * (-LoadSHCoeff(InstanceID, 0) * Y + LoadSHCoeff(InstanceID, 1) * Z - LoadSHCoeff(InstanceID, 2) * X);
+
+    float XX = X * X;
+    float YY = Y * Y;
+    float ZZ = Z * Z;
+    float XY = X * Y;
+    float YZ = Y * Z;
+    float XZ = X * Z;
+
+    Result +=
+        (SH_C2[0] * XY) * LoadSHCoeff(InstanceID, 3) +
+        (SH_C2[1] * YZ) * LoadSHCoeff(InstanceID, 4) +
+        (SH_C2[2] * (2.0 * ZZ - XX - YY)) * LoadSHCoeff(InstanceID, 5) +
+        (SH_C2[3] * XZ) * LoadSHCoeff(InstanceID, 6) +
+        (SH_C2[4] * (XX - YY)) * LoadSHCoeff(InstanceID, 7);
+
+    Result +=
+        (SH_C3[0] * Y * (3.0 * XX - YY)) * LoadSHCoeff(InstanceID, 8) +
+        (SH_C3[1] * XY * Z) * LoadSHCoeff(InstanceID, 9) +
+        (SH_C3[2] * Y * (4.0 * ZZ - XX - YY)) * LoadSHCoeff(InstanceID, 10) +
+        (SH_C3[3] * Z * (2.0 * ZZ - 3.0 * XX - 3.0 * YY)) * LoadSHCoeff(InstanceID, 11) +
+        (SH_C3[4] * X * (4.0 * ZZ - XX - YY)) * LoadSHCoeff(InstanceID, 12) +
+        (SH_C3[5] * Z * (XX - YY)) * LoadSHCoeff(InstanceID, 13) +
+        (SH_C3[6] * X * (XX - 3.0 * YY)) * LoadSHCoeff(InstanceID, 14);
+
+    return max(Result, 0.0);
+}
+
+float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
+{
+    float4 Clip = mul(float4(WorldPos, 1.0), ViewProjectionMatrix);
+    SafeClipW = max(abs(Clip.w), 1e-4);
+
+    float2 Ndc = Clip.xy / SafeClipW;
+    return float2(
+        ViewRectMin.x + (Ndc.x * 0.5 + 0.5) * ViewSize.x,
+        ViewRectMin.y + (0.5 - Ndc.y * 0.5) * ViewSize.y);
+}
+
+float2x2 BuildEllipseBasis(float3 Cov2D)
+{
+    float Diag1 = Cov2D.x;
+    float Diag2 = Cov2D.z;
+    float OffDiag = Cov2D.y;
+    float Mid = 0.5 * (Diag1 + Diag2);
+    float Radius = length(float2((Diag1 - Diag2) * 0.5, OffDiag));
+    float Lambda1 = Mid + Radius;
+    float Lambda2 = max(Mid - Radius, 0.1);
+
+    float2 DiagVec = normalize(float2(OffDiag, Lambda1 - Diag1));
+    DiagVec.y = -DiagVec.y;
+
+    float MaxSize = 4096.0;
+    float2 Axis0 = min(sqrt(2.0 * Lambda1), MaxSize) * DiagVec;
+    float2 Axis1 = min(sqrt(2.0 * Lambda2), MaxSize) * float2(DiagVec.y, -DiagVec.x);
+    return float2x2(Axis0, Axis1);
+}
+
+VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
+{
+    VSOutput Output = (VSOutput)0;
+    InstanceID = SplatOrderBuffer[InstanceID];
+
+    float3 CenterWS = SplatPositionBuffer[InstanceID].xyz;
+    float SafeClipW = 0.0;
+    float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW);
+    if (SafeClipW <= 1e-4)
     {
-        float4 posRad = SplatPositionRadiusBuffer[i];
-        float4 clip = mul(float4(posRad.xyz, 1.0), ViewProjectionMatrix);
-        if (clip.w <= 1e-4)
-        {
-            continue;
-        }
-
-        float2 ndc = clip.xy / clip.w;
-        if (abs(ndc.x) > 1.2 || abs(ndc.y) > 1.2)
-        {
-            continue;
-        }
-
-        float2 centerPx = float2(
-            (ndc.x * 0.5 + 0.5) * ViewSize.x,
-            (0.5 - ndc.y * 0.5) * ViewSize.y);
-
-        float radiusPx = max(1.0, posRad.w * ViewProjYScale / clip.w);
-        float2 d = (pixel - centerPx) / radiusPx;
-        float w = exp(-dot(d, d) * 2.0);
-
-        float4 c = SplatColorBuffer[i];
-        float a = saturate(c.a * w);
-        accumRgb += c.rgb * a;
-        accumA += a;
+        Output.Position = asfloat(0x7fc00000);
+        return Output;
     }
 
-    accumA = saturate(accumA);
-    float3 outRgb = lerp(sceneColor.rgb, sceneColor.rgb + accumRgb, saturate(accumA));
-    return float4(outRgb, 1.0);
+    float3 Cov2D = CalcCovariance2D(
+        CenterWS,
+        SplatCov3D0Buffer[InstanceID].xyz,
+        SplatCov3D1Buffer[InstanceID].xyz,
+        ViewMatrix,
+        ProjectionMatrix,
+        ViewSize);
+
+    Cov2D.x = max(Cov2D.x, 1.0);
+    Cov2D.z = max(Cov2D.z, 1.0);
+
+    float Det = Cov2D.x * Cov2D.z - Cov2D.y * Cov2D.y;
+    if (Det <= 1e-6)
+    {
+        Output.Position = asfloat(0x7fc00000);
+        return Output;
+    }
+
+    float2x2 Basis = BuildEllipseBasis(Cov2D);
+
+    float2 QuadPos = float2((VertexID == 1 || VertexID == 3) ? 1.0 : -1.0, (VertexID >= 2) ? 1.0 : -1.0) * 2.0;
+    float2 DeltaPx = Basis[0] * QuadPos.x + Basis[1] * QuadPos.y;
+    float2 PixelPos = CenterPx + DeltaPx;
+
+    float2 BasisExtent = abs(Basis[0]) + abs(Basis[1]);
+    float2 MinPx = CenterPx - BasisExtent;
+    float2 MaxPx = CenterPx + BasisExtent;
+    float2 ViewMin = ViewRectMin;
+    float2 ViewMax = ViewRectMin + ViewSize;
+    if (MaxPx.x < ViewMin.x || MaxPx.y < ViewMin.y || MinPx.x > ViewMax.x || MinPx.y > ViewMax.y)
+    {
+        Output.Position = asfloat(0x7fc00000);
+        return Output;
+    }
+
+    float2 PixelPosInView = PixelPos - ViewRectMin;
+    float2 Ndc = float2(
+        2.0 * PixelPosInView.x / max(ViewSize.x, 1.0) - 1.0,
+        1.0 - 2.0 * PixelPosInView.y / max(ViewSize.y, 1.0));
+    Output.Position = float4(Ndc, 0.0, 1.0);
+    Output.QuadPos = QuadPos;
+    float3 ViewDirWS = normalize(ViewWorldOrigin - CenterWS);
+    float4 BaseColor = SplatColorBuffer[InstanceID];
+    Output.Color = float4(
+        EvaluateSH(
+            BaseColor.rgb,
+            InstanceID,
+            ViewDirWS),
+        BaseColor.a);
+    return Output;
+}
+
+float4 MainPS(VSOutput Input) : SV_Target0
+{
+    float Weight = exp(-dot(Input.QuadPos, Input.QuadPos));
+    float Alpha = saturate(Input.Color.a * Weight);
+    if (Alpha < (1.0 / 255.0))
+    {
+        discard;
+    }
+
+    return float4(Input.Color.rgb * Alpha, Alpha);
 }

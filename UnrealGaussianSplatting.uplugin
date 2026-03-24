@@ -18,7 +18,7 @@
 		{
 			"Name": "GaussianSplattingRuntime",
 			"Type": "Runtime",
-			"LoadingPhase": "Default"
+			"LoadingPhase": "PostConfigInit"
 		},
 		{
 			"Name": "GaussianSplattingEditor",

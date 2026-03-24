@@ -11,6 +11,11 @@ FPrimitiveSceneProxy* UGaussianSplatComponent::CreateSceneProxy()
         return nullptr;
     }
 
+    if (PreviewRenderMode == EGaussianPreviewRenderMode::Billboards)
+    {
+        return nullptr;
+    }
+
     return new FGaussianSplatSceneProxy(this);
 }
 

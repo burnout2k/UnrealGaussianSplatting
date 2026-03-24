@@ -218,6 +218,25 @@ namespace
         return Values.IsValidIndex(Index) ? Values[Index] : DefaultValue;
     }
 
+    void AppendReorderedSH(const TArray<float>& Values, const TArray<int32>& RestIndices, UGaussianSplatAsset& Asset)
+    {
+        float RawSH[45] = {};
+        for (int32 I = 0; I < RestIndices.Num() && I < 45; ++I)
+        {
+            RawSH[I] = ReadValueOr(Values, RestIndices[I], 0.0f);
+        }
+
+        float ReorderedSH[45] = {};
+        for (int32 CoeffIndex = 0; CoeffIndex < 15; ++CoeffIndex)
+        {
+            ReorderedSH[CoeffIndex * 3 + 0] = RawSH[CoeffIndex];
+            ReorderedSH[CoeffIndex * 3 + 1] = RawSH[CoeffIndex + 15];
+            ReorderedSH[CoeffIndex * 3 + 2] = RawSH[CoeffIndex + 30];
+        }
+
+        Asset.SHCoefficients.Append(ReorderedSH, UE_ARRAY_COUNT(ReorderedSH));
+    }
+
     FVector3f BuildScale(const TArray<float>& Values, int32 SX, int32 SY, int32 SZ)
     {
         if (Values.IsValidIndex(SX) && Values.IsValidIndex(SY) && Values.IsValidIndex(SZ))
@@ -246,10 +265,10 @@ namespace
 
     FLinearColor BuildUnityGaussianColor(const TArray<float>& Values, int32 Dc0, int32 Dc1, int32 Dc2, int32 Opacity)
     {
-        const float R = FMath::Clamp(0.5f + SHC0 * ReadValueOr(Values, Dc0, 0.0f), 0.0f, 1.0f);
-        const float G = FMath::Clamp(0.5f + SHC0 * ReadValueOr(Values, Dc1, 0.0f), 0.0f, 1.0f);
-        const float B = FMath::Clamp(0.5f + SHC0 * ReadValueOr(Values, Dc2, 0.0f), 0.0f, 1.0f);
-        const float A = FMath::Clamp(1.0f / (1.0f + FMath::Exp(-ReadValueOr(Values, Opacity, 0.0f))), 0.0f, 1.0f);
+        const float R = 0.5f + SHC0 * ReadValueOr(Values, Dc0, 0.0f);
+        const float G = 0.5f + SHC0 * ReadValueOr(Values, Dc1, 0.0f);
+        const float B = 0.5f + SHC0 * ReadValueOr(Values, Dc2, 0.0f);
+        const float A = 1.0f / (1.0f + FMath::Exp(-ReadValueOr(Values, Opacity, 0.0f)));
         return FLinearColor(R, G, B, A);
     }
 
@@ -285,6 +304,12 @@ namespace
         const int32 Rot3Index = FindPropertyIndex(Header.VertexProperties, TEXT("rot_3"));
         const bool bHasUnityGaussianFields =
             Dc0Index != INDEX_NONE && Dc1Index != INDEX_NONE && Dc2Index != INDEX_NONE && OpacityIndex != INDEX_NONE;
+        TArray<int32> RestIndices;
+        RestIndices.Reserve(45);
+        for (int32 SHIndex = 0; SHIndex < 45; ++SHIndex)
+        {
+            RestIndices.Add(FindPropertyIndex(Header.VertexProperties, *FString::Printf(TEXT("f_rest_%d"), SHIndex)));
+        }
 
         if (XIndex == INDEX_NONE || YIndex == INDEX_NONE || ZIndex == INDEX_NONE)
         {
@@ -321,6 +346,7 @@ namespace
                 ? BuildUnityGaussianColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex)
                 : BuildColor(Values, RIndex, GIndex, BIndex, AIndex);
             Asset.ColorsOpacity.Add(FVector4f(Color.R, Color.G, Color.B, Color.A));
+            AppendReorderedSH(Values, RestIndices, Asset);
         }
 
         Asset.RebuildBounds();
@@ -349,6 +375,12 @@ namespace
         const int32 Rot3Index = FindPropertyIndex(Header.VertexProperties, TEXT("rot_3"));
         const bool bHasUnityGaussianFields =
             Dc0Index != INDEX_NONE && Dc1Index != INDEX_NONE && Dc2Index != INDEX_NONE && OpacityIndex != INDEX_NONE;
+        TArray<int32> RestIndices;
+        RestIndices.Reserve(45);
+        for (int32 SHIndex = 0; SHIndex < 45; ++SHIndex)
+        {
+            RestIndices.Add(FindPropertyIndex(Header.VertexProperties, *FString::Printf(TEXT("f_rest_%d"), SHIndex)));
+        }
 
         if (XIndex == INDEX_NONE || YIndex == INDEX_NONE || ZIndex == INDEX_NONE)
         {
@@ -398,6 +430,7 @@ namespace
                 ? BuildUnityGaussianColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex)
                 : BuildColor(Values, RIndex, GIndex, BIndex, AIndex);
             Asset.ColorsOpacity.Add(FVector4f(Color.R, Color.G, Color.B, Color.A));
+            AppendReorderedSH(Values, RestIndices, Asset);
         }
 
         Asset.RebuildBounds();

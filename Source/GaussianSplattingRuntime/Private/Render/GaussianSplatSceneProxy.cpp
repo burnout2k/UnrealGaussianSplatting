@@ -10,6 +10,8 @@ namespace
     uint32 GGaussianSplatProxyTypeId = 0;
 }
 
+DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatSceneProxy, Log, All);
+
 FGaussianSplatSceneProxy::FGaussianSplatSceneProxy(const UGaussianSplatComponent* InComponent)
     : FPrimitiveSceneProxy(InComponent)
 {
@@ -68,28 +70,44 @@ void FGaussianSplatSceneProxy::GetDynamicMeshElements(const TArray<const FSceneV
 {
     if (Positions.IsEmpty())
     {
+        UE_LOG(LogGaussianSplatSceneProxy, Log, TEXT("GetDynamicMeshElements: Positions are empty for proxy %s."), *GetOwnerName().ToString());
         return;
     }
 
     const float ClampedDensity = FMath::Max(0.001f, DensityScale);
     const int32 SampleStride = FMath::Max(1, FMath::RoundToInt(1.0f / FMath::Min(ClampedDensity, 1.0f)));
 
+    UE_LOG(
+        LogGaussianSplatSceneProxy,
+        Log,
+        TEXT("GetDynamicMeshElements: Proxy=%s Views=%d VisibilityMap=0x%x PointCount=%u SampleStride=%d PreviewMode=%d HasFalloff=%d"),
+        *GetOwnerName().ToString(),
+        Views.Num(),
+        VisibilityMap,
+        PointCount,
+        SampleStride,
+        PreviewRenderMode,
+        GaussianFalloffResource ? 1 : 0);
+
     for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
     {
         if ((VisibilityMap & (1U << ViewIndex)) == 0)
         {
+            UE_LOG(LogGaussianSplatSceneProxy, Log, TEXT("GetDynamicMeshElements: Proxy=%s skipping view %d due to VisibilityMap."), *GetOwnerName().ToString(), ViewIndex);
             continue;
         }
 
         const FSceneView* View = Views[ViewIndex];
         if (!View)
         {
+            UE_LOG(LogGaussianSplatSceneProxy, Warning, TEXT("GetDynamicMeshElements: Proxy=%s has null view at index %d."), *GetOwnerName().ToString(), ViewIndex);
             continue;
         }
 
         FPrimitiveDrawInterface* PDI = Collector.GetPDI(ViewIndex);
         if (!PDI)
         {
+            UE_LOG(LogGaussianSplatSceneProxy, Warning, TEXT("GetDynamicMeshElements: Proxy=%s has null PDI at view %d."), *GetOwnerName().ToString(), ViewIndex);
             continue;
         }
 
@@ -118,6 +136,16 @@ void FGaussianSplatSceneProxy::GetDynamicMeshElements(const TArray<const FSceneV
             Entry.Depth = FVector::DotProduct(WorldPos - ViewOrigin, ViewDirection);
             RenderList.Add(Entry);
         }
+
+        UE_LOG(
+            LogGaussianSplatSceneProxy,
+            Log,
+            TEXT("GetDynamicMeshElements: Proxy=%s view=%d RenderList=%d MaxRenderPoints=%d FrustumCull=%d"),
+            *GetOwnerName().ToString(),
+            ViewIndex,
+            RenderList.Num(),
+            MaxRenderPoints,
+            bFrustumCull ? 1 : 0);
 
         if (bDepthSort)
         {
@@ -158,37 +186,23 @@ void FGaussianSplatSceneProxy::GetDynamicMeshElements(const TArray<const FSceneV
                 const float RadiusPixelsY = B / FMath::Max(0.00001f, WorldPerPixel);
                 const float PixelSizeX = FMath::Clamp(BasePixelSize * RadiusPixelsX, 2.0f, 256.0f);
                 const float PixelSizeY = FMath::Clamp(BasePixelSize * RadiusPixelsY, 2.0f, 256.0f);
-                const float SizeWorldX = FMath::Max(0.001f, PixelSizeX * WorldPerPixel);
-                const float SizeWorldY = FMath::Max(0.001f, PixelSizeY * WorldPerPixel);
-
                 const float RelativeArea = FMath::Clamp((A * B) / (0.02f * 0.02f), 0.1f, 4.0f);
                 FinalColor.A = FMath::Clamp(FinalColor.A / FMath::Sqrt(RelativeArea), 0.0f, 1.0f);
-
-                if (GaussianFalloffResource)
-                {
-                    PDI->DrawSprite(
-                        WorldPos,
-                        SizeWorldX,
-                        SizeWorldY,
-                        GaussianFalloffResource,
-                        FinalColor,
-                        SDPG_World,
-                        0.0f,
-                        1.0f,
-                        0.0f,
-                        1.0f,
-                        SE_BLEND_Translucent);
-                }
-                else
-                {
-                    PDI->DrawPoint(WorldPos, FinalColor, FMath::Max(1.0f, 0.5f * (RadiusPixelsX + RadiusPixelsY) * 0.5f), SDPG_World);
-                }
+                PDI->DrawPoint(WorldPos, FinalColor, FMath::Max(1.0f, 0.5f * (RadiusPixelsX + RadiusPixelsY) * 0.5f), SDPG_World);
             }
             else
             {
                 PDI->DrawPoint(WorldPos, FinalColor, PointSize, SDPG_World);
             }
         }
+
+        UE_LOG(
+            LogGaussianSplatSceneProxy,
+            Log,
+            TEXT("GetDynamicMeshElements: Proxy=%s view=%d finished drawing %d candidates."),
+            *GetOwnerName().ToString(),
+            ViewIndex,
+            RenderList.Num());
     }
 }
 

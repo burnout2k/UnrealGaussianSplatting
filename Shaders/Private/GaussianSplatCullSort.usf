@@ -1,6 +1,66 @@
-#include "GaussianSplatCommon.ush"
+#include "/Engine/Public/Platform.ush"
+
+StructuredBuffer<float4> SplatPositionBuffer;
+RWStructuredBuffer<uint> SplatOrderBufferUAV;
+RWStructuredBuffer<uint> SplatKeyBufferUAV;
+
+uint NumElements;
+uint PaddedNumElements;
+uint SortK;
+uint SortJ;
+uint PassType;
+float3 ViewWorldOrigin;
+float3 ViewForward;
+
+uint EncodeDepthKey(float Depth)
+{
+    return asuint(max(Depth, 0.0));
+}
 
 [numthreads(64, 1, 1)]
 void MainCS(uint3 DTid : SV_DispatchThreadID)
 {
+    uint Index = DTid.x;
+    if (Index >= PaddedNumElements)
+    {
+        return;
+    }
+
+    if (PassType == 0)
+    {
+        if (Index < NumElements)
+        {
+            float3 Pos = SplatPositionBuffer[Index].xyz;
+            float Depth = dot(Pos - ViewWorldOrigin, ViewForward);
+            SplatOrderBufferUAV[Index] = Index;
+            SplatKeyBufferUAV[Index] = EncodeDepthKey(Depth);
+        }
+        else
+        {
+            SplatOrderBufferUAV[Index] = 0;
+            SplatKeyBufferUAV[Index] = 0xffffffff;
+        }
+        return;
+    }
+
+    uint Partner = Index ^ SortJ;
+    if (Partner <= Index || Partner >= PaddedNumElements)
+    {
+        return;
+    }
+
+    uint KeyA = SplatKeyBufferUAV[Index];
+    uint KeyB = SplatKeyBufferUAV[Partner];
+    uint OrderA = SplatOrderBufferUAV[Index];
+    uint OrderB = SplatOrderBufferUAV[Partner];
+
+    bool bAscending = (Index & SortK) == 0;
+    bool bShouldSwap = bAscending ? (KeyA > KeyB) : (KeyA < KeyB);
+    if (bShouldSwap)
+    {
+        SplatKeyBufferUAV[Index] = KeyB;
+        SplatKeyBufferUAV[Partner] = KeyA;
+        SplatOrderBufferUAV[Index] = OrderB;
+        SplatOrderBufferUAV[Partner] = OrderA;
+    }
 }
