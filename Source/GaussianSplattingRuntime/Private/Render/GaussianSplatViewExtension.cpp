@@ -37,7 +37,7 @@ void FGaussianSplatViewExtension::BeginRenderViewFamily(FSceneViewFamily& InView
 
 void FGaussianSplatViewExtension::PreRenderViewFamily_RenderThread(FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily)
 {
-    TArray<FGaussianSplatRenderPoint> LocalPoints;
+    TArray<FGaussianSplatRenderBatch> LocalPoints;
     {
         FReadScopeLock Lock(CachedPointsLock);
         LocalPoints = CachedPoints;
@@ -63,7 +63,7 @@ void FGaussianSplatViewExtension::SubscribeToPostProcessingPass(EPostProcessingP
 
 FScreenPassTexture FGaussianSplatViewExtension::PostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs)
 {
-    TArray<FGaussianSplatRenderPoint> LocalPoints;
+    TArray<FGaussianSplatRenderBatch> LocalPoints;
     {
         FReadScopeLock Lock(CachedPointsLock);
         LocalPoints = CachedPoints;
@@ -97,8 +97,8 @@ FScreenPassTexture FGaussianSplatViewExtension::PostProcessPass_RenderThread(FRD
 
 void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread()
 {
-    TArray<FGaussianSplatRenderPoint> NewPoints;
-    NewPoints.Reserve(65536);
+    TArray<FGaussianSplatRenderBatch> NewPoints;
+    NewPoints.Reserve(64);
 
     int32 TotalComponents = 0;
     int32 RegisteredVisibleComponents = 0;
@@ -177,9 +177,9 @@ void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread()
 
         ++ComponentsWithAssets;
 
-        if (Asset->Positions.IsEmpty())
+        if (Asset->Positions.IsEmpty() || Asset->GetRenderResources() == nullptr || Asset->GetRenderResources()->GetPointCount() == 0)
         {
-            UE_LOG(LogGaussianSplatViewExtension, Log, TEXT("BuildPointSnapshot: Skip %s because Asset has no positions."), *Component->GetPathName());
+            UE_LOG(LogGaussianSplatViewExtension, Log, TEXT("BuildPointSnapshot: Skip %s because Asset render resources are unavailable."), *Component->GetPathName());
             continue;
         }
 
@@ -192,92 +192,32 @@ void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread()
         const FMatrix ComponentToWorldNoScale = FRotationMatrix::Make(LocalToWorld.GetRotation());
         const FMatrix WorldToComponentNoScale = ComponentToWorldNoScale.GetTransposed();
 
-        int32 AddedForComponent = 0;
-        for (int32 Index = 0; Index < Asset->Positions.Num(); Index += Stride)
-        {
-            if (AddedForComponent >= LocalMax)
-            {
-                break;
-            }
+        FGaussianSplatRenderBatch Batch;
+        Batch.Resources = Asset->GetRenderResources();
+        Batch.LocalToWorld = FMatrix44f(LocalToWorld.ToMatrixWithScale());
+        Batch.WorldToLocalRow0 = FVector4f(
+            static_cast<float>(WorldToComponentNoScale.M[0][0]),
+            static_cast<float>(WorldToComponentNoScale.M[0][1]),
+            static_cast<float>(WorldToComponentNoScale.M[0][2]),
+            0.0f);
+        Batch.WorldToLocalRow1 = FVector4f(
+            static_cast<float>(WorldToComponentNoScale.M[1][0]),
+            static_cast<float>(WorldToComponentNoScale.M[1][1]),
+            static_cast<float>(WorldToComponentNoScale.M[1][2]),
+            0.0f);
+        Batch.WorldToLocalRow2 = FVector4f(
+            static_cast<float>(WorldToComponentNoScale.M[2][0]),
+            static_cast<float>(WorldToComponentNoScale.M[2][1]),
+            static_cast<float>(WorldToComponentNoScale.M[2][2]),
+            0.0f);
+        Batch.PointSize = FMath::Clamp(Component->PointSize, 0.1f, 32.0f);
+        Batch.OpacityScale = FMath::Clamp(Component->OpacityScale, 0.0f, 8.0f);
+        Batch.AssetPointCount = static_cast<uint32>(Asset->GetPointCount());
+        Batch.Stride = static_cast<uint32>(Stride);
+        Batch.MaxRenderPoints = static_cast<uint32>(LocalMax);
+        NewPoints.Add(Batch);
 
-            const FVector WorldPos = LocalToWorld.TransformPosition(FVector(Asset->Positions[Index]));
-            const FVector3f Scale = Asset->Scales.IsValidIndex(Index)
-                ? Asset->Scales[Index]
-                : FVector3f(0.02f, 0.02f, 0.02f);
-            const FQuat AssetRotation = Asset->Rotations.IsValidIndex(Index)
-                ? FQuat(Asset->Rotations[Index])
-                : FQuat::Identity;
-
-            const float AxisScale = FMath::Clamp(Component->PointSize, 0.1f, 32.0f) * 0.35f;
-            const FVector Axis0World = LocalToWorld.TransformVector(AssetRotation.RotateVector(FVector(Scale.X * AxisScale, 0.0f, 0.0f)));
-            const FVector Axis1World = LocalToWorld.TransformVector(AssetRotation.RotateVector(FVector(0.0f, Scale.Y * AxisScale, 0.0f)));
-            const FVector Axis2World = LocalToWorld.TransformVector(AssetRotation.RotateVector(FVector(0.0f, 0.0f, Scale.Z * AxisScale)));
-
-            const float Cov00 = static_cast<float>(Axis0World.X * Axis0World.X + Axis1World.X * Axis1World.X + Axis2World.X * Axis2World.X);
-            const float Cov01 = static_cast<float>(Axis0World.X * Axis0World.Y + Axis1World.X * Axis1World.Y + Axis2World.X * Axis2World.Y);
-            const float Cov02 = static_cast<float>(Axis0World.X * Axis0World.Z + Axis1World.X * Axis1World.Z + Axis2World.X * Axis2World.Z);
-            const float Cov11 = static_cast<float>(Axis0World.Y * Axis0World.Y + Axis1World.Y * Axis1World.Y + Axis2World.Y * Axis2World.Y);
-            const float Cov12 = static_cast<float>(Axis0World.Y * Axis0World.Z + Axis1World.Y * Axis1World.Z + Axis2World.Y * Axis2World.Z);
-            const float Cov22 = static_cast<float>(Axis0World.Z * Axis0World.Z + Axis1World.Z * Axis1World.Z + Axis2World.Z * Axis2World.Z);
-
-            FVector4f Color(1.0f, 1.0f, 1.0f, 1.0f);
-            if (Asset->ColorsOpacity.IsValidIndex(Index))
-            {
-                const FVector4f C = Asset->ColorsOpacity[Index];
-                Color = FVector4f(C.X, C.Y, C.Z, FMath::Clamp(C.W * Component->OpacityScale, 0.0f, 1.0f));
-            }
-
-            FGaussianSplatRenderPoint Point;
-            Point.PositionWS = FVector4f(
-                static_cast<float>(WorldPos.X),
-                static_cast<float>(WorldPos.Y),
-                static_cast<float>(WorldPos.Z),
-                1.0f);
-            Point.Cov3D0 = FVector4f(Cov00, Cov01, Cov02, 0.0f);
-            Point.Cov3D1 = FVector4f(Cov11, Cov12, Cov22, 0.0f);
-            Point.Color = Color;
-            Point.WorldToLocalRow0 = FVector4f(
-                static_cast<float>(WorldToComponentNoScale.M[0][0]),
-                static_cast<float>(WorldToComponentNoScale.M[0][1]),
-                static_cast<float>(WorldToComponentNoScale.M[0][2]),
-                0.0f);
-            Point.WorldToLocalRow1 = FVector4f(
-                static_cast<float>(WorldToComponentNoScale.M[1][0]),
-                static_cast<float>(WorldToComponentNoScale.M[1][1]),
-                static_cast<float>(WorldToComponentNoScale.M[1][2]),
-                0.0f);
-            Point.WorldToLocalRow2 = FVector4f(
-                static_cast<float>(WorldToComponentNoScale.M[2][0]),
-                static_cast<float>(WorldToComponentNoScale.M[2][1]),
-                static_cast<float>(WorldToComponentNoScale.M[2][2]),
-                0.0f);
-
-            const int32 SHBase = Index * 45;
-            if (Asset->SHCoefficients.Num() >= SHBase + 45)
-            {
-                auto ReadCoeff = [&](int32 CoeffOffset) -> FVector
-                {
-                    return FVector(
-                        Asset->SHCoefficients[SHBase + CoeffOffset + 0],
-                        Asset->SHCoefficients[SHBase + CoeffOffset + 1],
-                        Asset->SHCoefficients[SHBase + CoeffOffset + 2]);
-                };
-
-                for (int32 SHIndex = 0; SHIndex < 15; ++SHIndex)
-                {
-                    const FVector SHLocal = ReadCoeff(SHIndex * 3);
-                    Point.SHCoefficients[SHIndex] = FVector4f(
-                        static_cast<float>(SHLocal.X),
-                        static_cast<float>(SHLocal.Y),
-                        static_cast<float>(SHLocal.Z),
-                        0.0f);
-                }
-            }
-
-            NewPoints.Add(Point);
-
-            ++AddedForComponent;
-        }
+        const int32 AddedForComponent = FMath::Min(LocalMax, FMath::DivideAndRoundUp(Asset->Positions.Num(), Stride));
 
         UE_LOG(
             LogGaussianSplatViewExtension,

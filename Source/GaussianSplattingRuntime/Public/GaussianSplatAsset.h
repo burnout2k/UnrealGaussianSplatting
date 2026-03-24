@@ -3,6 +3,8 @@
 #include "CoreMinimal.h"
 #include "GaussianSplatAsset.generated.h"
 
+class FGaussianSplatRenderResources;
+
 UCLASS(BlueprintType)
 class GAUSSIANSPLATTINGRUNTIME_API UGaussianSplatAsset : public UObject
 {
@@ -34,4 +36,11 @@ public:
 
     int32 GetPointCount() const;
     void RebuildBounds();
+    const FGaussianSplatRenderResources* GetRenderResources() const;
+
+private:
+    void BuildRenderResources();
+    void ReleaseRenderResources();
+
+    TUniquePtr<FGaussianSplatRenderResources> RenderResources;
 };

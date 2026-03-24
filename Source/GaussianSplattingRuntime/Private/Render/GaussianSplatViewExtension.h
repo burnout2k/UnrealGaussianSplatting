@@ -22,5 +22,5 @@ private:
     FScreenPassTexture PostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs);
 
     FRWLock CachedPointsLock;
-    TArray<FGaussianSplatRenderPoint> CachedPoints;
+    TArray<FGaussianSplatRenderBatch> CachedPoints;
 };

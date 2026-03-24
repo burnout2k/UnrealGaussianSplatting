@@ -3,21 +3,24 @@
 
 StructuredBuffer<uint> SplatOrderBuffer;
 StructuredBuffer<float4> SplatPositionBuffer;
-StructuredBuffer<float4> SplatCov3D0Buffer;
-StructuredBuffer<float4> SplatCov3D1Buffer;
+StructuredBuffer<float4> SplatRotationBuffer;
+StructuredBuffer<float4> SplatScaleBuffer;
 StructuredBuffer<float4> SplatColorBuffer;
-StructuredBuffer<float4> SplatWorldToLocalRow0Buffer;
-StructuredBuffer<float4> SplatWorldToLocalRow1Buffer;
-StructuredBuffer<float4> SplatWorldToLocalRow2Buffer;
 StructuredBuffer<float4> SplatSHBuffer;
 
 float2 ViewRectMin;
 float2 ViewSize;
 float3 ViewWorldOrigin;
-float PreExposure;
+float PointSize;
+float OpacityScale;
+uint Stride;
 float4x4 ViewMatrix;
+float4x4 LocalToWorldMatrix;
 float4x4 ProjectionMatrix;
 float4x4 ViewProjectionMatrix;
+float4 WorldToLocalRow0;
+float4 WorldToLocalRow1;
+float4 WorldToLocalRow2;
 
 struct VSOutput
 {
@@ -38,9 +41,9 @@ float3 LoadSHCoeff(uint InstanceID, uint CoeffIndex)
 float3 WorldDirToLocal(uint InstanceID, float3 WorldDir)
 {
     return float3(
-        dot(SplatWorldToLocalRow0Buffer[InstanceID].xyz, WorldDir),
-        dot(SplatWorldToLocalRow1Buffer[InstanceID].xyz, WorldDir),
-        dot(SplatWorldToLocalRow2Buffer[InstanceID].xyz, WorldDir));
+        dot(WorldToLocalRow0.xyz, WorldDir),
+        dot(WorldToLocalRow1.xyz, WorldDir),
+        dot(WorldToLocalRow2.xyz, WorldDir));
 }
 
 float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
@@ -112,9 +115,9 @@ float2x2 BuildEllipseBasis(float3 Cov2D)
 VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 {
     VSOutput Output = (VSOutput)0;
-    InstanceID = SplatOrderBuffer[InstanceID];
+    InstanceID = SplatOrderBuffer[InstanceID] * max(Stride, 1);
 
-    float3 CenterWS = SplatPositionBuffer[InstanceID].xyz;
+    float3 CenterWS = mul(float4(SplatPositionBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
     float SafeClipW = 0.0;
     float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW);
     if (SafeClipW <= 1e-4)
@@ -123,10 +126,17 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
         return Output;
     }
 
+    float4 Rotation = SplatRotationBuffer[InstanceID];
+    float3 Scale = SplatScaleBuffer[InstanceID].xyz * (PointSize * 0.35);
+    float3x3 RotScale = CalcMatrixFromRotationScale(Rotation, Scale);
+    float3 Cov3D0;
+    float3 Cov3D1;
+    CalcCovariance3D(RotScale, Cov3D0, Cov3D1);
+
     float3 Cov2D = CalcCovariance2D(
         CenterWS,
-        SplatCov3D0Buffer[InstanceID].xyz,
-        SplatCov3D1Buffer[InstanceID].xyz,
+        Cov3D0,
+        Cov3D1,
         ViewMatrix,
         ProjectionMatrix,
         ViewSize);
@@ -171,7 +181,7 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
             BaseColor.rgb,
             InstanceID,
             ViewDirWS),
-        BaseColor.a);
+        saturate(BaseColor.a * OpacityScale));
     return Output;
 }
 

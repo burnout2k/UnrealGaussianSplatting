@@ -6,11 +6,13 @@ RWStructuredBuffer<uint> SplatKeyBufferUAV;
 
 uint NumElements;
 uint PaddedNumElements;
+uint Stride;
 uint SortK;
 uint SortJ;
 uint PassType;
 float3 ViewWorldOrigin;
 float3 ViewForward;
+float4x4 LocalToWorldMatrix;
 
 uint EncodeDepthKey(float Depth)
 {
@@ -30,7 +32,8 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
     {
         if (Index < NumElements)
         {
-            float3 Pos = SplatPositionBuffer[Index].xyz;
+            uint AssetIndex = Index * max(Stride, 1);
+            float3 Pos = mul(float4(SplatPositionBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
             float Depth = dot(Pos - ViewWorldOrigin, ViewForward);
             SplatOrderBufferUAV[Index] = Index;
             SplatKeyBufferUAV[Index] = EncodeDepthKey(Depth);

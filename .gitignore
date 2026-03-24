@@ -1,0 +1,19 @@
+Binaries/
+Intermediate/
+Docs/
+
+# Common local artifacts
+Saved/
+DerivedDataCache/
+
+# IDE / tool noise
+.vs/
+*.VC.db
+*.opensdf
+*.sdf
+*.suo
+*.user
+*.userprefs
+
+# Local debug captures
+*.png

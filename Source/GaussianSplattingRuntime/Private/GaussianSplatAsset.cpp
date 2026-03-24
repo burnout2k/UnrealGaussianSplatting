@@ -1,5 +1,7 @@
 #include "GaussianSplatAsset.h"
 
+#include "Render/GaussianSplatRenderResources.h"
+
 void UGaussianSplatAsset::Serialize(FArchive& Ar)
 {
     Super::Serialize(Ar);
@@ -14,10 +16,12 @@ void UGaussianSplatAsset::PostLoad()
 {
     Super::PostLoad();
     RebuildBounds();
+    BuildRenderResources();
 }
 
 void UGaussianSplatAsset::BeginDestroy()
 {
+    ReleaseRenderResources();
     Super::BeginDestroy();
 }
 
@@ -60,4 +64,28 @@ void UGaussianSplatAsset::RebuildBounds()
     }
 
     Bounds = FBoxSphereBounds(Box);
+}
+
+const FGaussianSplatRenderResources* UGaussianSplatAsset::GetRenderResources() const
+{
+    return RenderResources.Get();
+}
+
+void UGaussianSplatAsset::BuildRenderResources()
+{
+    ReleaseRenderResources();
+
+    RenderResources = MakeUnique<FGaussianSplatRenderResources>();
+    RenderResources->BuildFromAssetData(Positions, Rotations, Scales, ColorsOpacity, SHCoefficients);
+    BeginInitResource(RenderResources.Get());
+}
+
+void UGaussianSplatAsset::ReleaseRenderResources()
+{
+    if (RenderResources)
+    {
+        BeginReleaseResource(RenderResources.Get());
+        FlushRenderingCommands();
+        RenderResources.Reset();
+    }
 }

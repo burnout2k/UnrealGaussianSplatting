@@ -1,6 +1,33 @@
 ﻿#ifndef GAUSSIAN_SPLAT_COMMON_USH
 #define GAUSSIAN_SPLAT_COMMON_USH
 
+float3x3 CalcMatrixFromRotationScale(float4 Rot, float3 Scale)
+{
+    float x = Rot.x;
+    float y = Rot.y;
+    float z = Rot.z;
+    float w = Rot.w;
+
+    float3x3 Ms = float3x3(
+        Scale.x, 0, 0,
+        0, Scale.y, 0,
+        0, 0, Scale.z);
+
+    float3x3 Mr = float3x3(
+        1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y),
+        2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+        2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y));
+
+    return mul(Mr, Ms);
+}
+
+void CalcCovariance3D(float3x3 RotScale, out float3 Cov3D0, out float3 Cov3D1)
+{
+    float3x3 Sigma = mul(RotScale, transpose(RotScale));
+    Cov3D0 = float3(Sigma._m00, Sigma._m01, Sigma._m02);
+    Cov3D1 = float3(Sigma._m11, Sigma._m12, Sigma._m22);
+}
+
 float3x3 MakeFloat3x3FromRows(float3 Row0, float3 Row1, float3 Row2)
 {
     return float3x3(
