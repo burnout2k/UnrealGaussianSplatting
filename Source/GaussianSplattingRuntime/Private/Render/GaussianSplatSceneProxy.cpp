@@ -32,11 +32,20 @@ FGaussianSplatSceneProxy::FGaussianSplatSceneProxy(const UGaussianSplatComponent
     GaussianFalloffResource = InComponent->GaussianFalloffTexture ? InComponent->GaussianFalloffTexture->GetResource() : nullptr;
 
     Positions = Asset->Positions;
+    SplatRotations.SetNum(Positions.Num());
     SplatScales.SetNum(Positions.Num());
     Colors.SetNum(Positions.Num());
 
     for (int32 Index = 0; Index < Positions.Num(); ++Index)
     {
+        FQuat4f Rotation = FQuat4f::Identity;
+        if (Asset->Rotations.IsValidIndex(Index))
+        {
+            Rotation = Asset->Rotations[Index];
+            Rotation.Normalize();
+        }
+        SplatRotations[Index] = Rotation;
+
         FVector3f Scale(0.02f, 0.02f, 0.02f);
         if (Asset->Scales.IsValidIndex(Index))
         {
@@ -189,6 +198,42 @@ void FGaussianSplatSceneProxy::GetDynamicMeshElements(const TArray<const FSceneV
                 const float RelativeArea = FMath::Clamp((A * B) / (0.02f * 0.02f), 0.1f, 4.0f);
                 FinalColor.A = FMath::Clamp(FinalColor.A / FMath::Sqrt(RelativeArea), 0.0f, 1.0f);
                 PDI->DrawPoint(WorldPos, FinalColor, FMath::Max(1.0f, 0.5f * (RadiusPixelsX + RadiusPixelsY) * 0.5f), SDPG_World);
+            }
+            else if (PreviewRenderMode == static_cast<uint8>(EGaussianPreviewRenderMode::Boxes))
+            {
+                const FVector CenterLocal = FVector(Positions[Index]);
+                const FQuat Rotation = SplatRotations.IsValidIndex(Index) ? FQuat(SplatRotations[Index]) : FQuat::Identity;
+                const FVector3f Scale = SplatScales.IsValidIndex(Index) ? SplatScales[Index] : FVector3f(0.02f, 0.02f, 0.02f);
+                const FVector AxisX = Rotation.RotateVector(FVector(Scale.X, 0.0f, 0.0f));
+                const FVector AxisY = Rotation.RotateVector(FVector(0.0f, Scale.Y, 0.0f));
+                const FVector AxisZ = Rotation.RotateVector(FVector(0.0f, 0.0f, Scale.Z));
+
+                FVector Corners[8];
+                Corners[0] = GetLocalToWorld().TransformPosition(CenterLocal - AxisX - AxisY - AxisZ);
+                Corners[1] = GetLocalToWorld().TransformPosition(CenterLocal + AxisX - AxisY - AxisZ);
+                Corners[2] = GetLocalToWorld().TransformPosition(CenterLocal + AxisX + AxisY - AxisZ);
+                Corners[3] = GetLocalToWorld().TransformPosition(CenterLocal - AxisX + AxisY - AxisZ);
+                Corners[4] = GetLocalToWorld().TransformPosition(CenterLocal - AxisX - AxisY + AxisZ);
+                Corners[5] = GetLocalToWorld().TransformPosition(CenterLocal + AxisX - AxisY + AxisZ);
+                Corners[6] = GetLocalToWorld().TransformPosition(CenterLocal + AxisX + AxisY + AxisZ);
+                Corners[7] = GetLocalToWorld().TransformPosition(CenterLocal - AxisX + AxisY + AxisZ);
+
+                constexpr int32 EdgeIndices[12][2] =
+                {
+                    {0, 1}, {1, 2}, {2, 3}, {3, 0},
+                    {4, 5}, {5, 6}, {6, 7}, {7, 4},
+                    {0, 4}, {1, 5}, {2, 6}, {3, 7}
+                };
+
+                for (int32 EdgeIndex = 0; EdgeIndex < UE_ARRAY_COUNT(EdgeIndices); ++EdgeIndex)
+                {
+                    PDI->DrawLine(
+                        Corners[EdgeIndices[EdgeIndex][0]],
+                        Corners[EdgeIndices[EdgeIndex][1]],
+                        FinalColor,
+                        SDPG_World,
+                        0.25f);
+                }
             }
             else
             {

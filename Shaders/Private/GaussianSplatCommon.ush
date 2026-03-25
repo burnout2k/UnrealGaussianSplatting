@@ -45,24 +45,15 @@ float3 CalcCovariance2D(
     float2 ViewSize)
 {
     float3 viewPos = mul(float4(WorldPos, 1.0), ViewMatrix).xyz;
-
-    float aspect = ProjectionMatrix[0][0] / max(abs(ProjectionMatrix[1][1]), 1e-4);
-    float tanFovX = rcp(max(abs(ProjectionMatrix[0][0]), 1e-4));
-    float tanFovY = rcp(max(abs(ProjectionMatrix[1][1] * aspect), 1e-4));
-    float limX = 1.3 * tanFovX;
-    float limY = 1.3 * tanFovY;
-
     float safeZ = max(abs(viewPos.z), 1e-4);
-    viewPos.x = clamp(viewPos.x / safeZ, -limX, limX) * safeZ;
-    viewPos.y = clamp(viewPos.y / safeZ, -limY, limY) * safeZ;
-
-    float focal = ViewSize.x * ProjectionMatrix[0][0] * 0.5;
     float invZ = rcp(safeZ);
     float invZ2 = invZ * invZ;
+    float focalX = abs(ViewSize.x * ProjectionMatrix[0][0] * 0.5);
+    float focalY = abs(ViewSize.y * ProjectionMatrix[1][1] * 0.5);
 
     float3x3 J = MakeFloat3x3FromRows(
-        float3(focal * invZ, 0.0, -focal * viewPos.x * invZ2),
-        float3(0.0, focal * invZ, -focal * viewPos.y * invZ2),
+        float3(focalX * invZ, 0.0, -focalX * viewPos.x * invZ2),
+        float3(0.0, focalY * invZ, -focalY * viewPos.y * invZ2),
         float3(0.0, 0.0, 0.0));
 
     float3x3 V = MakeFloat3x3FromRows(

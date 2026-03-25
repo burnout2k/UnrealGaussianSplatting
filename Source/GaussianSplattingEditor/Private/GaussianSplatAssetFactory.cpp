@@ -3,6 +3,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Containers/StringConv.h"
 #include "GaussianSplatAsset.h"
+#include "Math/Matrix.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
@@ -237,6 +238,13 @@ namespace
         Asset.SHCoefficients.Append(ReorderedSH, UE_ARRAY_COUNT(ReorderedSH));
     }
 
+    struct FImportedGaussian
+    {
+        FVector3f Position = FVector3f::ZeroVector;
+        FQuat4f Rotation = FQuat4f::Identity;
+        FVector3f Scale = FVector3f(0.02f, 0.02f, 0.02f);
+    };
+
     FVector3f BuildScale(const TArray<float>& Values, int32 SX, int32 SY, int32 SZ)
     {
         if (Values.IsValidIndex(SX) && Values.IsValidIndex(SY) && Values.IsValidIndex(SZ))
@@ -261,6 +269,314 @@ namespace
         }
 
         return FQuat4f::Identity;
+    }
+
+    FMatrix44f BuildRotationMatrix(const FQuat4f& Rotation)
+    {
+        const float X = Rotation.X;
+        const float Y = Rotation.Y;
+        const float Z = Rotation.Z;
+        const float W = Rotation.W;
+
+        const float XX = X * X;
+        const float YY = Y * Y;
+        const float ZZ = Z * Z;
+        const float XY = X * Y;
+        const float XZ = X * Z;
+        const float YZ = Y * Z;
+        const float WX = W * X;
+        const float WY = W * Y;
+        const float WZ = W * Z;
+
+        FMatrix44f M = FMatrix44f::Identity;
+        M.M[0][0] = 1.0f - 2.0f * (YY + ZZ);
+        M.M[0][1] = 2.0f * (XY - WZ);
+        M.M[0][2] = 2.0f * (XZ + WY);
+        M.M[1][0] = 2.0f * (XY + WZ);
+        M.M[1][1] = 1.0f - 2.0f * (XX + ZZ);
+        M.M[1][2] = 2.0f * (YZ - WX);
+        M.M[2][0] = 2.0f * (XZ - WY);
+        M.M[2][1] = 2.0f * (YZ + WX);
+        M.M[2][2] = 1.0f - 2.0f * (XX + YY);
+        return M;
+    }
+
+    FMatrix44f Multiply3x3(const FMatrix44f& A, const FMatrix44f& B)
+    {
+        FMatrix44f Result = FMatrix44f::Identity;
+        for (int32 Row = 0; Row < 3; ++Row)
+        {
+            for (int32 Col = 0; Col < 3; ++Col)
+            {
+                float Sum = 0.0f;
+                for (int32 K = 0; K < 3; ++K)
+                {
+                    Sum += A.M[Row][K] * B.M[K][Col];
+                }
+                Result.M[Row][Col] = Sum;
+            }
+        }
+        return Result;
+    }
+
+    FMatrix44f Transpose3x3(const FMatrix44f& M)
+    {
+        FMatrix44f Result = FMatrix44f::Identity;
+        for (int32 Row = 0; Row < 3; ++Row)
+        {
+            for (int32 Col = 0; Col < 3; ++Col)
+            {
+                Result.M[Row][Col] = M.M[Col][Row];
+            }
+        }
+        return Result;
+    }
+
+    FMatrix44f BuildCovariance(const FQuat4f& Rotation, const FVector3f& Scale)
+    {
+        const FMatrix44f RotationMatrix = BuildRotationMatrix(Rotation);
+
+        FMatrix44f ScaleSquared = FMatrix44f::Identity;
+        ScaleSquared.M[0][0] = Scale.X * Scale.X;
+        ScaleSquared.M[1][1] = Scale.Y * Scale.Y;
+        ScaleSquared.M[2][2] = Scale.Z * Scale.Z;
+
+        return Multiply3x3(Multiply3x3(RotationMatrix, ScaleSquared), Transpose3x3(RotationMatrix));
+    }
+
+    FVector3f ApplyColmapToUEPosition(const FVector3f& Position)
+    {
+        return FVector3f(Position.Z, Position.X, -Position.Y);
+    }
+
+    FMatrix44f ApplyColmapToUECovariance(const FMatrix44f& Covariance)
+    {
+        FMatrix44f Transform = FMatrix44f::Identity;
+        Transform.M[0][0] = 0.0f;
+        Transform.M[0][1] = 0.0f;
+        Transform.M[0][2] = 1.0f;
+        Transform.M[1][0] = 1.0f;
+        Transform.M[1][1] = 0.0f;
+        Transform.M[1][2] = 0.0f;
+        Transform.M[2][0] = 0.0f;
+        Transform.M[2][1] = -1.0f;
+        Transform.M[2][2] = 0.0f;
+
+        return Multiply3x3(Multiply3x3(Transform, Covariance), Transpose3x3(Transform));
+    }
+
+    void JacobiDiagonalizeSymmetric3x3(const FMatrix44f& Input, FMatrix44f& OutEigenvectors, FVector3f& OutEigenvalues)
+    {
+        FMatrix44f A = Input;
+        OutEigenvectors = FMatrix44f::Identity;
+
+        for (int32 Iteration = 0; Iteration < 12; ++Iteration)
+        {
+            int32 P = 0;
+            int32 Q = 1;
+            float MaxOffDiag = FMath::Abs(A.M[0][1]);
+
+            auto ConsiderPair = [&](int32 Row, int32 Col)
+            {
+                const float Value = FMath::Abs(A.M[Row][Col]);
+                if (Value > MaxOffDiag)
+                {
+                    MaxOffDiag = Value;
+                    P = Row;
+                    Q = Col;
+                }
+            };
+
+            ConsiderPair(0, 2);
+            ConsiderPair(1, 2);
+
+            if (MaxOffDiag < 1e-6f)
+            {
+                break;
+            }
+
+            const float App = A.M[P][P];
+            const float Aqq = A.M[Q][Q];
+            const float Apq = A.M[P][Q];
+            const float Tau = (Aqq - App) / (2.0f * Apq);
+            const float T = (Tau >= 0.0f)
+                ? 1.0f / (Tau + FMath::Sqrt(1.0f + Tau * Tau))
+                : -1.0f / (-Tau + FMath::Sqrt(1.0f + Tau * Tau));
+            const float C = 1.0f / FMath::Sqrt(1.0f + T * T);
+            const float S = T * C;
+
+            for (int32 K = 0; K < 3; ++K)
+            {
+                if (K == P || K == Q)
+                {
+                    continue;
+                }
+
+                const float Akp = A.M[K][P];
+                const float Akq = A.M[K][Q];
+                A.M[K][P] = C * Akp - S * Akq;
+                A.M[P][K] = A.M[K][P];
+                A.M[K][Q] = S * Akp + C * Akq;
+                A.M[Q][K] = A.M[K][Q];
+            }
+
+            A.M[P][P] = C * C * App - 2.0f * S * C * Apq + S * S * Aqq;
+            A.M[Q][Q] = S * S * App + 2.0f * S * C * Apq + C * C * Aqq;
+            A.M[P][Q] = 0.0f;
+            A.M[Q][P] = 0.0f;
+
+            for (int32 K = 0; K < 3; ++K)
+            {
+                const float Vip = OutEigenvectors.M[K][P];
+                const float Viq = OutEigenvectors.M[K][Q];
+                OutEigenvectors.M[K][P] = C * Vip - S * Viq;
+                OutEigenvectors.M[K][Q] = S * Vip + C * Viq;
+            }
+        }
+
+        OutEigenvalues = FVector3f(A.M[0][0], A.M[1][1], A.M[2][2]);
+    }
+
+    void SortEigenbasisDescending(FMatrix44f& InOutEigenvectors, FVector3f& InOutEigenvalues)
+    {
+        auto GetComponent = [](const FVector3f& Vector, int32 Index) -> float
+        {
+            switch (Index)
+            {
+            case 0: return Vector.X;
+            case 1: return Vector.Y;
+            default: return Vector.Z;
+            }
+        };
+
+        int32 Order[3] = { 0, 1, 2 };
+        for (int32 I = 0; I < 3; ++I)
+        {
+            for (int32 J = I + 1; J < 3; ++J)
+            {
+                if (GetComponent(InOutEigenvalues, Order[J]) > GetComponent(InOutEigenvalues, Order[I]))
+                {
+                    Swap(Order[I], Order[J]);
+                }
+            }
+        }
+
+        FVector3f SortedValues;
+        SortedValues.X = GetComponent(InOutEigenvalues, Order[0]);
+        SortedValues.Y = GetComponent(InOutEigenvalues, Order[1]);
+        SortedValues.Z = GetComponent(InOutEigenvalues, Order[2]);
+
+        FMatrix44f SortedVectors = FMatrix44f::Identity;
+        for (int32 Col = 0; Col < 3; ++Col)
+        {
+            for (int32 Row = 0; Row < 3; ++Row)
+            {
+                SortedVectors.M[Row][Col] = InOutEigenvectors.M[Row][Order[Col]];
+            }
+        }
+
+        const FVector3f C0(SortedVectors.M[0][0], SortedVectors.M[1][0], SortedVectors.M[2][0]);
+        const FVector3f C1(SortedVectors.M[0][1], SortedVectors.M[1][1], SortedVectors.M[2][1]);
+        const FVector3f C2(SortedVectors.M[0][2], SortedVectors.M[1][2], SortedVectors.M[2][2]);
+        if (FVector3f::DotProduct(FVector3f::CrossProduct(C0, C1), C2) < 0.0f)
+        {
+            for (int32 Row = 0; Row < 3; ++Row)
+            {
+                SortedVectors.M[Row][2] *= -1.0f;
+            }
+        }
+
+        InOutEigenvectors = SortedVectors;
+        InOutEigenvalues = SortedValues;
+    }
+
+    FQuat4f QuaternionFromRotationMatrix(const FMatrix44f& Matrix)
+    {
+        const float Trace = Matrix.M[0][0] + Matrix.M[1][1] + Matrix.M[2][2];
+        float X;
+        float Y;
+        float Z;
+        float W;
+
+        if (Trace > 0.0f)
+        {
+            const float S = FMath::Sqrt(Trace + 1.0f) * 2.0f;
+            W = 0.25f * S;
+            X = (Matrix.M[2][1] - Matrix.M[1][2]) / S;
+            Y = (Matrix.M[0][2] - Matrix.M[2][0]) / S;
+            Z = (Matrix.M[1][0] - Matrix.M[0][1]) / S;
+        }
+        else if (Matrix.M[0][0] > Matrix.M[1][1] && Matrix.M[0][0] > Matrix.M[2][2])
+        {
+            const float S = FMath::Sqrt(1.0f + Matrix.M[0][0] - Matrix.M[1][1] - Matrix.M[2][2]) * 2.0f;
+            W = (Matrix.M[2][1] - Matrix.M[1][2]) / S;
+            X = 0.25f * S;
+            Y = (Matrix.M[0][1] + Matrix.M[1][0]) / S;
+            Z = (Matrix.M[0][2] + Matrix.M[2][0]) / S;
+        }
+        else if (Matrix.M[1][1] > Matrix.M[2][2])
+        {
+            const float S = FMath::Sqrt(1.0f + Matrix.M[1][1] - Matrix.M[0][0] - Matrix.M[2][2]) * 2.0f;
+            W = (Matrix.M[0][2] - Matrix.M[2][0]) / S;
+            X = (Matrix.M[0][1] + Matrix.M[1][0]) / S;
+            Y = 0.25f * S;
+            Z = (Matrix.M[1][2] + Matrix.M[2][1]) / S;
+        }
+        else
+        {
+            const float S = FMath::Sqrt(1.0f + Matrix.M[2][2] - Matrix.M[0][0] - Matrix.M[1][1]) * 2.0f;
+            W = (Matrix.M[1][0] - Matrix.M[0][1]) / S;
+            X = (Matrix.M[0][2] + Matrix.M[2][0]) / S;
+            Y = (Matrix.M[1][2] + Matrix.M[2][1]) / S;
+            Z = 0.25f * S;
+        }
+
+        FQuat4f Result(X, Y, Z, W);
+        Result.Normalize();
+        return Result;
+    }
+
+    FImportedGaussian BuildImportedGaussian(
+        const TArray<float>& Values,
+        int32 XIndex,
+        int32 YIndex,
+        int32 ZIndex,
+        int32 Scale0Index,
+        int32 Scale1Index,
+        int32 Scale2Index,
+        int32 Rot0Index,
+        int32 Rot1Index,
+        int32 Rot2Index,
+        int32 Rot3Index)
+    {
+        FImportedGaussian Result;
+        Result.Position = FVector3f(Values[XIndex], Values[YIndex], Values[ZIndex]);
+        Result.Rotation = BuildRotation(Values, Rot0Index, Rot1Index, Rot2Index, Rot3Index);
+        Result.Scale = BuildScale(Values, Scale0Index, Scale1Index, Scale2Index);
+
+        const bool bHasAnisotropicGaussian =
+            Values.IsValidIndex(Scale0Index) && Values.IsValidIndex(Scale1Index) && Values.IsValidIndex(Scale2Index) &&
+            Values.IsValidIndex(Rot0Index) && Values.IsValidIndex(Rot1Index) && Values.IsValidIndex(Rot2Index) && Values.IsValidIndex(Rot3Index);
+
+        if (!bHasAnisotropicGaussian)
+        {
+            return Result;
+        }
+
+        Result.Position = ApplyColmapToUEPosition(Result.Position);
+
+        const FMatrix44f CovarianceUE = ApplyColmapToUECovariance(BuildCovariance(Result.Rotation, Result.Scale));
+        FMatrix44f Eigenvectors;
+        FVector3f Eigenvalues;
+        JacobiDiagonalizeSymmetric3x3(CovarianceUE, Eigenvectors, Eigenvalues);
+        SortEigenbasisDescending(Eigenvectors, Eigenvalues);
+
+        Result.Scale = FVector3f(
+            FMath::Sqrt(FMath::Max(Eigenvalues.X, 1e-10f)),
+            FMath::Sqrt(FMath::Max(Eigenvalues.Y, 1e-10f)),
+            FMath::Sqrt(FMath::Max(Eigenvalues.Z, 1e-10f)));
+        Result.Rotation = QuaternionFromRotationMatrix(Eigenvectors);
+        return Result;
     }
 
     FLinearColor BuildUnityGaussianColor(const TArray<float>& Values, int32 Dc0, int32 Dc1, int32 Dc2, int32 Opacity)
@@ -338,9 +654,21 @@ namespace
                 Values.Add(FCString::Atof(*Token));
             }
 
-            Asset.Positions.Add(FVector3f(Values[XIndex], Values[YIndex], Values[ZIndex]));
-            Asset.Rotations.Add(BuildRotation(Values, Rot0Index, Rot1Index, Rot2Index, Rot3Index));
-            Asset.Scales.Add(BuildScale(Values, Scale0Index, Scale1Index, Scale2Index));
+            const FImportedGaussian Gaussian = BuildImportedGaussian(
+                Values,
+                XIndex,
+                YIndex,
+                ZIndex,
+                Scale0Index,
+                Scale1Index,
+                Scale2Index,
+                Rot0Index,
+                Rot1Index,
+                Rot2Index,
+                Rot3Index);
+            Asset.Positions.Add(Gaussian.Position);
+            Asset.Rotations.Add(Gaussian.Rotation);
+            Asset.Scales.Add(Gaussian.Scale);
 
             const FLinearColor Color = bHasUnityGaussianFields
                 ? BuildUnityGaussianColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex)
@@ -422,9 +750,21 @@ namespace
                 Cursor += GetTypeSize(Property.Type);
             }
 
-            Asset.Positions.Add(FVector3f(Values[XIndex], Values[YIndex], Values[ZIndex]));
-            Asset.Rotations.Add(BuildRotation(Values, Rot0Index, Rot1Index, Rot2Index, Rot3Index));
-            Asset.Scales.Add(BuildScale(Values, Scale0Index, Scale1Index, Scale2Index));
+            const FImportedGaussian Gaussian = BuildImportedGaussian(
+                Values,
+                XIndex,
+                YIndex,
+                ZIndex,
+                Scale0Index,
+                Scale1Index,
+                Scale2Index,
+                Rot0Index,
+                Rot1Index,
+                Rot2Index,
+                Rot3Index);
+            Asset.Positions.Add(Gaussian.Position);
+            Asset.Rotations.Add(Gaussian.Rotation);
+            Asset.Scales.Add(Gaussian.Scale);
 
             const FLinearColor Color = bHasUnityGaussianFields
                 ? BuildUnityGaussianColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex)

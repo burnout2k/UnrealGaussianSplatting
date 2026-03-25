@@ -35,6 +35,7 @@ private:
     uint8 PreviewRenderMode = 1;
     const FTexture* GaussianFalloffResource = nullptr;
     TArray<FVector3f> Positions;
+    TArray<FQuat4f> SplatRotations;
     TArray<FVector3f> SplatScales;
     TArray<FLinearColor> Colors;
 };
