@@ -1,5 +1,7 @@
 #include "GaussianSplatAsset.h"
 
+#include "EngineUtils.h"
+#include "GaussianSplatComponent.h"
 #include "Render/GaussianSplatRenderResources.h"
 
 void UGaussianSplatAsset::Serialize(FArchive& Ar)
@@ -15,8 +17,7 @@ void UGaussianSplatAsset::Serialize(FArchive& Ar)
 void UGaussianSplatAsset::PostLoad()
 {
     Super::PostLoad();
-    RebuildBounds();
-    BuildRenderResources();
+    RefreshDerivedData();
 }
 
 void UGaussianSplatAsset::BeginDestroy()
@@ -39,6 +40,14 @@ int32 UGaussianSplatAsset::GetPointCount() const
 {
     return Positions.Num();
 }
+
+#if WITH_EDITOR
+void UGaussianSplatAsset::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+    Super::PostEditChangeProperty(PropertyChangedEvent);
+    RefreshDerivedData();
+}
+#endif
 
 void UGaussianSplatAsset::RebuildBounds()
 {
@@ -64,6 +73,27 @@ void UGaussianSplatAsset::RebuildBounds()
     }
 
     Bounds = FBoxSphereBounds(Box);
+}
+
+void UGaussianSplatAsset::RefreshDerivedData()
+{
+    RebuildBounds();
+    BuildRenderResources();
+
+#if WITH_EDITOR
+    for (TObjectIterator<UGaussianSplatComponent> It; It; ++It)
+    {
+        UGaussianSplatComponent* Component = *It;
+        if (!IsValid(Component) || Component->Asset != this)
+        {
+            continue;
+        }
+
+        Component->UpdateBounds();
+        Component->MarkRenderTransformDirty();
+        Component->MarkRenderStateDirty();
+    }
+#endif
 }
 
 const FGaussianSplatRenderResources* UGaussianSplatAsset::GetRenderResources() const

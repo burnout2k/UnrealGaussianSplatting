@@ -33,9 +33,13 @@ public:
     virtual void PostLoad() override;
     virtual void BeginDestroy() override;
     virtual void GetResourceSizeEx(FResourceSizeEx& CumulativeResourceSize) override;
+#if WITH_EDITOR
+    virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
 
     int32 GetPointCount() const;
     void RebuildBounds();
+    void RefreshDerivedData();
     const FGaussianSplatRenderResources* GetRenderResources() const;
 
 private:

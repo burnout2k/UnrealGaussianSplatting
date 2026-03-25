@@ -1,8 +1,12 @@
 #include "/Engine/Public/Platform.ush"
+#include "GaussianSplatCommon.ush"
 
 StructuredBuffer<float4> SplatPositionBuffer;
+StructuredBuffer<float4> SplatRotationBuffer;
+StructuredBuffer<float4> SplatScaleBuffer;
 RWStructuredBuffer<uint> SplatOrderBufferUAV;
 RWStructuredBuffer<uint> SplatKeyBufferUAV;
+RWBuffer<uint> SplatIndirectArgsUAV;
 
 uint NumElements;
 uint PaddedNumElements;
@@ -12,11 +16,97 @@ uint SortJ;
 uint PassType;
 float3 ViewWorldOrigin;
 float3 ViewForward;
+float2 ViewRectMin;
+float2 ViewSize;
+float PointSize;
+float4x4 ViewMatrix;
+float4x4 ProjectionMatrix;
+float4x4 ViewProjectionMatrix;
 float4x4 LocalToWorldMatrix;
 
 uint EncodeDepthKey(float Depth)
 {
     return asuint(max(Depth, 0.0));
+}
+
+float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
+{
+    float4 Clip = mul(float4(WorldPos, 1.0), ViewProjectionMatrix);
+    SafeClipW = max(abs(Clip.w), 1e-4);
+
+    float2 Ndc = Clip.xy / SafeClipW;
+    return float2(
+        ViewRectMin.x + (Ndc.x * 0.5 + 0.5) * ViewSize.x,
+        ViewRectMin.y + (0.5 - Ndc.y * 0.5) * ViewSize.y);
+}
+
+float2x2 BuildEllipseBasis(float3 Cov2D)
+{
+    float Diag1 = Cov2D.x;
+    float Diag2 = Cov2D.z;
+    float OffDiag = Cov2D.y;
+    float Mid = 0.5 * (Diag1 + Diag2);
+    float Radius = length(float2((Diag1 - Diag2) * 0.5, OffDiag));
+    float Lambda1 = Mid + Radius;
+    float Lambda2 = max(Mid - Radius, 0.1);
+
+    float2 DiagVec = normalize(float2(OffDiag, Lambda1 - Diag1));
+    DiagVec.y = -DiagVec.y;
+
+    float MaxSize = 4096.0;
+    float2 Axis0 = min(sqrt(2.0 * Lambda1), MaxSize) * DiagVec;
+    float2 Axis1 = min(sqrt(2.0 * Lambda2), MaxSize) * float2(DiagVec.y, -DiagVec.x);
+    return float2x2(Axis0, Axis1);
+}
+
+bool IsSplatVisible(uint AssetIndex, out float Depth)
+{
+    float3 CenterWS = mul(float4(SplatPositionBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
+    Depth = dot(CenterWS - ViewWorldOrigin, ViewForward);
+    if (Depth <= 0.0)
+    {
+        return false;
+    }
+
+    float SafeClipW = 0.0;
+    float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW);
+    if (SafeClipW <= 1e-4)
+    {
+        return false;
+    }
+
+    float4 Rotation = SplatRotationBuffer[AssetIndex];
+    float3 Scale = SplatScaleBuffer[AssetIndex].xyz * (PointSize * 0.35);
+    float3x3 RotScale = CalcMatrixFromRotationScale(Rotation, Scale);
+    float3 Cov3D0;
+    float3 Cov3D1;
+    CalcCovariance3D(RotScale, Cov3D0, Cov3D1);
+
+    float3 Cov2D = CalcCovariance2D(
+        CenterWS,
+        Cov3D0,
+        Cov3D1,
+        ViewMatrix,
+        ProjectionMatrix,
+        ViewSize);
+
+    Cov2D.x = max(Cov2D.x, 1.0);
+    Cov2D.z = max(Cov2D.z, 1.0);
+
+    float Det = Cov2D.x * Cov2D.z - Cov2D.y * Cov2D.y;
+    if (Det <= 1e-6)
+    {
+        return false;
+    }
+
+    float2x2 Basis = BuildEllipseBasis(Cov2D);
+    float2 BasisExtent = abs(Basis[0]) + abs(Basis[1]);
+    float2 MinPx = CenterPx - BasisExtent;
+    float2 MaxPx = CenterPx + BasisExtent;
+    float2 ViewMin = ViewRectMin;
+    float2 ViewMax = ViewRectMin + ViewSize;
+
+    return !(MaxPx.x < ViewMin.x || MaxPx.y < ViewMin.y || MinPx.x > ViewMax.x || MinPx.y > ViewMax.y);
 }
 
 [numthreads(64, 1, 1)]
@@ -30,18 +120,25 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
 
     if (PassType == 0)
     {
+        if (Index == 0)
+        {
+            SplatIndirectArgsUAV[0] = 4;
+            SplatIndirectArgsUAV[2] = 0;
+            SplatIndirectArgsUAV[3] = 0;
+        }
+
         if (Index < NumElements)
         {
             uint AssetIndex = Index * max(Stride, 1);
-            float3 Pos = mul(float4(SplatPositionBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
-            float Depth = dot(Pos - ViewWorldOrigin, ViewForward);
-            SplatOrderBufferUAV[Index] = Index;
-            SplatKeyBufferUAV[Index] = EncodeDepthKey(Depth);
-        }
-        else
-        {
-            SplatOrderBufferUAV[Index] = 0;
-            SplatKeyBufferUAV[Index] = 0xffffffff;
+            float Depth = 0.0;
+            bool bVisible = IsSplatVisible(AssetIndex, Depth);
+            if (bVisible)
+            {
+                uint VisibleIndex = 0;
+                InterlockedAdd(SplatIndirectArgsUAV[1], 1, VisibleIndex);
+                SplatOrderBufferUAV[VisibleIndex] = Index;
+                SplatKeyBufferUAV[VisibleIndex] = EncodeDepthKey(Depth);
+            }
         }
         return;
     }

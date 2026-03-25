@@ -8,6 +8,7 @@
 #include "RenderGraphUtils.h"
 #include "RenderGraphResources.h"
 #include "RenderUtils.h"
+#include "RHI.h"
 #include "ScreenPass.h"
 
 namespace GaussianSplatPasses
@@ -73,6 +74,23 @@ namespace GaussianSplatPasses
             FRDGBufferRef KeyBuffer = GraphBuilder.CreateBuffer(
                 FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), PaddedPointCount),
                 TEXT("GaussianSplat.KeyBuffer"));
+            FRDGBufferDesc IndirectArgsDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 4);
+            IndirectArgsDesc.Usage |= BUF_DrawIndirect | BUF_UnorderedAccess;
+            FRDGBufferRef IndirectArgsBuffer = GraphBuilder.CreateBuffer(
+                IndirectArgsDesc,
+                TEXT("GaussianSplat.IndirectArgs"));
+            AddClearUAVPass(
+                GraphBuilder,
+                GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT)),
+                0u);
+            AddClearUAVPass(
+                GraphBuilder,
+                GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT)),
+                0xffffffffu);
+            AddClearUAVPass(
+                GraphBuilder,
+                GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT)),
+                0u);
 
             FGaussianSplatCullSortCS::FParameters* InitSortParameters = GraphBuilder.AllocParameters<FGaussianSplatCullSortCS::FParameters>();
             InitSortParameters->NumElements = RenderPointCount;
@@ -83,10 +101,19 @@ namespace GaussianSplatPasses
             InitSortParameters->PassType = 0;
             InitSortParameters->ViewWorldOrigin = FVector3f(static_cast<FVector3f>(View.ViewMatrices.GetViewOrigin()));
             InitSortParameters->ViewForward = FVector3f(static_cast<FVector3f>(View.GetViewDirection()));
+            InitSortParameters->ViewRectMin = FVector2f(static_cast<float>(ViewRect.Min.X), static_cast<float>(ViewRect.Min.Y));
+            InitSortParameters->ViewSize = FVector2f(static_cast<float>(ViewRect.Width()), static_cast<float>(ViewRect.Height()));
+            InitSortParameters->PointSize = Batch.PointSize;
+            InitSortParameters->ViewMatrix = ViewMatrix;
+            InitSortParameters->ProjectionMatrix = ProjectionMatrix;
+            InitSortParameters->ViewProjectionMatrix = ViewProjection;
             InitSortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
             InitSortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
+            InitSortParameters->SplatRotationBuffer = Resources->GetRotationSRV();
+            InitSortParameters->SplatScaleBuffer = Resources->GetScaleSRV();
             InitSortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
             InitSortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
+            InitSortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
 
             FComputeShaderUtils::AddPass(
                 GraphBuilder,
@@ -108,10 +135,19 @@ namespace GaussianSplatPasses
                     SortParameters->PassType = 1;
                     SortParameters->ViewWorldOrigin = FVector3f::ZeroVector;
                     SortParameters->ViewForward = FVector3f::ForwardVector;
+                    SortParameters->ViewRectMin = FVector2f::ZeroVector;
+                    SortParameters->ViewSize = FVector2f::ZeroVector;
+                    SortParameters->PointSize = 0.0f;
+                    SortParameters->ViewMatrix = FMatrix44f::Identity;
+                    SortParameters->ProjectionMatrix = FMatrix44f::Identity;
+                    SortParameters->ViewProjectionMatrix = FMatrix44f::Identity;
                     SortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
                     SortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
+                    SortParameters->SplatRotationBuffer = Resources->GetRotationSRV();
+                    SortParameters->SplatScaleBuffer = Resources->GetScaleSRV();
                     SortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                     SortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
+                    SortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
 
                     FComputeShaderUtils::AddPass(
                         GraphBuilder,
@@ -142,6 +178,7 @@ namespace GaussianSplatPasses
             RasterParameters->SplatScaleBuffer = Resources->GetScaleSRV();
             RasterParameters->SplatColorBuffer = Resources->GetColorSRV();
             RasterParameters->SplatSHBuffer = Resources->GetSHSRV();
+            RasterParameters->IndirectArgsBuffer = IndirectArgsBuffer;
             RasterParameters->RenderTargets[0] = FRenderTargetBinding(
                 SplatOutput.Texture,
                 bFirstBatch ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad);
@@ -150,7 +187,7 @@ namespace GaussianSplatPasses
                 RDG_EVENT_NAME("GaussianSplatRaster.DrawInstanced"),
                 RasterParameters,
                 ERDGPassFlags::Raster,
-                [RasterParameters, RasterVS, RasterPS, ViewRect, RenderPointCount](FRHICommandList& RHICmdList)
+                [RasterParameters, RasterVS, RasterPS, ViewRect, IndirectArgsBuffer](FRHICommandList& RHICmdList)
                 {
                     RHICmdList.SetViewport(
                         static_cast<float>(ViewRect.Min.X),
@@ -176,7 +213,7 @@ namespace GaussianSplatPasses
                     SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
                     SetShaderParameters(RHICmdList, RasterVS, RasterVS.GetVertexShader(), *RasterParameters);
                     SetShaderParameters(RHICmdList, RasterPS, RasterPS.GetPixelShader(), FGaussianSplatRasterPS::FParameters());
-                    RHICmdList.DrawPrimitive(0, 2, RenderPointCount);
+                    RHICmdList.DrawPrimitiveIndirect(IndirectArgsBuffer->GetIndirectRHICallBuffer(), 0);
                 });
 
             bFirstBatch = false;

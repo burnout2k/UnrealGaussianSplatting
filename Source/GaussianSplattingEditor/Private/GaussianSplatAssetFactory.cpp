@@ -349,7 +349,7 @@ namespace
             AppendReorderedSH(Values, RestIndices, Asset);
         }
 
-        Asset.RebuildBounds();
+        Asset.RefreshDerivedData();
         return true;
     }
 
@@ -433,7 +433,7 @@ namespace
             AppendReorderedSH(Values, RestIndices, Asset);
         }
 
-        Asset.RebuildBounds();
+        Asset.RefreshDerivedData();
         return true;
     }
 }

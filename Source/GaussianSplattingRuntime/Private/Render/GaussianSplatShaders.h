@@ -18,10 +18,19 @@ public:
         SHADER_PARAMETER(uint32, PassType)
         SHADER_PARAMETER(FVector3f, ViewWorldOrigin)
         SHADER_PARAMETER(FVector3f, ViewForward)
+        SHADER_PARAMETER(FVector2f, ViewRectMin)
+        SHADER_PARAMETER(FVector2f, ViewSize)
+        SHADER_PARAMETER(float, PointSize)
+        SHADER_PARAMETER(FMatrix44f, ViewMatrix)
+        SHADER_PARAMETER(FMatrix44f, ProjectionMatrix)
+        SHADER_PARAMETER(FMatrix44f, ViewProjectionMatrix)
         SHADER_PARAMETER(FMatrix44f, LocalToWorldMatrix)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatPositionBuffer)
+        SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatRotationBuffer)
+        SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatScaleBuffer)
         SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, SplatOrderBufferUAV)
         SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, SplatKeyBufferUAV)
+        SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, SplatIndirectArgsUAV)
     END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -51,6 +60,7 @@ public:
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatScaleBuffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatColorBuffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatSHBuffer)
+        RDG_BUFFER_ACCESS(IndirectArgsBuffer, ERHIAccess::IndirectArgs)
         RENDER_TARGET_BINDING_SLOTS()
     END_SHADER_PARAMETER_STRUCT()
 };
