@@ -93,25 +93,6 @@ float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
         ViewRectMin.y + (0.5 - Ndc.y * 0.5) * ViewSize.y);
 }
 
-float2x2 BuildEllipseBasis(float3 Cov2D)
-{
-    float Diag1 = Cov2D.x;
-    float Diag2 = Cov2D.z;
-    float OffDiag = Cov2D.y;
-    float Mid = 0.5 * (Diag1 + Diag2);
-    float Radius = length(float2((Diag1 - Diag2) * 0.5, OffDiag));
-    float Lambda1 = Mid + Radius;
-    float Lambda2 = max(Mid - Radius, 0.1);
-
-    float2 DiagVec = normalize(float2(OffDiag, Lambda1 - Diag1));
-    DiagVec.y = -DiagVec.y;
-
-    float MaxSize = 4096.0;
-    float2 Axis0 = min(sqrt(2.0 * Lambda1), MaxSize) * DiagVec;
-    float2 Axis1 = min(sqrt(2.0 * Lambda2), MaxSize) * float2(DiagVec.y, -DiagVec.x);
-    return float2x2(Axis0, Axis1);
-}
-
 VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 {
     VSOutput Output = (VSOutput)0;
@@ -149,12 +130,14 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
         return Output;
     }
 
-    float2x2 Basis = BuildEllipseBasis(Cov2D);
+    float2 Axis0;
+    float2 Axis1;
+    BuildEllipseAxes(Cov2D, Axis0, Axis1);
     float2 QuadPos = float2((VertexID == 1 || VertexID == 3) ? 1.0 : -1.0, (VertexID >= 2) ? 1.0 : -1.0) * 2.0;
-    float2 DeltaPx = Basis[0] * QuadPos.x + Basis[1] * QuadPos.y;
+    float2 DeltaPx = Axis0 * QuadPos.x + Axis1 * QuadPos.y;
     float2 PixelPos = CenterPx + DeltaPx;
 
-    float2 BasisExtent = abs(Basis[0]) + abs(Basis[1]);
+    float2 BasisExtent = abs(Axis0) + abs(Axis1);
     float2 MinPx = CenterPx - BasisExtent;
     float2 MaxPx = CenterPx + BasisExtent;
     float2 ViewMin = ViewRectMin;

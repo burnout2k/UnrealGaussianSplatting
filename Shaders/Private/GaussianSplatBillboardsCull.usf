@@ -41,25 +41,6 @@ float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
         ViewRectMin.y + (0.5 - Ndc.y * 0.5) * ViewSize.y);
 }
 
-float2x2 BuildEllipseBasis(float3 Cov2D)
-{
-    float Diag1 = Cov2D.x;
-    float Diag2 = Cov2D.z;
-    float OffDiag = Cov2D.y;
-    float Mid = 0.5 * (Diag1 + Diag2);
-    float Radius = length(float2((Diag1 - Diag2) * 0.5, OffDiag));
-    float Lambda1 = Mid + Radius;
-    float Lambda2 = max(Mid - Radius, 0.1);
-
-    float2 DiagVec = normalize(float2(OffDiag, Lambda1 - Diag1));
-    DiagVec.y = -DiagVec.y;
-
-    float MaxSize = 4096.0;
-    float2 Axis0 = min(sqrt(2.0 * Lambda1), MaxSize) * DiagVec;
-    float2 Axis1 = min(sqrt(2.0 * Lambda2), MaxSize) * float2(DiagVec.y, -DiagVec.x);
-    return float2x2(Axis0, Axis1);
-}
-
 bool IsSplatVisible(uint AssetIndex, out float Depth)
 {
     float3 CenterWS = mul(float4(SplatPositionBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
@@ -97,8 +78,10 @@ bool IsSplatVisible(uint AssetIndex, out float Depth)
         return false;
     }
 
-    float2x2 Basis = BuildEllipseBasis(Cov2D);
-    float2 BasisExtent = abs(Basis[0]) + abs(Basis[1]);
+    float2 Axis0;
+    float2 Axis1;
+    BuildEllipseAxes(Cov2D, Axis0, Axis1);
+    float2 BasisExtent = abs(Axis0) + abs(Axis1);
     float2 MinPx = CenterPx - BasisExtent;
     float2 MaxPx = CenterPx + BasisExtent;
     float2 ViewMin = ViewRectMin;

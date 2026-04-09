@@ -33,31 +33,42 @@ float3 CalcCovariance2D(
     float4x4 ProjectionMatrix,
     float2 ViewSize)
 {
-    float3 viewPos = mul(float4(WorldPos, 1.0), ViewMatrix).xyz;
-    float safeZ = max(abs(viewPos.z), 1e-4);
-    float invZ = rcp(safeZ);
-    float invZ2 = invZ * invZ;
-
-    float focalX = abs(ViewSize.x * ProjectionMatrix[0][0] * 0.5);
-    float focalY = abs(ViewSize.y * ProjectionMatrix[1][1] * 0.5);
-
-    float3x3 J = MakeFloat3x3FromRows(
-        float3(focalX * invZ, 0.0, -focalX * viewPos.x * invZ2),
-        float3(0.0, focalY * invZ, -focalY * viewPos.y * invZ2),
-        float3(0.0, 0.0, 0.0));
-
     float3x3 V = MakeFloat3x3FromRows(
         float3(Cov3D0.x, Cov3D0.y, Cov3D0.z),
         float3(Cov3D0.y, Cov3D1.x, Cov3D1.y),
         float3(Cov3D0.z, Cov3D1.y, Cov3D1.z));
 
-    float3x3 W = (float3x3)ViewMatrix;
-    float3x3 T = mul(J, W);
-    float3x3 Cov = mul(T, mul(V, transpose(T)));
+    // Keep the Jacobian in the same row-vector convention used by the rest of
+    // this shader (`mul(float4(Pos, 1), Matrix)`). Porting the original 3DGS
+    // W/J/T formula directly led to a view-dependent ellipse orientation error
+    // because UE/HLSL matrix conventions do not match the CUDA/GLM code path.
+    float4x4 ViewProjectionMatrix = mul(ViewMatrix, ProjectionMatrix);
+    float4 Clip = mul(float4(WorldPos, 1.0), ViewProjectionMatrix);
+    float SafeW = abs(Clip.w) >= 1e-4 ? Clip.w : (Clip.w >= 0.0 ? 1e-4 : -1e-4);
+    float InvW = rcp(SafeW);
+    float InvW2 = InvW * InvW;
 
-    Cov[0][0] += 0.3;
-    Cov[1][1] += 0.3;
-    return float3(Cov[0][0], Cov[0][1], Cov[1][1]);
+    float3 ClipGradX = float3(ViewProjectionMatrix[0][0], ViewProjectionMatrix[1][0], ViewProjectionMatrix[2][0]);
+    float3 ClipGradY = float3(ViewProjectionMatrix[0][1], ViewProjectionMatrix[1][1], ViewProjectionMatrix[2][1]);
+    float3 ClipGradW = float3(ViewProjectionMatrix[0][3], ViewProjectionMatrix[1][3], ViewProjectionMatrix[2][3]);
+
+    // Analytic Jacobian of pixel coordinates with respect to world position.
+    // This matches the numerically validated version but avoids the extra
+    // projection work per splat.
+    float3 JacobianRow0 =
+        0.5 * ViewSize.x *
+        (ClipGradX * SafeW - Clip.x * ClipGradW) * InvW2;
+    float3 JacobianRow1 =
+        -0.5 * ViewSize.y *
+        (ClipGradY * SafeW - Clip.y * ClipGradW) * InvW2;
+
+    float3 CovRow0 = mul(JacobianRow0, V);
+    float3 CovRow1 = mul(JacobianRow1, V);
+
+    float CovXX = dot(CovRow0, JacobianRow0) + 0.3;
+    float CovXY = dot(CovRow0, JacobianRow1);
+    float CovYY = dot(CovRow1, JacobianRow1) + 0.3;
+    return float3(CovXX, CovXY, CovYY);
 }
 
 float3 CalcConic(float3 Cov2D)
@@ -69,6 +80,33 @@ float3 CalcConic(float3 Cov2D)
 float CalcPowerFromConic(float3 Conic, float2 Delta)
 {
     return -0.5 * (Conic.x * Delta.x * Delta.x + Conic.z * Delta.y * Delta.y) + Conic.y * Delta.x * Delta.y;
+}
+
+void BuildEllipseAxes(float3 Cov2D, out float2 Axis0, out float2 Axis1)
+{
+    float Diag1 = Cov2D.x;
+    float Diag2 = Cov2D.z;
+    float OffDiag = Cov2D.y;
+    float Mid = 0.5 * (Diag1 + Diag2);
+    float Radius = length(float2((Diag1 - Diag2) * 0.5, OffDiag));
+    float Lambda1 = max(Mid + Radius, 0.1);
+    float Lambda2 = max(Mid - Radius, 0.1);
+
+    float2 MajorDir;
+    if (abs(OffDiag) > 1e-6 || abs(Lambda1 - Diag1) > 1e-6)
+    {
+        MajorDir = normalize(float2(OffDiag, Lambda1 - Diag1));
+    }
+    else
+    {
+        MajorDir = (Diag1 >= Diag2) ? float2(1.0, 0.0) : float2(0.0, 1.0);
+    }
+
+    float MaxSize = 4096.0;
+    // Return the axes explicitly instead of packing them into a float2x2.
+    // That keeps cull/raster usage identical and avoids row/column ambiguity.
+    Axis0 = min(sqrt(2.0 * Lambda1), MaxSize) * MajorDir;
+    Axis1 = min(sqrt(2.0 * Lambda2), MaxSize) * float2(-MajorDir.y, MajorDir.x);
 }
 
 #endif
