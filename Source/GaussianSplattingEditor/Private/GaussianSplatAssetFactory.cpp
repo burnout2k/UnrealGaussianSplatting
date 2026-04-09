@@ -229,8 +229,7 @@ namespace
     struct FImportedGaussian
     {
         FVector3f Position = FVector3f::ZeroVector;
-        FQuat4f Rotation = FQuat4f::Identity;
-        FVector3f Scale = FVector3f(0.02f, 0.02f, 0.02f);
+        FGaussianCovariance3f Covariance = FGaussianCovariance3f(0.0004f, 0.0f, 0.0f, 0.0004f, 0.0f, 0.0004f);
     };
 
     // 在 3DGS 的参数存储中，缩放向量存储的是对数形式（Log-space），因此这里需要做一次 exp。
@@ -362,178 +361,15 @@ namespace
         return Multiply3x3(Multiply3x3(Transform, Covariance), Transpose3x3(Transform));
     }
 
-    // 对对称 3x3 协方差做 Jacobi 特征分解，取出主轴方向和三个特征值。
-    void JacobiDiagonalizeSymmetric3x3(const FMatrix44f& Input, FMatrix44f& OutEigenvectors, FVector3f& OutEigenvalues)
+    FGaussianCovariance3f PackCovariance(const FMatrix44f& Covariance)
     {
-        FMatrix44f A = Input;
-        OutEigenvectors = FMatrix44f::Identity;
-
-        for (int32 Iteration = 0; Iteration < 12; ++Iteration)
-        {
-            int32 P = 0;
-            int32 Q = 1;
-            float MaxOffDiag = FMath::Abs(A.M[0][1]);
-
-            auto ConsiderPair = [&](int32 Row, int32 Col)
-            {
-                const float Value = FMath::Abs(A.M[Row][Col]);
-                if (Value > MaxOffDiag)
-                {
-                    MaxOffDiag = Value;
-                    P = Row;
-                    Q = Col;
-                }
-            };
-
-            ConsiderPair(0, 2);
-            ConsiderPair(1, 2);
-
-            if (MaxOffDiag < 1e-6f)
-            {
-                break;
-            }
-
-            const float App = A.M[P][P];
-            const float Aqq = A.M[Q][Q];
-            const float Apq = A.M[P][Q];
-            const float Tau = (Aqq - App) / (2.0f * Apq);
-            const float T = (Tau >= 0.0f)
-                ? 1.0f / (Tau + FMath::Sqrt(1.0f + Tau * Tau))
-                : -1.0f / (-Tau + FMath::Sqrt(1.0f + Tau * Tau));
-            const float C = 1.0f / FMath::Sqrt(1.0f + T * T);
-            const float S = T * C;
-
-            for (int32 K = 0; K < 3; ++K)
-            {
-                if (K == P || K == Q)
-                {
-                    continue;
-                }
-
-                const float Akp = A.M[K][P];
-                const float Akq = A.M[K][Q];
-                A.M[K][P] = C * Akp - S * Akq;
-                A.M[P][K] = A.M[K][P];
-                A.M[K][Q] = S * Akp + C * Akq;
-                A.M[Q][K] = A.M[K][Q];
-            }
-
-            A.M[P][P] = C * C * App - 2.0f * S * C * Apq + S * S * Aqq;
-            A.M[Q][Q] = S * S * App + 2.0f * S * C * Apq + C * C * Aqq;
-            A.M[P][Q] = 0.0f;
-            A.M[Q][P] = 0.0f;
-
-            for (int32 K = 0; K < 3; ++K)
-            {
-                const float Vip = OutEigenvectors.M[K][P];
-                const float Viq = OutEigenvectors.M[K][Q];
-                OutEigenvectors.M[K][P] = C * Vip - S * Viq;
-                OutEigenvectors.M[K][Q] = S * Vip + C * Viq;
-            }
-        }
-
-        OutEigenvalues = FVector3f(A.M[0][0], A.M[1][1], A.M[2][2]);
-    }
-
-    // 把特征值按从大到小排序，并保持特征向量构成右手系。
-    void SortEigenbasisDescending(FMatrix44f& InOutEigenvectors, FVector3f& InOutEigenvalues)
-    {
-        auto GetComponent = [](const FVector3f& Vector, int32 Index) -> float
-        {
-            switch (Index)
-            {
-            case 0: return Vector.X;
-            case 1: return Vector.Y;
-            default: return Vector.Z;
-            }
-        };
-
-        int32 Order[3] = { 0, 1, 2 };
-        for (int32 I = 0; I < 3; ++I)
-        {
-            for (int32 J = I + 1; J < 3; ++J)
-            {
-                if (GetComponent(InOutEigenvalues, Order[J]) > GetComponent(InOutEigenvalues, Order[I]))
-                {
-                    Swap(Order[I], Order[J]);
-                }
-            }
-        }
-
-        FVector3f SortedValues;
-        SortedValues.X = GetComponent(InOutEigenvalues, Order[0]);
-        SortedValues.Y = GetComponent(InOutEigenvalues, Order[1]);
-        SortedValues.Z = GetComponent(InOutEigenvalues, Order[2]);
-
-        FMatrix44f SortedVectors = FMatrix44f::Identity;
-        for (int32 Col = 0; Col < 3; ++Col)
-        {
-            for (int32 Row = 0; Row < 3; ++Row)
-            {
-                SortedVectors.M[Row][Col] = InOutEigenvectors.M[Row][Order[Col]];
-            }
-        }
-
-        const FVector3f C0(SortedVectors.M[0][0], SortedVectors.M[1][0], SortedVectors.M[2][0]);
-        const FVector3f C1(SortedVectors.M[0][1], SortedVectors.M[1][1], SortedVectors.M[2][1]);
-        const FVector3f C2(SortedVectors.M[0][2], SortedVectors.M[1][2], SortedVectors.M[2][2]);
-        if (FVector3f::DotProduct(FVector3f::CrossProduct(C0, C1), C2) < 0.0f)
-        {
-            for (int32 Row = 0; Row < 3; ++Row)
-            {
-                SortedVectors.M[Row][2] *= -1.0f;
-            }
-        }
-
-        InOutEigenvectors = SortedVectors;
-        InOutEigenvalues = SortedValues;
-    }
-
-    // 把主轴矩阵重新编码成四元数，便于运行时 shader 复用。
-    FQuat4f QuaternionFromRotationMatrix(const FMatrix44f& Matrix)
-    {
-        const float Trace = Matrix.M[0][0] + Matrix.M[1][1] + Matrix.M[2][2];
-        float X;
-        float Y;
-        float Z;
-        float W;
-
-        if (Trace > 0.0f)
-        {
-            const float S = FMath::Sqrt(Trace + 1.0f) * 2.0f;
-            W = 0.25f * S;
-            X = (Matrix.M[2][1] - Matrix.M[1][2]) / S;
-            Y = (Matrix.M[0][2] - Matrix.M[2][0]) / S;
-            Z = (Matrix.M[1][0] - Matrix.M[0][1]) / S;
-        }
-        else if (Matrix.M[0][0] > Matrix.M[1][1] && Matrix.M[0][0] > Matrix.M[2][2])
-        {
-            const float S = FMath::Sqrt(1.0f + Matrix.M[0][0] - Matrix.M[1][1] - Matrix.M[2][2]) * 2.0f;
-            W = (Matrix.M[2][1] - Matrix.M[1][2]) / S;
-            X = 0.25f * S;
-            Y = (Matrix.M[0][1] + Matrix.M[1][0]) / S;
-            Z = (Matrix.M[0][2] + Matrix.M[2][0]) / S;
-        }
-        else if (Matrix.M[1][1] > Matrix.M[2][2])
-        {
-            const float S = FMath::Sqrt(1.0f + Matrix.M[1][1] - Matrix.M[0][0] - Matrix.M[2][2]) * 2.0f;
-            W = (Matrix.M[0][2] - Matrix.M[2][0]) / S;
-            X = (Matrix.M[0][1] + Matrix.M[1][0]) / S;
-            Y = 0.25f * S;
-            Z = (Matrix.M[1][2] + Matrix.M[2][1]) / S;
-        }
-        else
-        {
-            const float S = FMath::Sqrt(1.0f + Matrix.M[2][2] - Matrix.M[0][0] - Matrix.M[1][1]) * 2.0f;
-            W = (Matrix.M[1][0] - Matrix.M[0][1]) / S;
-            X = (Matrix.M[0][2] + Matrix.M[2][0]) / S;
-            Y = (Matrix.M[1][2] + Matrix.M[2][1]) / S;
-            Z = 0.25f * S;
-        }
-
-        FQuat4f Result(X, Y, Z, W);
-        Result.Normalize();
-        return Result;
+        return FGaussianCovariance3f(
+            Covariance.M[0][0],
+            Covariance.M[0][1],
+            Covariance.M[0][2],
+            Covariance.M[1][1],
+            Covariance.M[1][2],
+            Covariance.M[2][2]);
     }
 
     // 统一构建导入后的高斯：
@@ -554,29 +390,16 @@ namespace
     {
         FImportedGaussian Result;
         Result.Position = ApplyColmapToUEPosition(FVector3f(Values[XIndex], Values[YIndex], Values[ZIndex]));
-        Result.Rotation = BuildRotation(Values, Rot0Index, Rot1Index, Rot2Index, Rot3Index);
-        Result.Scale = BuildScale(Values, Scale0Index, Scale1Index, Scale2Index);
-        const FMatrix44f CovarianceUE = ApplyColmapToUECovariance(BuildCovariance(Result.Rotation, Result.Scale));
+        const FQuat4f Rotation = BuildRotation(Values, Rot0Index, Rot1Index, Rot2Index, Rot3Index);
+        const FVector3f Scale = BuildScale(Values, Scale0Index, Scale1Index, Scale2Index);
+        const FMatrix44f CovarianceUE = ApplyColmapToUECovariance(BuildCovariance(Rotation, Scale));
+        Result.Covariance = PackCovariance(CovarianceUE);
         // 以上的 Position、Covariance 都已经由 Colmap 坐标系转换到了 UE 坐标系。
         // 如果在 Shader 中直接使用协方差矩阵（例如进行 EWA Splatting），不需要单独处理旋转和缩放。
         // SH 系数决定了高斯点的颜色随视角的变化。当旋转了坐标系，SH 的基函数方向也变了。
         // 对于 Level 0 (DC 项)：它是常数，代表基础颜色，不需要旋转。
         // 对于 Level 1 及以上：它们具有方向性。需要旋转。可以在渲染时将“相机观察向量”转换回 COLMAP 空间再去采样 SH，避免复杂的 SH 旋转计算。
-        
-        // 为什么要把协方差矩阵又转回缩放向量和四元数？？？
-        // 如果在代码中直接把 OutEigenvalues 的 x, y, z 塞回 scale_0, 1, 2，
-        // 而没有调整对应的特征向量（旋转矩阵的列），高斯球的方向会直接偏转 90 度或 180 度，导致渲染出来的物体表面全是细碎的毛刺。
-        FMatrix44f Eigenvectors;
-        FVector3f Eigenvalues;
-        JacobiDiagonalizeSymmetric3x3(CovarianceUE, Eigenvectors, Eigenvalues);
-        SortEigenbasisDescending(Eigenvectors, Eigenvalues);
 
-        Result.Scale = FVector3f(
-            FMath::Sqrt(FMath::Max(Eigenvalues.X, 1e-10f)),
-            FMath::Sqrt(FMath::Max(Eigenvalues.Y, 1e-10f)),
-            FMath::Sqrt(FMath::Max(Eigenvalues.Z, 1e-10f)));
-        Result.Rotation = QuaternionFromRotationMatrix(Eigenvectors);
-        
         return Result;
     }
     
@@ -631,8 +454,7 @@ namespace
         }
 
         Asset.Positions.Reset(Header.VertexCount);
-        Asset.Rotations.Reset(Header.VertexCount);
-        Asset.Scales.Reset(Header.VertexCount);
+        Asset.Covariances.Reset(Header.VertexCount);
         Asset.ColorsOpacity.Reset(Header.VertexCount);
         Asset.SHCoefficients.Reset();
 
@@ -666,8 +488,7 @@ namespace
                 Rot2Index,
                 Rot3Index);
             Asset.Positions.Add(Gaussian.Position);
-            Asset.Rotations.Add(Gaussian.Rotation);
-            Asset.Scales.Add(Gaussian.Scale);
+            Asset.Covariances.Add(Gaussian.Covariance);
 
             const FLinearColor Color = BuildColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex);
             Asset.ColorsOpacity.Add(FVector4f(Color.R, Color.G, Color.B, Color.A));
@@ -727,8 +548,7 @@ namespace
         }
 
         Asset.Positions.Reset(Header.VertexCount);
-        Asset.Rotations.Reset(Header.VertexCount);
-        Asset.Scales.Reset(Header.VertexCount);
+        Asset.Covariances.Reset(Header.VertexCount);
         Asset.ColorsOpacity.Reset(Header.VertexCount);
         Asset.SHCoefficients.Reset();
 
@@ -758,8 +578,7 @@ namespace
                 Rot2Index,
                 Rot3Index);
             Asset.Positions.Add(Gaussian.Position);
-            Asset.Rotations.Add(Gaussian.Rotation);
-            Asset.Scales.Add(Gaussian.Scale);
+            Asset.Covariances.Add(Gaussian.Covariance);
 
             const FLinearColor Color = BuildColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex);
             Asset.ColorsOpacity.Add(FVector4f(Color.R, Color.G, Color.B, Color.A));

@@ -19,8 +19,7 @@ namespace GaussianSplatParser
 
         // 当前仅做“重置数据”的占位行为。
         OutAsset.Positions.Reset();
-        OutAsset.Rotations.Reset();
-        OutAsset.Scales.Reset();
+        OutAsset.Covariances.Reset();
         OutAsset.ColorsOpacity.Reset();
         OutAsset.SHCoefficients.Reset();
         OutAsset.RebuildBounds();

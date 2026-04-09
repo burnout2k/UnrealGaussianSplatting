@@ -1,23 +1,13 @@
 #include "/Engine/Public/Platform.ush"
 #include "GaussianSplatCommon.ush"
 
-// 这份 shader 负责真正把排序后的高斯画成屏幕上的 billboard。
-// - MainVS：根据排序后的实例索引恢复真实点，并展开成四边形。
-// - MainPS：对四边形内部像素评估二维高斯权重并输出预乘 alpha。
-//
-// 它对应 C++ 侧的：
-// - FGaussianSplatRasterVS::FParameters
-// - FGaussianSplatRasterPS::FParameters
-
-// OrderBuffer 决定实例绘制顺序，其余 StructuredBuffer 存放资产属性。
 StructuredBuffer<uint> SplatOrderBuffer;
 StructuredBuffer<float4> SplatPositionBuffer;
-StructuredBuffer<float4> SplatRotationBuffer;
-StructuredBuffer<float4> SplatScaleBuffer;
+StructuredBuffer<float4> SplatCovariance0Buffer;
+StructuredBuffer<float4> SplatCovariance1Buffer;
 StructuredBuffer<float4> SplatColorBuffer;
 StructuredBuffer<float4> SplatSHBuffer;
 
-// 当前视图和当前 batch 的常量参数。
 float2 ViewRectMin;
 float2 ViewSize;
 float4 ViewWorldOrigin;
@@ -39,19 +29,15 @@ struct VSOutput
     nointerpolation float4 Color : COLOR0;
 };
 
-// 3 阶球谐基的常数项。
 static const float SH_C1 = 0.4886025;
 static const float SH_C2[5] = { 1.0925484, -1.0925484, 0.3153916, -1.0925484, 0.5462742 };
 static const float SH_C3[7] = { -0.5900436, 2.8906114, -0.4570458, 0.3731763, -0.4570458, 1.4453057, -0.5900436 };
 
-// 每个高斯读取 15 组 float3 SH 系数。
 float3 LoadSHCoeff(uint InstanceID, uint CoeffIndex)
 {
     return SplatSHBuffer[InstanceID * 15 + CoeffIndex].xyz;
 }
 
-// 把世界空间观察方向变回高斯局部空间，再喂给 SH。
-// 这里用的是 C++ 侧预先准备好的旋转逆矩阵三行。
 float3 WorldDirToLocal(uint InstanceID, float3 WorldDir)
 {
     return float3(
@@ -60,7 +46,6 @@ float3 WorldDirToLocal(uint InstanceID, float3 WorldDir)
         dot(WorldToLocalRow2.xyz, WorldDir));
 }
 
-// 根据观察方向评估 3 阶 SH 对基础颜色的调制结果。
 float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
 {
     float3 Dir = -normalize(WorldDirToLocal(InstanceID, ViewDirWS));
@@ -97,7 +82,6 @@ float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
     return max(Result, 0.0);
 }
 
-// 把世界空间位置投影到像素空间。
 float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
 {
     float4 Clip = mul(float4(WorldPos, 1.0), ViewProjectionMatrix);
@@ -109,7 +93,6 @@ float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
         ViewRectMin.y + (0.5 - Ndc.y * 0.5) * ViewSize.y);
 }
 
-// 从二维协方差求屏幕椭圆主轴。
 float2x2 BuildEllipseBasis(float3 Cov2D)
 {
     float Diag1 = Cov2D.x;
@@ -133,7 +116,6 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 {
     VSOutput Output = (VSOutput)0;
 
-    // InstanceID 先按排序结果重映射，再乘 Stride 还原真实资产点索引。
     InstanceID = SplatOrderBuffer[InstanceID] * max(Stride, 1);
 
     float3 CenterWS = mul(float4(SplatPositionBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
@@ -141,18 +123,13 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW);
     if (SafeClipW <= 1e-4)
     {
-        // 输出 NaN 位置，让 GPU 丢弃这个实例对应的顶点。
         Output.Position = asfloat(0x7fc00000);
         return Output;
     }
 
-    // 从 3D 高斯参数恢复屏幕空间 2D 椭圆。
-    float4 Rotation = SplatRotationBuffer[InstanceID];
-    float3 Scale = SplatScaleBuffer[InstanceID].xyz * (PointSize * 0.35);
-    float3x3 RotScale = CalcMatrixFromRotationScale(Rotation, Scale);
     float3 Cov3D0;
     float3 Cov3D1;
-    CalcCovariance3D(RotScale, Cov3D0, Cov3D1);
+    LoadCovariance3D(SplatCovariance0Buffer, SplatCovariance1Buffer, InstanceID, PointSize * 0.35, Cov3D0, Cov3D1);
 
     float3 Cov2D = CalcCovariance2D(
         CenterWS,
@@ -173,13 +150,10 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     }
 
     float2x2 Basis = BuildEllipseBasis(Cov2D);
-
-    // 一个实例展开成 4 顶点的 billboard。
     float2 QuadPos = float2((VertexID == 1 || VertexID == 3) ? 1.0 : -1.0, (VertexID >= 2) ? 1.0 : -1.0) * 2.0;
     float2 DeltaPx = Basis[0] * QuadPos.x + Basis[1] * QuadPos.y;
     float2 PixelPos = CenterPx + DeltaPx;
 
-    // 额外做一次屏幕矩形裁剪，避免落到视口外的实例继续绘制。
     float2 BasisExtent = abs(Basis[0]) + abs(Basis[1]);
     float2 MinPx = CenterPx - BasisExtent;
     float2 MaxPx = CenterPx + BasisExtent;
@@ -191,7 +165,6 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
         return Output;
     }
 
-    // 把像素坐标转换回 NDC，作为最终顶点位置输出。
     float2 PixelPosInView = PixelPos - ViewRectMin;
     float2 Ndc = float2(
         2.0 * PixelPosInView.x / max(ViewSize.x, 1.0) - 1.0,
@@ -199,7 +172,6 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     Output.Position = float4(Ndc, 0.0, 1.0);
     Output.QuadPos = QuadPos;
 
-    // 颜色来自基础颜色 + SH 调制，alpha 来自基础透明度乘全局透明度缩放。
     float3 ViewDirWS = normalize(ViewWorldOrigin.xyz - CenterWS);
     float4 BaseColor = SplatColorBuffer[InstanceID];
     Output.Color = float4(
@@ -213,7 +185,6 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 
 float4 MainPS(VSOutput Input) : SV_Target0
 {
-    // 用 quad 局部坐标直接评估二维高斯核。
     float Weight = exp(-dot(Input.QuadPos, Input.QuadPos));
     float Alpha = saturate(Input.Color.a * Weight);
     if (Alpha < (1.0 / 255.0))
@@ -221,6 +192,5 @@ float4 MainPS(VSOutput Input) : SV_Target0
         discard;
     }
 
-    // 输出预乘 alpha，便于后续透明累积与合成。
     return float4(Input.Color.rgb * Alpha, Alpha);
 }

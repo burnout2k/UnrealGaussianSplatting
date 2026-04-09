@@ -1,0 +1,80 @@
+#include "/Engine/Public/Platform.ush"
+
+StructuredBuffer<uint> SplatOrderBuffer;
+StructuredBuffer<float4> SplatPositionBuffer;
+StructuredBuffer<float4> SplatColorBuffer;
+
+float2 ViewRectMin;
+float2 ViewSize;
+float PointSize;
+float OpacityScale;
+uint Stride;
+float4x4 LocalToWorldMatrix;
+float4x4 ViewProjectionMatrix;
+
+struct VSOutput
+{
+    float4 Position : SV_POSITION;
+    nointerpolation float4 Color : COLOR0;
+};
+
+float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
+{
+    float4 Clip = mul(float4(WorldPos, 1.0), ViewProjectionMatrix);
+    SafeClipW = max(abs(Clip.w), 1e-4);
+
+    float2 Ndc = Clip.xy / SafeClipW;
+    return float2(
+        ViewRectMin.x + (Ndc.x * 0.5 + 0.5) * ViewSize.x,
+        ViewRectMin.y + (0.5 - Ndc.y * 0.5) * ViewSize.y);
+}
+
+VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
+{
+    VSOutput Output = (VSOutput)0;
+
+    InstanceID = SplatOrderBuffer[InstanceID] * max(Stride, 1);
+
+    float3 CenterWS = mul(float4(SplatPositionBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
+    float SafeClipW = 0.0;
+    float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW);
+    if (SafeClipW <= 1e-4)
+    {
+        Output.Position = asfloat(0x7fc00000);
+        return Output;
+    }
+
+    float2 QuadPos = float2((VertexID == 1 || VertexID == 3) ? 1.0 : -1.0, (VertexID >= 2) ? 1.0 : -1.0) * 2.0;
+    float HalfExtent = max(PointSize * 0.5, 0.5);
+    float2 PixelPos = CenterPx + QuadPos * HalfExtent * 0.5;
+
+    float2 MinPx = CenterPx - HalfExtent;
+    float2 MaxPx = CenterPx + HalfExtent;
+    float2 ViewMin = ViewRectMin;
+    float2 ViewMax = ViewRectMin + ViewSize;
+    if (MaxPx.x < ViewMin.x || MaxPx.y < ViewMin.y || MinPx.x > ViewMax.x || MinPx.y > ViewMax.y)
+    {
+        Output.Position = asfloat(0x7fc00000);
+        return Output;
+    }
+
+    float2 PixelPosInView = PixelPos - ViewRectMin;
+    float2 Ndc = float2(
+        2.0 * PixelPosInView.x / max(ViewSize.x, 1.0) - 1.0,
+        1.0 - 2.0 * PixelPosInView.y / max(ViewSize.y, 1.0));
+    Output.Position = float4(Ndc, 0.0, 1.0);
+
+    float4 BaseColor = SplatColorBuffer[InstanceID];
+    Output.Color = float4(BaseColor.rgb, saturate(BaseColor.a * OpacityScale));
+    return Output;
+}
+
+float4 MainPS(VSOutput Input) : SV_Target0
+{
+    if (Input.Color.a < (1.0 / 255.0))
+    {
+        discard;
+    }
+
+    return float4(Input.Color.rgb * Input.Color.a, Input.Color.a);
+}

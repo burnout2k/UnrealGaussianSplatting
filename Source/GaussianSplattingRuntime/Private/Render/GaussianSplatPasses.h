@@ -8,12 +8,19 @@ class FGaussianSplatRenderResources;
 struct FScreenPassRenderTarget;
 struct FScreenPassTexture;
 
+enum class EGaussianSplatRenderMode : uint32
+{
+    Points = 0,
+    Billboards = 1,
+};
+
 // 每个 Batch 对应一个 UGaussianSplatComponent 在当前帧被快照出来的渲染参数。
 // ViewExtension 不直接在渲染线程持有 UObject，
 // 这样渲染线程只依赖快照，不需要跨线程直接访问组件对象。而是把渲染所需的最小只读数据抽成这个 POD 结构。
 struct FGaussianSplatRenderBatch
 {
     const FGaussianSplatRenderResources* Resources = nullptr;
+    EGaussianSplatRenderMode RenderMode = EGaussianSplatRenderMode::Billboards;
     FMatrix44f LocalToWorld = FMatrix44f::Identity;
     FVector4f WorldToLocalRow0 = FVector4f(1, 0, 0, 0);
     FVector4f WorldToLocalRow1 = FVector4f(0, 1, 0, 0);

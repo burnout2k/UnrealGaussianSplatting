@@ -1,0 +1,117 @@
+#include "/Engine/Public/Platform.ush"
+
+StructuredBuffer<float4> SplatPositionBuffer;
+
+RWStructuredBuffer<uint> SplatOrderBufferUAV;
+RWStructuredBuffer<uint> SplatKeyBufferUAV;
+RWBuffer<uint> SplatIndirectArgsUAV;
+
+uint NumElements;
+uint PaddedNumElements;
+uint Stride;
+uint SortK;
+uint SortJ;
+uint PassType;
+float4 ViewWorldOrigin;
+float4 ViewForward;
+float2 ViewRectMin;
+float2 ViewSize;
+float PointSize;
+float4x4 ViewProjectionMatrix;
+float4x4 LocalToWorldMatrix;
+
+uint EncodeDepthKey(float Depth)
+{
+    return asuint(max(Depth, 0.0));
+}
+
+float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
+{
+    float4 Clip = mul(float4(WorldPos, 1.0), ViewProjectionMatrix);
+    SafeClipW = max(abs(Clip.w), 1e-4);
+
+    float2 Ndc = Clip.xy / SafeClipW;
+    return float2(
+        ViewRectMin.x + (Ndc.x * 0.5 + 0.5) * ViewSize.x,
+        ViewRectMin.y + (0.5 - Ndc.y * 0.5) * ViewSize.y);
+}
+
+bool IsSplatVisible(uint AssetIndex, out float Depth)
+{
+    float3 CenterWS = mul(float4(SplatPositionBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
+    Depth = dot(CenterWS - ViewWorldOrigin.xyz, ViewForward.xyz);
+    if (Depth <= 0.0)
+    {
+        return false;
+    }
+
+    float SafeClipW = 0.0;
+    float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW);
+    if (SafeClipW <= 1e-4)
+    {
+        return false;
+    }
+
+    float HalfExtent = max(PointSize * 0.5, 0.5);
+    float2 MinPx = CenterPx - HalfExtent;
+    float2 MaxPx = CenterPx + HalfExtent;
+    float2 ViewMin = ViewRectMin;
+    float2 ViewMax = ViewRectMin + ViewSize;
+    return !(MaxPx.x < ViewMin.x || MaxPx.y < ViewMin.y || MinPx.x > ViewMax.x || MinPx.y > ViewMax.y);
+}
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint Index = DTid.x;
+    if (Index >= PaddedNumElements)
+    {
+        return;
+    }
+
+    if (PassType == 0)
+    {
+        if (Index == 0)
+        {
+            SplatIndirectArgsUAV[0] = 4;
+            SplatIndirectArgsUAV[2] = 0;
+            SplatIndirectArgsUAV[3] = 0;
+        }
+
+        if (Index < NumElements)
+        {
+            uint AssetIndex = Index * max(Stride, 1);
+            float Depth = 0.0;
+            bool bVisible = IsSplatVisible(AssetIndex, Depth);
+            if (bVisible)
+            {
+                uint VisibleIndex = 0;
+                InterlockedAdd(SplatIndirectArgsUAV[1], 1, VisibleIndex);
+                SplatOrderBufferUAV[VisibleIndex] = Index;
+                SplatKeyBufferUAV[VisibleIndex] = EncodeDepthKey(Depth);
+            }
+        }
+        return;
+    }
+
+    uint Partner = Index ^ SortJ;
+    if (Partner <= Index || Partner >= PaddedNumElements)
+    {
+        return;
+    }
+
+    uint KeyA = SplatKeyBufferUAV[Index];
+    uint KeyB = SplatKeyBufferUAV[Partner];
+    uint OrderA = SplatOrderBufferUAV[Index];
+    uint OrderB = SplatOrderBufferUAV[Partner];
+
+    bool bAscending = (Index & SortK) == 0;
+    bool bShouldSwap = bAscending ? (KeyA > KeyB) : (KeyA < KeyB);
+    if (bShouldSwap)
+    {
+        SplatKeyBufferUAV[Index] = KeyB;
+        SplatKeyBufferUAV[Partner] = KeyA;
+        SplatOrderBufferUAV[Index] = OrderB;
+        SplatOrderBufferUAV[Partner] = OrderA;
+    }
+}

@@ -1,23 +1,14 @@
 #include "/Engine/Public/Platform.ush"
 #include "GaussianSplatCommon.ush"
 
-// 这份 compute shader 负责两件事：
-// 1. PassType == 0：可见性筛选、深度 key 生成、间接绘制参数初始化。
-// 2. PassType == 1：bitonic sort。
-//
-// 它对应 C++ 侧的 FGaussianSplatCullSortCS::FParameters。
-
-// 输入是资产上传到 GPU 后的点属性。
 StructuredBuffer<float4> SplatPositionBuffer;
-StructuredBuffer<float4> SplatRotationBuffer;
-StructuredBuffer<float4> SplatScaleBuffer;
+StructuredBuffer<float4> SplatCovariance0Buffer;
+StructuredBuffer<float4> SplatCovariance1Buffer;
 
-// 输出是排序结果和间接绘制参数。
 RWStructuredBuffer<uint> SplatOrderBufferUAV;
 RWStructuredBuffer<uint> SplatKeyBufferUAV;
 RWBuffer<uint> SplatIndirectArgsUAV;
 
-// 这些参数都来自 C++ 侧的 FGaussianSplatCullSortCS::FParameters。
 uint NumElements;
 uint PaddedNumElements;
 uint Stride;
@@ -34,15 +25,11 @@ float4x4 ProjectionMatrix;
 float4x4 ViewProjectionMatrix;
 float4x4 LocalToWorldMatrix;
 
-// 把深度编码成可排序的整型 key。
-// 当前实现直接把正深度 reinterpret 成 uint，用于从前到后排序。
 uint EncodeDepthKey(float Depth)
 {
     return asuint(max(Depth, 0.0));
 }
 
-// 把世界空间位置投影到像素空间。
-// SafeClipW 用来避免除零，并兼作投影是否合法的快速判断。
 float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
 {
     float4 Clip = mul(float4(WorldPos, 1.0), ViewProjectionMatrix);
@@ -54,7 +41,6 @@ float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
         ViewRectMin.y + (0.5 - Ndc.y * 0.5) * ViewSize.y);
 }
 
-// 从二维协方差提取椭圆两条主轴，用于估计屏幕包围盒。
 float2x2 BuildEllipseBasis(float3 Cov2D)
 {
     float Diag1 = Cov2D.x;
@@ -74,8 +60,6 @@ float2x2 BuildEllipseBasis(float3 Cov2D)
     return float2x2(Axis0, Axis1);
 }
 
-// 判断一个高斯投影到当前视图后是否可能可见。
-// 这里只做快速保守判断，不做深度测试。
 bool IsSplatVisible(uint AssetIndex, out float Depth)
 {
     float3 CenterWS = mul(float4(SplatPositionBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
@@ -92,13 +76,9 @@ bool IsSplatVisible(uint AssetIndex, out float Depth)
         return false;
     }
 
-    // 用旋转 + 尺度恢复 3D 椭球，再投影成 2D 椭圆，估计屏幕包围范围。
-    float4 Rotation = SplatRotationBuffer[AssetIndex];
-    float3 Scale = SplatScaleBuffer[AssetIndex].xyz * (PointSize * 0.35);
-    float3x3 RotScale = CalcMatrixFromRotationScale(Rotation, Scale);
     float3 Cov3D0;
     float3 Cov3D1;
-    CalcCovariance3D(RotScale, Cov3D0, Cov3D1);
+    LoadCovariance3D(SplatCovariance0Buffer, SplatCovariance1Buffer, AssetIndex, PointSize * 0.35, Cov3D0, Cov3D1);
 
     float3 Cov2D = CalcCovariance2D(
         CenterWS,
@@ -138,11 +118,6 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
 
     if (PassType == 0)
     {
-        // 初始化 DrawPrimitiveIndirect 所需参数：
-        // [0] VertexCountPerInstance = 4
-        // [1] InstanceCount 由可见性筛选阶段通过原子加法累积
-        // [2] StartVertexLocation = 0
-        // [3] StartInstanceLocation = 0
         if (Index == 0)
         {
             SplatIndirectArgsUAV[0] = 4;
@@ -152,14 +127,11 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
 
         if (Index < NumElements)
         {
-            // 逻辑索引通过 Stride 映射回真实资产点索引，实现密度抽样。
             uint AssetIndex = Index * max(Stride, 1);
             float Depth = 0.0;
             bool bVisible = IsSplatVisible(AssetIndex, Depth);
             if (bVisible)
             {
-                // 用原子加法把所有可见实例压缩到前缀区域。
-                // 这样后续 raster pass 只画真正可见的那一段。
                 uint VisibleIndex = 0;
                 InterlockedAdd(SplatIndirectArgsUAV[1], 1, VisibleIndex);
                 SplatOrderBufferUAV[VisibleIndex] = Index;
@@ -169,7 +141,6 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
         return;
     }
 
-    // 第二阶段：执行 bitonic compare-and-swap。
     uint Partner = Index ^ SortJ;
     if (Partner <= Index || Partner >= PaddedNumElements)
     {
