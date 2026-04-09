@@ -15,6 +15,7 @@ TSharedRef<IDetailCustomization> FGaussianSplatComponentDetails::MakeInstance()
 
 void FGaussianSplatComponentDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBuilder)
 {
+	// 找到当前正在编辑的 GaussianSplatComponent。
 	TArray<TWeakObjectPtr<UObject>> Objects;
 	DetailBuilder.GetObjectsBeingCustomized(Objects);
 
@@ -30,6 +31,7 @@ void FGaussianSplatComponentDetails::CustomizeDetails(IDetailLayoutBuilder& Deta
 
 	IDetailCategoryBuilder& Category = DetailBuilder.EditCategory(TEXT("Gaussian Splat|Component"));
 
+	// 展示当前组件是否绑定了 Asset，以及绑定 Asset 后的点数。
 	Category.AddCustomRow(FText::FromString(TEXT("Asset Status")))
 	.WholeRowContent()
 	[
@@ -51,6 +53,7 @@ void FGaussianSplatComponentDetails::CustomizeDetails(IDetailLayoutBuilder& Deta
 		})
 	];
 
+	// 手动触发渲染状态重建，方便调试 SceneProxy / ViewExtension 是否同步到最新状态。
 	Category.AddCustomRow(FText::FromString(TEXT("Rebuild Render State")))
 	.WholeRowContent()
 	[

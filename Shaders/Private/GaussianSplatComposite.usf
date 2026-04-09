@@ -1,17 +1,33 @@
 #include "/Engine/Public/Platform.ush"
 
+// 这份全屏像素着色器负责把中间 SplatTexture 叠回 SceneColor。
+// 它对应 C++ 侧的 FGaussianSplatCompositePS::FParameters，
+// 并在 GaussianSplatPasses::AddPostProcessPass() 末尾通过
+// FPixelShaderUtils::AddFullscreenPass(...) 被调用。
+
+// 当前后处理阶段输入的原始 SceneColor。
 Texture2D SceneColorTexture;
 SamplerState SceneColorSampler;
+
+// 前面所有 Gaussian batch 累积出来的中间纹理。
 Texture2D SplatTexture;
 SamplerState SplatSampler;
 
+// SceneColor 纹理大小，用于把像素坐标转换成标准化 UV。
 float2 SceneColorTextureSize;
 
 float4 MainPS(float4 SvPosition : SV_POSITION) : SV_Target0
 {
+    // 当前全屏像素对应的标准化 UV。
     const float2 uv = SvPosition.xy / max(SceneColorTextureSize, float2(1.0, 1.0));
+
+    // sceneColor 是进入 Gaussian 后处理前的原始场景颜色。
+    // splatColor 是中间纹理里的累积结果，RGB 已经是预乘 alpha 形式。
     const float4 sceneColor = SceneColorTexture.SampleLevel(SceneColorSampler, uv, 0);
     const float4 splatColor = SplatTexture.SampleLevel(SplatSampler, uv, 0);
+
+    // 先压低原场景颜色，再叠加预乘后的 splat RGB。
+    // 这等价于把高斯结果按 alpha 覆盖回原图。
     const float3 outRgb = sceneColor.rgb * (1.0 - saturate(splatColor.a)) + splatColor.rgb;
     return float4(outRgb, 1.0);
 }

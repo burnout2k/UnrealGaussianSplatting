@@ -2,22 +2,23 @@
 
 #include "GaussianSplatAsset.h"
 #include "GaussianSplatComponent.h"
+#include "GaussianSplatWorldSubsystem.h"
 #include "PostProcess/PostProcessMaterialInputs.h"
 #include "Render/GaussianSplatPasses.h"
+#include "Render/GaussianSplatRenderResources.h"
 #include "ScreenPass.h"
-#include "UObject/UObjectIterator.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatViewExtension, Log, All);
 
 FGaussianSplatViewExtension::FGaussianSplatViewExtension(const FAutoRegister& AutoRegister)
     : FSceneViewExtensionBase(AutoRegister)
 {
-    UE_LOG(LogGaussianSplatViewExtension, Log, TEXT("FGaussianSplatViewExtension constructed."));
 }
 
 bool FGaussianSplatViewExtension::IsActiveThisFrame_Internal(const FSceneViewExtensionContext& Context) const
 {
-    UE_LOG(LogGaussianSplatViewExtension, VeryVerbose, TEXT("IsActiveThisFrame_Internal called."));
+    // 当前实现始终启用。
+    // 如果后面要继续优化，可以在这里根据 world 类型、是否存在 Gaussian 组件等条件动态关闭。
     return true;
 }
 
@@ -31,169 +32,131 @@ void FGaussianSplatViewExtension::SetupView(FSceneViewFamily& InViewFamily, FSce
 
 void FGaussianSplatViewExtension::BeginRenderViewFamily(FSceneViewFamily& InViewFamily)
 {
-    UE_LOG(LogGaussianSplatViewExtension, Log, TEXT("BeginRenderViewFamily: Views=%d"), InViewFamily.Views.Num());
-    BuildPointSnapshot_GameThread();
+    // 这是游戏线程阶段，适合读取 UObject / Component。
+    // 这里先根据当前 ViewFamily 找到对应的 World，再把本帧需要渲染的 billboard
+    // Gaussian 组件压成快照，供后面的渲染线程消费。
+    const UWorld* ViewFamilyWorld = InViewFamily.Scene ? InViewFamily.Scene->GetWorld() : nullptr;
+    BuildPointSnapshot_GameThread(ViewFamilyWorld);
 }
 
 void FGaussianSplatViewExtension::PreRenderViewFamily_RenderThread(FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily)
 {
-    TArray<FGaussianSplatRenderBatch> LocalPoints;
-    {
-        FReadScopeLock Lock(CachedPointsLock);
-        LocalPoints = CachedPoints;
-    }
-
-    UE_LOG(
-        LogGaussianSplatViewExtension,
-        Log,
-        TEXT("PreRenderViewFamily_RenderThread: Views=%d CachedPoints=%d RenderTarget=%s"),
-        InViewFamily.Views.Num(),
-        LocalPoints.Num(),
-        InViewFamily.RenderTarget ? TEXT("Yes") : TEXT("No"));
 }
 
 void FGaussianSplatViewExtension::SubscribeToPostProcessingPass(EPostProcessingPass PassId, const FSceneView& View, FAfterPassCallbackDelegateArray& InOutPassCallbacks, bool bIsPassEnabled)
 {
+    // 这里选择把 Gaussian 绘制挂在 MotionBlur 之后。
+    // UE 走到这个后处理阶段时，会回调 PostProcessPass_RenderThread，
+    // 然后由我们往 RDG 里继续追加 Gaussian 的渲染与合成 pass。
     if (PassId == EPostProcessingPass::MotionBlur)
     {
-        UE_LOG(LogGaussianSplatViewExtension, Log, TEXT("SubscribeToPostProcessingPass: Registering MotionBlur callback."));
         InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(this, &FGaussianSplatViewExtension::PostProcessPass_RenderThread));
     }
 }
 
 FScreenPassTexture FGaussianSplatViewExtension::PostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs)
 {
+    // CachedPoints 是游戏线程在 BeginRenderViewFamily() 里构造的快照。
+    // 这里先复制一份本地数组，避免长时间持锁进入后续 RDG 构图逻辑。
     TArray<FGaussianSplatRenderBatch> LocalPoints;
     {
         FReadScopeLock Lock(CachedPointsLock);
         LocalPoints = CachedPoints;
     }
 
-    UE_LOG(
-        LogGaussianSplatViewExtension,
-        Log,
-        TEXT("PostProcessPass_RenderThread: CachedPoints=%d"),
-        LocalPoints.Num());
-
+    // 没有 Gaussian 要画时，直接返回原始 SceneColor。
     if (LocalPoints.IsEmpty())
     {
         return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
     }
 
+    // 取当前后处理链路传下来的 SceneColor。
     const FScreenPassTexture SceneColor = FScreenPassTexture::CopyFromSlice(GraphBuilder, Inputs.GetInput(EPostProcessMaterialInput::SceneColor));
     if (!SceneColor.IsValid())
     {
         return Inputs.ReturnUntouchedSceneColorForPostProcessing(GraphBuilder);
     }
 
+    // 如果上游没有指定输出 RT，就基于 SceneColor 创建一个默认输出。
     FScreenPassRenderTarget Output = Inputs.OverrideOutput;
     if (!Output.IsValid())
     {
         Output = FScreenPassRenderTarget::CreateFromInput(GraphBuilder, SceneColor, View.GetOverwriteLoadAction(), TEXT("GaussianSplat.PostProcessOutput"));
     }
 
+    // 真正的 Cull / Sort / Raster / Composite 组合都在 AddPostProcessPass() 里完成。
     return GaussianSplatPasses::AddPostProcessPass(GraphBuilder, View, SceneColor, Output, LocalPoints);
 }
 
-void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread()
+void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread(const UWorld* TargetWorld)
 {
+    // NewPoints 是本帧快照。构造完成后一次性替换 CachedPoints，减少锁占用时间。
     TArray<FGaussianSplatRenderBatch> NewPoints;
     NewPoints.Reserve(64);
 
-    int32 TotalComponents = 0;
-    int32 RegisteredVisibleComponents = 0;
-    int32 BillboardComponents = 0;
-    int32 ComponentsWithAssets = 0;
-    int32 AcceptedComponents = 0;
-
-    for (TObjectIterator<UGaussianSplatComponent> It; It; ++It)
+    // 没有目标 World，说明这一帧没有合法的场景上下文，直接清空快照。
+    if (TargetWorld == nullptr)
     {
-        UGaussianSplatComponent* Component = *It;
-        ++TotalComponents;
+        FWriteScopeLock Lock(CachedPointsLock);
+        CachedPoints = MoveTemp(NewPoints);
+        return;
+    }
 
+    // 每个 World 自己维护一份 Gaussian billboard 组件注册表。
+    // 这里不再全局扫 TObjectIterator，而是直接从当前 World 的 subsystem 取组件列表。
+    UGaussianSplatWorldSubsystem* WorldSubsystem = TargetWorld->GetSubsystem<UGaussianSplatWorldSubsystem>();
+    if (WorldSubsystem == nullptr)
+    {
+        FWriteScopeLock Lock(CachedPointsLock);
+        CachedPoints = MoveTemp(NewPoints);
+        return;
+    }
+
+    TArray<UGaussianSplatComponent*> RegisteredComponents;
+    WorldSubsystem->GetRegisteredComponents(RegisteredComponents);
+
+    for (UGaussianSplatComponent* Component : RegisteredComponents)
+    {
         if (!IsValid(Component))
         {
-            UE_LOG(LogGaussianSplatViewExtension, Warning, TEXT("BuildPointSnapshot: Skipping invalid component."));
             continue;
         }
 
-        if (Component->HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject))
-        {
-            UE_LOG(LogGaussianSplatViewExtension, Log, TEXT("BuildPointSnapshot: Skip %s because it is a CDO/archetype object."), *Component->GetPathName());
-            continue;
-        }
-
-        UWorld* ComponentWorld = Component->GetWorld();
-        if (!IsValid(ComponentWorld))
-        {
-            UE_LOG(LogGaussianSplatViewExtension, Log, TEXT("BuildPointSnapshot: Skip %s because World is null."), *Component->GetPathName());
-            continue;
-        }
-
-        if (ComponentWorld->WorldType == EWorldType::Inactive || ComponentWorld->WorldType == EWorldType::None)
-        {
-            UE_LOG(
-                LogGaussianSplatViewExtension,
-                Log,
-                TEXT("BuildPointSnapshot: Skip %s because WorldType=%d."),
-                *Component->GetPathName(),
-                static_cast<int32>(ComponentWorld->WorldType));
-            continue;
-        }
-
-        if (!Component->IsRegistered())
-        {
-            UE_LOG(LogGaussianSplatViewExtension, Log, TEXT("BuildPointSnapshot: Skip %s because it is not registered."), *Component->GetPathName());
-            continue;
-        }
-
+        // 这里的注册表已经只缓存 billboard 组件，但可见性仍然是逐帧状态，
+        // 所以应当在快照构建阶段判断。
         if (!Component->IsVisible())
         {
-            UE_LOG(LogGaussianSplatViewExtension, Log, TEXT("BuildPointSnapshot: Skip %s because IsVisible() is false."), *Component->GetPathName());
             continue;
         }
-
-        ++RegisteredVisibleComponents;
-
-        if (Component->PreviewRenderMode != EGaussianPreviewRenderMode::Billboards)
-        {
-            UE_LOG(
-                LogGaussianSplatViewExtension,
-                Log,
-                TEXT("BuildPointSnapshot: Skip %s because PreviewRenderMode=%d."),
-                *Component->GetPathName(),
-                static_cast<int32>(Component->PreviewRenderMode));
-            continue;
-        }
-
-        ++BillboardComponents;
 
         const UGaussianSplatAsset* Asset = Component->Asset;
         if (!IsValid(Asset))
         {
-            UE_LOG(LogGaussianSplatViewExtension, Log, TEXT("BuildPointSnapshot: Skip %s because Asset is null."), *Component->GetPathName());
             continue;
         }
 
-        ++ComponentsWithAssets;
-
-        if (Asset->Positions.IsEmpty() || Asset->GetRenderResources() == nullptr || Asset->GetRenderResources()->GetPointCount() == 0)
+        const FGaussianSplatRenderResources* RenderResources = Asset->GetRenderResources();
+        if (Asset->Positions.IsEmpty() || RenderResources == nullptr || RenderResources->GetPointCount() == 0)
         {
-            UE_LOG(LogGaussianSplatViewExtension, Log, TEXT("BuildPointSnapshot: Skip %s because Asset render resources are unavailable."), *Component->GetPathName());
             continue;
         }
-
-        ++AcceptedComponents;
 
         const float Density = FMath::Clamp(Component->DensityScale, 0.001f, 1.0f);
+
+        // DensityScale 通过固定步长抽样实现。
+        // 例如 0.25 大致对应每 4 个点里取 1 个。
         const int32 Stride = FMath::Max(1, FMath::RoundToInt(1.0f / Density));
         const int32 LocalMax = FMath::Max(1, Component->MaxRenderPoints);
         const FTransform LocalToWorld = Component->GetComponentTransform();
+
+        // 这里只需要旋转部分的逆矩阵，把世界方向变回组件局部空间，
+        // 供 SH 方向光照相关计算使用。
         const FMatrix ComponentToWorldNoScale = FRotationMatrix::Make(LocalToWorld.GetRotation());
         const FMatrix WorldToComponentNoScale = ComponentToWorldNoScale.GetTransposed();
 
+        // 把组件和资源状态压成一个渲染线程可安全读取的 batch。
         FGaussianSplatRenderBatch Batch;
-        Batch.Resources = Asset->GetRenderResources();
+        Batch.Resources = RenderResources;
         Batch.LocalToWorld = FMatrix44f(LocalToWorld.ToMatrixWithScale());
         Batch.WorldToLocalRow0 = FVector4f(
             static_cast<float>(WorldToComponentNoScale.M[0][0]),
@@ -216,34 +179,7 @@ void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread()
         Batch.Stride = static_cast<uint32>(Stride);
         Batch.MaxRenderPoints = static_cast<uint32>(LocalMax);
         NewPoints.Add(Batch);
-
-        const int32 AddedForComponent = FMath::Min(LocalMax, FMath::DivideAndRoundUp(Asset->Positions.Num(), Stride));
-
-        UE_LOG(
-            LogGaussianSplatViewExtension,
-            Log,
-            TEXT("BuildPointSnapshot: Accepted %s AssetPoints=%d Density=%.3f Stride=%d LocalMax=%d Added=%d Visible=%d Registered=%d"),
-            *Component->GetPathName(),
-            Asset->Positions.Num(),
-            Density,
-            Stride,
-            LocalMax,
-            AddedForComponent,
-            Component->IsVisible() ? 1 : 0,
-            Component->IsRegistered() ? 1 : 0);
-
     }
-
-    UE_LOG(
-        LogGaussianSplatViewExtension,
-        Log,
-        TEXT("BuildPointSnapshot summary: Total=%d RegisteredVisible=%d Billboard=%d WithAsset=%d Accepted=%d CachedPoints=%d"),
-        TotalComponents,
-        RegisteredVisibleComponents,
-        BillboardComponents,
-        ComponentsWithAssets,
-        AcceptedComponents,
-        NewPoints.Num());
 
     {
         FWriteScopeLock Lock(CachedPointsLock);

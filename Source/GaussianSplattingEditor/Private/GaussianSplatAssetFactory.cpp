@@ -11,8 +11,10 @@ DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatFactory, Log, All);
 
 namespace
 {
+    // Unity Gaussian Splatting 常用到的 SH 直流项常数。
     constexpr float SHC0 = 0.28209479177387814f;
 
+    // PLY header 里可能出现的标量类型。
     enum class EPlyScalarType : uint8
     {
         Invalid,
@@ -26,12 +28,14 @@ namespace
         Float64,
     };
 
+    // 记录一个 vertex property 的名字和类型。
     struct FPlyProperty
     {
         FString Name;
         EPlyScalarType Type = EPlyScalarType::Invalid;
     };
 
+    // 这里只解析导入高斯所需的最小 PLY 头信息。
     struct FPlyHeader
     {
         bool bAscii = false;
@@ -41,6 +45,7 @@ namespace
         TArray<FPlyProperty> VertexProperties;
     };
 
+    // 把 PLY 类型名转成内部枚举。
     EPlyScalarType ParsePlyType(const FString& TypeText)
     {
         const FString T = TypeText.ToLower();
@@ -55,6 +60,7 @@ namespace
         return EPlyScalarType::Invalid;
     }
 
+    // 返回单个标量在二进制 PLY 中占多少字节。
     int32 GetTypeSize(EPlyScalarType Type)
     {
         switch (Type)
@@ -76,6 +82,7 @@ namespace
         }
     }
 
+    // 扫描 PLY header，确定编码方式、顶点数和 vertex property 列表。
     bool ParseHeader(const TArray<uint8>& RawData, FPlyHeader& OutHeader)
     {
         static const ANSICHAR EndA[] = "end_header\n";
@@ -162,6 +169,7 @@ namespace
         return (OutHeader.bAscii || OutHeader.bBinaryLittleEndian) && OutHeader.VertexCount > 0 && OutHeader.VertexProperties.Num() > 0;
     }
 
+    // 通过字段名查 property 在每行/每个顶点记录中的序号。
     int32 FindPropertyIndex(const TArray<FPlyProperty>& Properties, const TCHAR* Name)
     {
         for (int32 I = 0; I < Properties.Num(); ++I)
@@ -174,6 +182,7 @@ namespace
         return INDEX_NONE;
     }
 
+    // 二进制 PLY 中统一按 float 读回，便于后续复用同一套构建逻辑。
     float ReadScalarAsFloat(const uint8* Data, EPlyScalarType Type)
     {
         switch (Type)
@@ -190,35 +199,13 @@ namespace
         }
     }
 
-    FLinearColor BuildColor(
-        const TArray<float>& Values,
-        int32 RIndex,
-        int32 GIndex,
-        int32 BIndex,
-        int32 AIndex)
-    {
-        auto SampleColor = [&](int32 Index, float DefaultValue) -> float
-        {
-            if (!Values.IsValidIndex(Index))
-            {
-                return DefaultValue;
-            }
-            const float Raw = Values[Index];
-            return Raw > 1.0f ? FMath::Clamp(Raw / 255.0f, 0.0f, 1.0f) : FMath::Clamp(Raw, 0.0f, 1.0f);
-        };
-
-        return FLinearColor(
-            SampleColor(RIndex, 1.0f),
-            SampleColor(GIndex, 1.0f),
-            SampleColor(BIndex, 1.0f),
-            SampleColor(AIndex, 1.0f));
-    }
-
+    // 安全读取一个字段，不存在时回落到默认值。
     float ReadValueOr(const TArray<float>& Values, int32 Index, float DefaultValue)
     {
         return Values.IsValidIndex(Index) ? Values[Index] : DefaultValue;
     }
 
+    // 把源文件里的 SH rest 项重排成运行时 shader 期待的 [coeff][rgb] 紧密布局。
     void AppendReorderedSH(const TArray<float>& Values, const TArray<int32>& RestIndices, UGaussianSplatAsset& Asset)
     {
         float RawSH[45] = {};
@@ -238,6 +225,7 @@ namespace
         Asset.SHCoefficients.Append(ReorderedSH, UE_ARRAY_COUNT(ReorderedSH));
     }
 
+    // 导入阶段先整理成一个统一的中间表示，再写入 Asset。
     struct FImportedGaussian
     {
         FVector3f Position = FVector3f::ZeroVector;
@@ -245,11 +233,11 @@ namespace
         FVector3f Scale = FVector3f(0.02f, 0.02f, 0.02f);
     };
 
+    // 在 3DGS 的参数存储中，缩放向量存储的是对数形式（Log-space），因此这里需要做一次 exp。
     FVector3f BuildScale(const TArray<float>& Values, int32 SX, int32 SY, int32 SZ)
     {
         if (Values.IsValidIndex(SX) && Values.IsValidIndex(SY) && Values.IsValidIndex(SZ))
         {
-            // Unity Gaussian data stores log-space scale.
             return FVector3f(
                 FMath::Exp(Values[SX]),
                 FMath::Exp(Values[SY]),
@@ -259,6 +247,7 @@ namespace
         return FVector3f(0.02f, 0.02f, 0.02f);
     }
 
+    // 从 rot_0..3 还原四元数，字段顺序按 [w, x, y, z] 理解。
     FQuat4f BuildRotation(const TArray<float>& Values, int32 RW, int32 RX, int32 RY, int32 RZ)
     {
         if (Values.IsValidIndex(RW) && Values.IsValidIndex(RX) && Values.IsValidIndex(RY) && Values.IsValidIndex(RZ))
@@ -271,6 +260,7 @@ namespace
         return FQuat4f::Identity;
     }
 
+    // 自己展开四元数转矩阵，避免在这个低层工具区引入更多高层类型转换。
     FMatrix44f BuildRotationMatrix(const FQuat4f& Rotation)
     {
         const float X = Rotation.X;
@@ -301,6 +291,7 @@ namespace
         return M;
     }
 
+    // 只对左上 3x3 做乘法，因为这里处理的都是协方差/旋转子矩阵。
     FMatrix44f Multiply3x3(const FMatrix44f& A, const FMatrix44f& B)
     {
         FMatrix44f Result = FMatrix44f::Identity;
@@ -319,6 +310,7 @@ namespace
         return Result;
     }
 
+    // 只转置左上 3x3。
     FMatrix44f Transpose3x3(const FMatrix44f& M)
     {
         FMatrix44f Result = FMatrix44f::Identity;
@@ -332,23 +324,28 @@ namespace
         return Result;
     }
 
+    // 由旋转和尺度恢复 3D 协方差矩阵。
     FMatrix44f BuildCovariance(const FQuat4f& Rotation, const FVector3f& Scale)
     {
         const FMatrix44f RotationMatrix = BuildRotationMatrix(Rotation);
 
-        FMatrix44f ScaleSquared = FMatrix44f::Identity;
-        ScaleSquared.M[0][0] = Scale.X * Scale.X;
-        ScaleSquared.M[1][1] = Scale.Y * Scale.Y;
-        ScaleSquared.M[2][2] = Scale.Z * Scale.Z;
+        FMatrix44f ScaleMatrix = FMatrix44f::Identity;
+        ScaleMatrix.M[0][0] = Scale.X;
+        ScaleMatrix.M[1][1] = Scale.Y;
+        ScaleMatrix.M[2][2] = Scale.Z;
 
-        return Multiply3x3(Multiply3x3(RotationMatrix, ScaleSquared), Transpose3x3(RotationMatrix));
+        FMatrix44f L = Multiply3x3(RotationMatrix, ScaleMatrix);
+        
+        return Multiply3x3(L, Transpose3x3(L));
     }
 
+    // 把 COLMAP 坐标系转换成 UE 坐标系。
     FVector3f ApplyColmapToUEPosition(const FVector3f& Position)
     {
         return FVector3f(Position.Z, Position.X, -Position.Y);
     }
 
+    // 协方差也必须在同一线性变换下同步变换，否则位置和椭球方向会不一致。
     FMatrix44f ApplyColmapToUECovariance(const FMatrix44f& Covariance)
     {
         FMatrix44f Transform = FMatrix44f::Identity;
@@ -365,6 +362,7 @@ namespace
         return Multiply3x3(Multiply3x3(Transform, Covariance), Transpose3x3(Transform));
     }
 
+    // 对对称 3x3 协方差做 Jacobi 特征分解，取出主轴方向和三个特征值。
     void JacobiDiagonalizeSymmetric3x3(const FMatrix44f& Input, FMatrix44f& OutEigenvectors, FVector3f& OutEigenvalues)
     {
         FMatrix44f A = Input;
@@ -437,6 +435,7 @@ namespace
         OutEigenvalues = FVector3f(A.M[0][0], A.M[1][1], A.M[2][2]);
     }
 
+    // 把特征值按从大到小排序，并保持特征向量构成右手系。
     void SortEigenbasisDescending(FMatrix44f& InOutEigenvectors, FVector3f& InOutEigenvalues)
     {
         auto GetComponent = [](const FVector3f& Vector, int32 Index) -> float
@@ -490,6 +489,7 @@ namespace
         InOutEigenvalues = SortedValues;
     }
 
+    // 把主轴矩阵重新编码成四元数，便于运行时 shader 复用。
     FQuat4f QuaternionFromRotationMatrix(const FMatrix44f& Matrix)
     {
         const float Trace = Matrix.M[0][0] + Matrix.M[1][1] + Matrix.M[2][2];
@@ -536,6 +536,9 @@ namespace
         return Result;
     }
 
+    // 统一构建导入后的高斯：
+    // - 读取位置/尺度/旋转；
+    // - 若源数据包含 anisotropic Gaussian 参数，则顺便做坐标系转换和协方差重分解。
     FImportedGaussian BuildImportedGaussian(
         const TArray<float>& Values,
         int32 XIndex,
@@ -550,22 +553,19 @@ namespace
         int32 Rot3Index)
     {
         FImportedGaussian Result;
-        Result.Position = FVector3f(Values[XIndex], Values[YIndex], Values[ZIndex]);
+        Result.Position = ApplyColmapToUEPosition(FVector3f(Values[XIndex], Values[YIndex], Values[ZIndex]));
         Result.Rotation = BuildRotation(Values, Rot0Index, Rot1Index, Rot2Index, Rot3Index);
         Result.Scale = BuildScale(Values, Scale0Index, Scale1Index, Scale2Index);
-
-        const bool bHasAnisotropicGaussian =
-            Values.IsValidIndex(Scale0Index) && Values.IsValidIndex(Scale1Index) && Values.IsValidIndex(Scale2Index) &&
-            Values.IsValidIndex(Rot0Index) && Values.IsValidIndex(Rot1Index) && Values.IsValidIndex(Rot2Index) && Values.IsValidIndex(Rot3Index);
-
-        if (!bHasAnisotropicGaussian)
-        {
-            return Result;
-        }
-
-        Result.Position = ApplyColmapToUEPosition(Result.Position);
-
         const FMatrix44f CovarianceUE = ApplyColmapToUECovariance(BuildCovariance(Result.Rotation, Result.Scale));
+        // 以上的 Position、Covariance 都已经由 Colmap 坐标系转换到了 UE 坐标系。
+        // 如果在 Shader 中直接使用协方差矩阵（例如进行 EWA Splatting），不需要单独处理旋转和缩放。
+        // SH 系数决定了高斯点的颜色随视角的变化。当旋转了坐标系，SH 的基函数方向也变了。
+        // 对于 Level 0 (DC 项)：它是常数，代表基础颜色，不需要旋转。
+        // 对于 Level 1 及以上：它们具有方向性。需要旋转。可以在渲染时将“相机观察向量”转换回 COLMAP 空间再去采样 SH，避免复杂的 SH 旋转计算。
+        
+        // 为什么要把协方差矩阵又转回缩放向量和四元数？？？
+        // 如果在代码中直接把 OutEigenvalues 的 x, y, z 塞回 scale_0, 1, 2，
+        // 而没有调整对应的特征向量（旋转矩阵的列），高斯球的方向会直接偏转 90 度或 180 度，导致渲染出来的物体表面全是细碎的毛刺。
         FMatrix44f Eigenvectors;
         FVector3f Eigenvalues;
         JacobiDiagonalizeSymmetric3x3(CovarianceUE, Eigenvectors, Eigenvalues);
@@ -576,10 +576,12 @@ namespace
             FMath::Sqrt(FMath::Max(Eigenvalues.Y, 1e-10f)),
             FMath::Sqrt(FMath::Max(Eigenvalues.Z, 1e-10f)));
         Result.Rotation = QuaternionFromRotationMatrix(Eigenvectors);
+        
         return Result;
     }
-
-    FLinearColor BuildUnityGaussianColor(const TArray<float>& Values, int32 Dc0, int32 Dc1, int32 Dc2, int32 Opacity)
+    
+    // RGB 来自 SH 直流项，A 来自 sigmoid(opacity)。
+    FLinearColor BuildColor(const TArray<float>& Values, int32 Dc0, int32 Dc1, int32 Dc2, int32 Opacity)
     {
         const float R = 0.5f + SHC0 * ReadValueOr(Values, Dc0, 0.0f);
         const float G = 0.5f + SHC0 * ReadValueOr(Values, Dc1, 0.0f);
@@ -588,6 +590,7 @@ namespace
         return FLinearColor(R, G, B, A);
     }
 
+    // 解析 ASCII PLY。
     bool FillAssetFromAscii(const TArray<uint8>& RawData, const FPlyHeader& Header, UGaussianSplatAsset& Asset)
     {
         const int32 BodyByteSize = RawData.Num() - Header.HeaderByteSize;
@@ -603,10 +606,6 @@ namespace
         const int32 XIndex = FindPropertyIndex(Header.VertexProperties, TEXT("x"));
         const int32 YIndex = FindPropertyIndex(Header.VertexProperties, TEXT("y"));
         const int32 ZIndex = FindPropertyIndex(Header.VertexProperties, TEXT("z"));
-        const int32 RIndex = FindPropertyIndex(Header.VertexProperties, TEXT("red"));
-        const int32 GIndex = FindPropertyIndex(Header.VertexProperties, TEXT("green"));
-        const int32 BIndex = FindPropertyIndex(Header.VertexProperties, TEXT("blue"));
-        const int32 AIndex = FindPropertyIndex(Header.VertexProperties, TEXT("alpha"));
         const int32 Dc0Index = FindPropertyIndex(Header.VertexProperties, TEXT("f_dc_0"));
         const int32 Dc1Index = FindPropertyIndex(Header.VertexProperties, TEXT("f_dc_1"));
         const int32 Dc2Index = FindPropertyIndex(Header.VertexProperties, TEXT("f_dc_2"));
@@ -618,8 +617,6 @@ namespace
         const int32 Rot1Index = FindPropertyIndex(Header.VertexProperties, TEXT("rot_1"));
         const int32 Rot2Index = FindPropertyIndex(Header.VertexProperties, TEXT("rot_2"));
         const int32 Rot3Index = FindPropertyIndex(Header.VertexProperties, TEXT("rot_3"));
-        const bool bHasUnityGaussianFields =
-            Dc0Index != INDEX_NONE && Dc1Index != INDEX_NONE && Dc2Index != INDEX_NONE && OpacityIndex != INDEX_NONE;
         TArray<int32> RestIndices;
         RestIndices.Reserve(45);
         for (int32 SHIndex = 0; SHIndex < 45; ++SHIndex)
@@ -627,6 +624,7 @@ namespace
             RestIndices.Add(FindPropertyIndex(Header.VertexProperties, *FString::Printf(TEXT("f_rest_%d"), SHIndex)));
         }
 
+        // 没有基础位置字段就无法导入。
         if (XIndex == INDEX_NONE || YIndex == INDEX_NONE || ZIndex == INDEX_NONE)
         {
             return false;
@@ -640,6 +638,7 @@ namespace
 
         for (int32 I = 0; I < Header.VertexCount; ++I)
         {
+            // 先把一行顶点记录打平成 float 数组，再走统一构建逻辑。
             TArray<FString> Tokens;
             Lines[I].TrimStartAndEnd().ParseIntoArrayWS(Tokens, nullptr, true);
             if (Tokens.Num() < Header.VertexProperties.Num())
@@ -670,26 +669,22 @@ namespace
             Asset.Rotations.Add(Gaussian.Rotation);
             Asset.Scales.Add(Gaussian.Scale);
 
-            const FLinearColor Color = bHasUnityGaussianFields
-                ? BuildUnityGaussianColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex)
-                : BuildColor(Values, RIndex, GIndex, BIndex, AIndex);
+            const FLinearColor Color = BuildColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex);
             Asset.ColorsOpacity.Add(FVector4f(Color.R, Color.G, Color.B, Color.A));
             AppendReorderedSH(Values, RestIndices, Asset);
         }
 
+        // 写完 CPU 数据后立即刷新 Bounds 和 GPU 资源。
         Asset.RefreshDerivedData();
         return true;
     }
 
+    // 解析 binary_little_endian PLY，和 ASCII 路径的差别主要在于“如何取每个字段的值”。
     bool FillAssetFromBinaryLE(const TArray<uint8>& RawData, const FPlyHeader& Header, UGaussianSplatAsset& Asset)
     {
         const int32 XIndex = FindPropertyIndex(Header.VertexProperties, TEXT("x"));
         const int32 YIndex = FindPropertyIndex(Header.VertexProperties, TEXT("y"));
         const int32 ZIndex = FindPropertyIndex(Header.VertexProperties, TEXT("z"));
-        const int32 RIndex = FindPropertyIndex(Header.VertexProperties, TEXT("red"));
-        const int32 GIndex = FindPropertyIndex(Header.VertexProperties, TEXT("green"));
-        const int32 BIndex = FindPropertyIndex(Header.VertexProperties, TEXT("blue"));
-        const int32 AIndex = FindPropertyIndex(Header.VertexProperties, TEXT("alpha"));
         const int32 Dc0Index = FindPropertyIndex(Header.VertexProperties, TEXT("f_dc_0"));
         const int32 Dc1Index = FindPropertyIndex(Header.VertexProperties, TEXT("f_dc_1"));
         const int32 Dc2Index = FindPropertyIndex(Header.VertexProperties, TEXT("f_dc_2"));
@@ -701,8 +696,6 @@ namespace
         const int32 Rot1Index = FindPropertyIndex(Header.VertexProperties, TEXT("rot_1"));
         const int32 Rot2Index = FindPropertyIndex(Header.VertexProperties, TEXT("rot_2"));
         const int32 Rot3Index = FindPropertyIndex(Header.VertexProperties, TEXT("rot_3"));
-        const bool bHasUnityGaussianFields =
-            Dc0Index != INDEX_NONE && Dc1Index != INDEX_NONE && Dc2Index != INDEX_NONE && OpacityIndex != INDEX_NONE;
         TArray<int32> RestIndices;
         RestIndices.Reserve(45);
         for (int32 SHIndex = 0; SHIndex < 45; ++SHIndex)
@@ -715,6 +708,7 @@ namespace
             return false;
         }
 
+        // 先算出一条顶点记录的总字节数，便于校验 body 是否完整。
         int32 VertexStride = 0;
         for (const FPlyProperty& Property : Header.VertexProperties)
         {
@@ -741,6 +735,7 @@ namespace
         const uint8* Cursor = RawData.GetData() + Header.HeaderByteSize;
         for (int32 I = 0; I < Header.VertexCount; ++I)
         {
+            // 按 header 中声明的字段顺序逐个解码，再走和 ASCII 路径相同的构建逻辑。
             TArray<float> Values;
             Values.Reserve(Header.VertexProperties.Num());
 
@@ -766,9 +761,7 @@ namespace
             Asset.Rotations.Add(Gaussian.Rotation);
             Asset.Scales.Add(Gaussian.Scale);
 
-            const FLinearColor Color = bHasUnityGaussianFields
-                ? BuildUnityGaussianColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex)
-                : BuildColor(Values, RIndex, GIndex, BIndex, AIndex);
+            const FLinearColor Color = BuildColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex);
             Asset.ColorsOpacity.Add(FVector4f(Color.R, Color.G, Color.B, Color.A));
             AppendReorderedSH(Values, RestIndices, Asset);
         }
@@ -780,6 +773,7 @@ namespace
 
 UGaussianSplatAssetFactory::UGaussianSplatAssetFactory()
 {
+    // 这是一个“只能导入文件”的工厂，不支持在内容浏览器里凭空创建新 Asset。
     bEditorImport = true;
     bCreateNew = false;
     SupportedClass = UGaussianSplatAsset::StaticClass();
@@ -798,6 +792,12 @@ UObject* UGaussianSplatAssetFactory::FactoryCreateFile(
 {
     bOutOperationCanceled = false;
 
+    // 导入器整体流程：
+    // 1. 读原始文件；
+    // 2. 解析 header；
+    // 3. 创建目标 UGaussianSplatAsset；
+    // 4. 按 ASCII / Binary 分支填充 Asset；
+    // 5. 注册到 AssetRegistry。
     TArray<uint8> RawData;
     if (!FFileHelper::LoadFileToArray(RawData, *Filename))
     {
@@ -829,7 +829,7 @@ UObject* UGaussianSplatAssetFactory::FactoryCreateFile(
     FAssetRegistryModule::AssetCreated(Asset);
     if (Asset->GetPackage())
     {
-        Asset->GetPackage()->MarkPackageDirty();
+        (void)Asset->GetPackage()->MarkPackageDirty();
     }
 
     UE_LOG(LogGaussianSplatFactory, Display, TEXT("Imported %d points from %s"), Asset->GetPointCount(), *FPaths::GetCleanFilename(Filename));

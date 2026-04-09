@@ -16,6 +16,7 @@ TSharedRef<IDetailCustomization> FGaussianSplatAssetDetails::MakeInstance()
 
 void FGaussianSplatAssetDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBuilder)
 {
+	// 收集当前 Details 面板正在编辑的对象，并找到第一个 GaussianSplatAsset。
 	TArray<TWeakObjectPtr<UObject>> Objects;
 	DetailBuilder.GetObjectsBeingCustomized(Objects);
 
@@ -31,6 +32,7 @@ void FGaussianSplatAssetDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBu
 
 	IDetailCategoryBuilder& Category = DetailBuilder.EditCategory(TEXT("Gaussian Splat|Asset"));
 
+	// 只读显示点数，帮助用户快速确认导入是否成功。
 	Category.AddCustomRow(FText::FromString(TEXT("Point Count")))
 	.WholeRowContent()
 	[
@@ -42,6 +44,7 @@ void FGaussianSplatAssetDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBu
 		})
 	];
 
+	// 提供一个手动重建 Bounds 的按钮，便于导入后或手改数据后重新校准包围体。
 	Category.AddCustomRow(FText::FromString(TEXT("Rebuild Bounds")))
 	.WholeRowContent()
 	[
@@ -57,6 +60,7 @@ void FGaussianSplatAssetDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBu
 			const FScopedTransaction Transaction(FText::FromString(TEXT("Rebuild Gaussian Splat Bounds")));
 			Asset->Modify();
 			Asset->RebuildBounds();
+			// 这里只重建 Bounds，不重建整套 GPU 资源，因为这个按钮的目标就是修正包围体。
 			Asset->MarkPackageDirty();
 			return FReply::Handled();
 		})
