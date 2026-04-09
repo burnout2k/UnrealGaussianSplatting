@@ -16,7 +16,6 @@ enum class EGaussianPreviewRenderMode : uint8
 {
     Points UMETA(DisplayName = "Points"),
     Billboards UMETA(DisplayName = "Gaussian Billboards"),
-    Boxes UMETA(DisplayName = "Gaussian Boxes"),
 };
 
 UCLASS(ClassGroup = Rendering, meta = (BlueprintSpawnableComponent))

@@ -17,7 +17,7 @@ void UGaussianSplatComponent::SyncWorldSubsystemRegistration()
         return;
     }
 
-    if (IsRegistered() && PreviewRenderMode != EGaussianPreviewRenderMode::Boxes)
+    if (IsRegistered())
     {
         WorldSubsystem->RegisterComponent(this);
         return;

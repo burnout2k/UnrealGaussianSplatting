@@ -6,7 +6,7 @@ void UGaussianSplatWorldSubsystem::RegisterComponent(UGaussianSplatComponent* Co
 {
     // 这个 subsystem 只维护“当前 World 里需要走 billboard 后处理路径的组件”。
     // 因此即使外部误调用注册，这里也会再守一层，只接受合法的 billboard 组件。
-    if (!IsValid(Component) || Component->PreviewRenderMode == EGaussianPreviewRenderMode::Boxes)
+    if (!IsValid(Component))
     {
         return;
     }
