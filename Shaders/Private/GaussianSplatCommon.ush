@@ -1,6 +1,15 @@
-﻿#ifndef GAUSSIAN_SPLAT_COMMON_USH
+#ifndef GAUSSIAN_SPLAT_COMMON_USH
 #define GAUSSIAN_SPLAT_COMMON_USH
 
+// 这份公共头放的是 CullSort / Raster 两个 shader 共用的数学工具。
+// 主要负责：
+// 1. 从旋转 + 尺度恢复 3D 高斯椭球
+// 2. 计算 3D 协方差
+// 3. 把 3D 协方差近似投影到屏幕空间，得到 2D 椭圆协方差
+// 4. 提供 conic 形式和指数项计算工具
+
+// 把四元数旋转和三轴缩放组合成 3x3 线性变换矩阵。
+// 对 3DGS 来说，这个矩阵定义了单位球如何变成一个有方向的椭球。
 float3x3 CalcMatrixFromRotationScale(float4 Rot, float3 Scale)
 {
     float x = Rot.x;
@@ -21,6 +30,8 @@ float3x3 CalcMatrixFromRotationScale(float4 Rot, float3 Scale)
     return mul(Mr, Ms);
 }
 
+// 计算 3D 协方差矩阵 Sigma = M * M^T，其中 M = R * S。
+// 协方差是对称矩阵，所以这里只返回 6 个独立元素中的 5 个。
 void CalcCovariance3D(float3x3 RotScale, out float3 Cov3D0, out float3 Cov3D1)
 {
     float3x3 Sigma = mul(RotScale, transpose(RotScale));
@@ -28,6 +39,7 @@ void CalcCovariance3D(float3x3 RotScale, out float3 Cov3D0, out float3 Cov3D1)
     Cov3D1 = float3(Sigma._m11, Sigma._m12, Sigma._m22);
 }
 
+// 工具函数：按行构造 3x3 矩阵。
 float3x3 MakeFloat3x3FromRows(float3 Row0, float3 Row1, float3 Row2)
 {
     return float3x3(
@@ -36,6 +48,16 @@ float3x3 MakeFloat3x3FromRows(float3 Row0, float3 Row1, float3 Row2)
         Row2.x, Row2.y, Row2.z);
 }
 
+// 使用 Jacobian 近似把 3D 协方差投影到屏幕空间，得到 2D 椭圆协方差。
+//
+// 输入：
+// - WorldPos：高斯中心世界坐标
+// - Cov3D0 / Cov3D1：3D 协方差矩阵的压缩表示
+// - ViewMatrix / ProjectionMatrix：当前视图矩阵
+// - ViewSize：当前视口像素大小
+//
+// 输出：
+// - float3(xx, xy, yy)，表示 2D 对称协方差矩阵
 float3 CalcCovariance2D(
     float3 WorldPos,
     float3 Cov3D0,
@@ -44,46 +66,47 @@ float3 CalcCovariance2D(
     float4x4 ProjectionMatrix,
     float2 ViewSize)
 {
+    // 先把中心点变到观察空间。
     float3 viewPos = mul(float4(WorldPos, 1.0), ViewMatrix).xyz;
-
-    float aspect = ProjectionMatrix[0][0] / max(abs(ProjectionMatrix[1][1]), 1e-4);
-    float tanFovX = rcp(max(abs(ProjectionMatrix[0][0]), 1e-4));
-    float tanFovY = rcp(max(abs(ProjectionMatrix[1][1] * aspect), 1e-4));
-    float limX = 1.3 * tanFovX;
-    float limY = 1.3 * tanFovY;
-
     float safeZ = max(abs(viewPos.z), 1e-4);
-    viewPos.x = clamp(viewPos.x / safeZ, -limX, limX) * safeZ;
-    viewPos.y = clamp(viewPos.y / safeZ, -limY, limY) * safeZ;
-
-    float focal = ViewSize.x * ProjectionMatrix[0][0] * 0.5;
     float invZ = rcp(safeZ);
     float invZ2 = invZ * invZ;
 
+    // 从投影矩阵恢复像素尺度下的焦距。
+    float focalX = abs(ViewSize.x * ProjectionMatrix[0][0] * 0.5);
+    float focalY = abs(ViewSize.y * ProjectionMatrix[1][1] * 0.5);
+
+    // J 是透视投影对局部扰动的 Jacobian 近似。
     float3x3 J = MakeFloat3x3FromRows(
-        float3(focal * invZ, 0.0, -focal * viewPos.x * invZ2),
-        float3(0.0, focal * invZ, -focal * viewPos.y * invZ2),
+        float3(focalX * invZ, 0.0, -focalX * viewPos.x * invZ2),
+        float3(0.0, focalY * invZ, -focalY * viewPos.y * invZ2),
         float3(0.0, 0.0, 0.0));
 
+    // 恢复完整 3D 协方差矩阵。
     float3x3 V = MakeFloat3x3FromRows(
         float3(Cov3D0.x, Cov3D0.y, Cov3D0.z),
         float3(Cov3D0.y, Cov3D1.x, Cov3D1.y),
         float3(Cov3D0.z, Cov3D1.y, Cov3D1.z));
+
+    // W 取 ViewMatrix 的线性部分，把世界空间协方差变到观察空间。
     float3x3 W = (float3x3)ViewMatrix;
     float3x3 T = mul(J, W);
     float3x3 Cov = mul(T, mul(V, transpose(T)));
 
+    // 给对角线增加一个最小值，避免投影后过小或退化。
     Cov[0][0] += 0.3;
     Cov[1][1] += 0.3;
     return float3(Cov[0][0], Cov[0][1], Cov[1][1]);
 }
 
+// 把协方差转成 conic 形式，便于像素阶段直接求高斯指数项。
 float3 CalcConic(float3 Cov2D)
 {
     float det = Cov2D.x * Cov2D.z - Cov2D.y * Cov2D.y;
     return float3(Cov2D.z, -Cov2D.y, Cov2D.x) * rcp(max(det, 1e-8));
 }
 
+// 根据 conic 和像素偏移量求二维高斯的指数项。
 float CalcPowerFromConic(float3 Conic, float2 Delta)
 {
     return -0.5 * (Conic.x * Delta.x * Delta.x + Conic.z * Delta.y * Delta.y) + Conic.y * Delta.x * Delta.y;

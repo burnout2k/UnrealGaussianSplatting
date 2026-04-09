@@ -8,6 +8,7 @@
 #include "IAssetTools.h"
 #include "PropertyEditorModule.h"
 
+// 这个类型动作只负责让内容浏览器认识这个自定义 Asset 类型，并给它一个显示名/颜色。
 class FGaussianSplatAssetTypeActions final : public FAssetTypeActions_Base
 {
 public:
@@ -37,11 +38,13 @@ class FGaussianSplattingEditorModule final : public IModuleInterface
 public:
     virtual void StartupModule() override
     {
+        // 注册自定义 Asset 类型动作，让内容浏览器能把 GaussianSplatAsset 当成独立资源展示。
         IAssetTools& AssetTools = FAssetToolsModule::GetModule().Get();
         const TSharedRef<IAssetTypeActions> Action = MakeShared<FGaussianSplatAssetTypeActions>();
         AssetTools.RegisterAssetTypeActions(Action);
         RegisteredAssetTypeActions.Add(Action);
 
+        // 注册 Details 面板自定义布局，让 Asset 和 Component 的属性面板更易读。
         FPropertyEditorModule& PropertyModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>(TEXT("PropertyEditor"));
         PropertyModule.RegisterCustomClassLayout(TEXT("GaussianSplatAsset"), FOnGetDetailCustomizationInstance::CreateStatic(&FGaussianSplatAssetDetails::MakeInstance));
         PropertyModule.RegisterCustomClassLayout(TEXT("GaussianSplatComponent"), FOnGetDetailCustomizationInstance::CreateStatic(&FGaussianSplatComponentDetails::MakeInstance));
@@ -50,6 +53,7 @@ public:
 
     virtual void ShutdownModule() override
     {
+        // 编辑器模块关闭时做对称反注册，避免模块热重载后残留旧注册项。
         if (!FModuleManager::Get().IsModuleLoaded(TEXT("AssetTools")))
         {
             return;
@@ -72,6 +76,7 @@ public:
     }
 
 private:
+    // 保存已注册的 AssetTypeActions，便于 Shutdown 时逐一注销。
     TArray<TSharedRef<IAssetTypeActions>> RegisteredAssetTypeActions;
 };
 

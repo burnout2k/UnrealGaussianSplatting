@@ -7,6 +7,7 @@
 
 namespace
 {
+    // UE 用 TypeHash 区分不同 PrimitiveSceneProxy 类型。
     uint32 GGaussianSplatProxyTypeId = 0;
 }
 
@@ -15,6 +16,8 @@ DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatSceneProxy, Log, All);
 FGaussianSplatSceneProxy::FGaussianSplatSceneProxy(const UGaussianSplatComponent* InComponent)
     : FPrimitiveSceneProxy(InComponent)
 {
+    // SceneProxy 是“游戏线程对象在渲染线程上的镜像”。
+    // 构造时要把后续绘制需要的数据都拷一份出来，避免渲染线程回头读 UObject。
     if (!InComponent || !InComponent->Asset)
     {
         return;
@@ -29,14 +32,23 @@ FGaussianSplatSceneProxy::FGaussianSplatSceneProxy(const UGaussianSplatComponent
     bFrustumCull = InComponent->bFrustumCull;
     MaxRenderPoints = InComponent->MaxRenderPoints;
     PreviewRenderMode = static_cast<uint8>(InComponent->PreviewRenderMode);
-    GaussianFalloffResource = InComponent->GaussianFalloffTexture ? InComponent->GaussianFalloffTexture->GetResource() : nullptr;
 
     Positions = Asset->Positions;
+    SplatRotations.SetNum(Positions.Num());
     SplatScales.SetNum(Positions.Num());
     Colors.SetNum(Positions.Num());
 
     for (int32 Index = 0; Index < Positions.Num(); ++Index)
     {
+        // 把 Asset 里的可选数据整理成长度一致的渲染数组，并填默认值。
+        FQuat4f Rotation = FQuat4f::Identity;
+        if (Asset->Rotations.IsValidIndex(Index))
+        {
+            Rotation = Asset->Rotations[Index];
+            Rotation.Normalize();
+        }
+        SplatRotations[Index] = Rotation;
+
         FVector3f Scale(0.02f, 0.02f, 0.02f);
         if (Asset->Scales.IsValidIndex(Index))
         {
@@ -66,54 +78,27 @@ SIZE_T FGaussianSplatSceneProxy::GetTypeHash() const
     return reinterpret_cast<SIZE_T>(&GGaussianSplatProxyTypeId);
 }
 
+// 这条路径只服务于 Points / Boxes 调试预览。
+// 真正的 billboard 3DGS 并不会进这个函数。
 void FGaussianSplatSceneProxy::GetDynamicMeshElements(const TArray<const FSceneView*>& Views, const FSceneViewFamily& ViewFamily, uint32 VisibilityMap, FMeshElementCollector& Collector) const
 {
-    if (Positions.IsEmpty())
-    {
-        UE_LOG(LogGaussianSplatSceneProxy, Log, TEXT("GetDynamicMeshElements: Positions are empty for proxy %s."), *GetOwnerName().ToString());
-        return;
-    }
-
+    // 和 billboard 路径保持一致，密度控制同样通过固定步长抽样实现。
     const float ClampedDensity = FMath::Max(0.001f, DensityScale);
     const int32 SampleStride = FMath::Max(1, FMath::RoundToInt(1.0f / FMath::Min(ClampedDensity, 1.0f)));
-
-    UE_LOG(
-        LogGaussianSplatSceneProxy,
-        Log,
-        TEXT("GetDynamicMeshElements: Proxy=%s Views=%d VisibilityMap=0x%x PointCount=%u SampleStride=%d PreviewMode=%d HasFalloff=%d"),
-        *GetOwnerName().ToString(),
-        Views.Num(),
-        VisibilityMap,
-        PointCount,
-        SampleStride,
-        PreviewRenderMode,
-        GaussianFalloffResource ? 1 : 0);
 
     for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
     {
         if ((VisibilityMap & (1U << ViewIndex)) == 0)
         {
-            UE_LOG(LogGaussianSplatSceneProxy, Log, TEXT("GetDynamicMeshElements: Proxy=%s skipping view %d due to VisibilityMap."), *GetOwnerName().ToString(), ViewIndex);
             continue;
         }
 
         const FSceneView* View = Views[ViewIndex];
-        if (!View)
-        {
-            UE_LOG(LogGaussianSplatSceneProxy, Warning, TEXT("GetDynamicMeshElements: Proxy=%s has null view at index %d."), *GetOwnerName().ToString(), ViewIndex);
-            continue;
-        }
-
         FPrimitiveDrawInterface* PDI = Collector.GetPDI(ViewIndex);
-        if (!PDI)
-        {
-            UE_LOG(LogGaussianSplatSceneProxy, Warning, TEXT("GetDynamicMeshElements: Proxy=%s has null PDI at view %d."), *GetOwnerName().ToString(), ViewIndex);
-            continue;
-        }
-
         const FVector ViewOrigin = View->ViewMatrices.GetViewOrigin();
         const FVector ViewDirection = View->GetViewDirection();
 
+        // RenderList 是当前视图下要画的候选点列表，里面只存索引和深度，尽量少拷贝数据。
         TArray<FSortablePoint> RenderList;
         RenderList.Reserve(FMath::Min<int32>(Positions.Num(), MaxRenderPoints));
 
@@ -126,26 +111,12 @@ void FGaussianSplatSceneProxy::GetDynamicMeshElements(const TArray<const FSceneV
 
             const FVector WorldPos = GetLocalToWorld().TransformPosition(FVector(Positions[Index]));
 
-            if (bFrustumCull && !View->ViewFrustum.IntersectSphere(WorldPos, 1.0f))
-            {
-                continue;
-            }
-
+            // 用视线方向上的投影当深度近似值，够满足调试预览排序。
             FSortablePoint Entry;
             Entry.Index = Index;
             Entry.Depth = FVector::DotProduct(WorldPos - ViewOrigin, ViewDirection);
             RenderList.Add(Entry);
         }
-
-        UE_LOG(
-            LogGaussianSplatSceneProxy,
-            Log,
-            TEXT("GetDynamicMeshElements: Proxy=%s view=%d RenderList=%d MaxRenderPoints=%d FrustumCull=%d"),
-            *GetOwnerName().ToString(),
-            ViewIndex,
-            RenderList.Num(),
-            MaxRenderPoints,
-            bFrustumCull ? 1 : 0);
 
         if (bDepthSort)
         {
@@ -155,10 +126,6 @@ void FGaussianSplatSceneProxy::GetDynamicMeshElements(const TArray<const FSceneV
                 return A.Depth > B.Depth;
             });
         }
-
-        const float TanHalfFovY = 1.0f / FMath::Max(0.001f, View->ViewMatrices.GetProjectionMatrix().M[1][1]);
-        const float ViewHeight = FMath::Max(1.0f, static_cast<float>(View->UnconstrainedViewRect.Height()));
-        const float BasePixelSize = FMath::Clamp(PointSize, 0.1f, 128.0f);
 
         for (const FSortablePoint& Entry : RenderList)
         {
@@ -172,42 +139,56 @@ void FGaussianSplatSceneProxy::GetDynamicMeshElements(const TArray<const FSceneV
                 continue;
             }
 
-            if (PreviewRenderMode == static_cast<uint8>(EGaussianPreviewRenderMode::Billboards))
+            if (PreviewRenderMode == static_cast<uint8>(EGaussianPreviewRenderMode::Boxes))
             {
-                const float Distance = FMath::Max(1.0f, Entry.Depth);
-                const float WorldPerPixel = (2.0f * Distance * TanHalfFovY) / ViewHeight;
-
+                // 盒子模式把高斯椭球的三个主轴画成一个有朝向的包围盒，方便调试旋转和尺度。
+                const FVector CenterLocal = FVector(Positions[Index]);
+                const FQuat Rotation = SplatRotations.IsValidIndex(Index) ? FQuat(SplatRotations[Index]) : FQuat::Identity;
                 const FVector3f Scale = SplatScales.IsValidIndex(Index) ? SplatScales[Index] : FVector3f(0.02f, 0.02f, 0.02f);
-                const float A = FMath::Max3(Scale.X, Scale.Y, Scale.Z);
-                const float C = FMath::Min3(Scale.X, Scale.Y, Scale.Z);
-                const float B = FMath::Max(0.001f, Scale.X + Scale.Y + Scale.Z - A - C);
+                const FVector AxisX = Rotation.RotateVector(FVector(Scale.X, 0.0f, 0.0f));
+                const FVector AxisY = Rotation.RotateVector(FVector(0.0f, Scale.Y, 0.0f));
+                const FVector AxisZ = Rotation.RotateVector(FVector(0.0f, 0.0f, Scale.Z));
 
-                const float RadiusPixelsX = A / FMath::Max(0.00001f, WorldPerPixel);
-                const float RadiusPixelsY = B / FMath::Max(0.00001f, WorldPerPixel);
-                const float PixelSizeX = FMath::Clamp(BasePixelSize * RadiusPixelsX, 2.0f, 256.0f);
-                const float PixelSizeY = FMath::Clamp(BasePixelSize * RadiusPixelsY, 2.0f, 256.0f);
-                const float RelativeArea = FMath::Clamp((A * B) / (0.02f * 0.02f), 0.1f, 4.0f);
-                FinalColor.A = FMath::Clamp(FinalColor.A / FMath::Sqrt(RelativeArea), 0.0f, 1.0f);
-                PDI->DrawPoint(WorldPos, FinalColor, FMath::Max(1.0f, 0.5f * (RadiusPixelsX + RadiusPixelsY) * 0.5f), SDPG_World);
+                FVector Corners[8];
+                Corners[0] = GetLocalToWorld().TransformPosition(CenterLocal - AxisX - AxisY - AxisZ);
+                Corners[1] = GetLocalToWorld().TransformPosition(CenterLocal + AxisX - AxisY - AxisZ);
+                Corners[2] = GetLocalToWorld().TransformPosition(CenterLocal + AxisX + AxisY - AxisZ);
+                Corners[3] = GetLocalToWorld().TransformPosition(CenterLocal - AxisX + AxisY - AxisZ);
+                Corners[4] = GetLocalToWorld().TransformPosition(CenterLocal - AxisX - AxisY + AxisZ);
+                Corners[5] = GetLocalToWorld().TransformPosition(CenterLocal + AxisX - AxisY + AxisZ);
+                Corners[6] = GetLocalToWorld().TransformPosition(CenterLocal + AxisX + AxisY + AxisZ);
+                Corners[7] = GetLocalToWorld().TransformPosition(CenterLocal - AxisX + AxisY + AxisZ);
+
+                constexpr int32 EdgeIndices[12][2] =
+                {
+                    {0, 1}, {1, 2}, {2, 3}, {3, 0},
+                    {4, 5}, {5, 6}, {6, 7}, {7, 4},
+                    {0, 4}, {1, 5}, {2, 6}, {3, 7}
+                };
+
+                for (int32 EdgeIndex = 0; EdgeIndex < UE_ARRAY_COUNT(EdgeIndices); ++EdgeIndex)
+                {
+                    PDI->DrawLine(
+                        Corners[EdgeIndices[EdgeIndex][0]],
+                        Corners[EdgeIndices[EdgeIndex][1]],
+                        FinalColor,
+                        SDPG_World,
+                        0.25f);
+                }
             }
             else
             {
+                // 最简单的点模式，直接用 UE 的调试点绘制。
                 PDI->DrawPoint(WorldPos, FinalColor, PointSize, SDPG_World);
             }
         }
 
-        UE_LOG(
-            LogGaussianSplatSceneProxy,
-            Log,
-            TEXT("GetDynamicMeshElements: Proxy=%s view=%d finished drawing %d candidates."),
-            *GetOwnerName().ToString(),
-            ViewIndex,
-            RenderList.Num());
     }
 }
 
 FPrimitiveViewRelevance FGaussianSplatSceneProxy::GetViewRelevance(const FSceneView* View) const
 {
+    // 告诉 UE：这是一个动态、半透明、参与主渲染通道的 Primitive。
     FPrimitiveViewRelevance Relevance;
     Relevance.bDrawRelevance = IsShown(View);
     Relevance.bDynamicRelevance = true;
@@ -223,10 +204,5 @@ FPrimitiveViewRelevance FGaussianSplatSceneProxy::GetViewRelevance(const FSceneV
 
 uint32 FGaussianSplatSceneProxy::GetMemoryFootprint() const
 {
-    return sizeof(*this) + GetAllocatedSize();
-}
-
-uint32 FGaussianSplatSceneProxy::GetAllocatedSize() const
-{
-    return Positions.GetAllocatedSize() + SplatScales.GetAllocatedSize() + Colors.GetAllocatedSize();
+    return sizeof(*this) + Positions.GetAllocatedSize() + SplatScales.GetAllocatedSize() + Colors.GetAllocatedSize();
 }
