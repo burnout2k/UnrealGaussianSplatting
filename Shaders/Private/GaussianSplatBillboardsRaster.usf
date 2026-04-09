@@ -127,6 +127,7 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
         CenterWS,
         Cov3D0,
         Cov3D1,
+        LocalToWorldMatrix,
         ViewMatrix,
         ProjectionMatrix,
         ViewSize);

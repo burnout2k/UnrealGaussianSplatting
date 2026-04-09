@@ -29,6 +29,7 @@ float3 CalcCovariance2D(
     float3 WorldPos,
     float3 Cov3D0,
     float3 Cov3D1,
+    float4x4 LocalToWorldMatrix,
     float4x4 ViewMatrix,
     float4x4 ProjectionMatrix,
     float2 ViewSize)
@@ -62,12 +63,28 @@ float3 CalcCovariance2D(
         -0.5 * ViewSize.y *
         (ClipGradY * SafeW - Clip.y * ClipGradW) * InvW2;
 
-    float3 CovRow0 = mul(JacobianRow0, V);
-    float3 CovRow1 = mul(JacobianRow1, V);
+    // Covariance is stored in asset-local UE space. When the component rotates
+    // or scales, the Gaussian shape must follow the same LocalToWorld linear
+    // transform as the center position.
+    float3 LocalToWorldRow0 = float3(LocalToWorldMatrix[0][0], LocalToWorldMatrix[0][1], LocalToWorldMatrix[0][2]);
+    float3 LocalToWorldRow1 = float3(LocalToWorldMatrix[1][0], LocalToWorldMatrix[1][1], LocalToWorldMatrix[1][2]);
+    float3 LocalToWorldRow2 = float3(LocalToWorldMatrix[2][0], LocalToWorldMatrix[2][1], LocalToWorldMatrix[2][2]);
 
-    float CovXX = dot(CovRow0, JacobianRow0) + 0.3;
-    float CovXY = dot(CovRow0, JacobianRow1);
-    float CovYY = dot(CovRow1, JacobianRow1) + 0.3;
+    float3 LocalJacobianRow0 = float3(
+        dot(JacobianRow0, LocalToWorldRow0),
+        dot(JacobianRow0, LocalToWorldRow1),
+        dot(JacobianRow0, LocalToWorldRow2));
+    float3 LocalJacobianRow1 = float3(
+        dot(JacobianRow1, LocalToWorldRow0),
+        dot(JacobianRow1, LocalToWorldRow1),
+        dot(JacobianRow1, LocalToWorldRow2));
+
+    float3 CovRow0 = mul(LocalJacobianRow0, V);
+    float3 CovRow1 = mul(LocalJacobianRow1, V);
+
+    float CovXX = dot(CovRow0, LocalJacobianRow0) + 0.3;
+    float CovXY = dot(CovRow0, LocalJacobianRow1);
+    float CovYY = dot(CovRow1, LocalJacobianRow1) + 0.3;
     return float3(CovXX, CovXY, CovYY);
 }
 
