@@ -40,7 +40,7 @@ void FGaussianSplatViewExtension::PreRenderViewFamily_RenderThread(FRDGBuilder& 
 
 void FGaussianSplatViewExtension::SubscribeToPostProcessingPass(EPostProcessingPass PassId, const FSceneView& View, FAfterPassCallbackDelegateArray& InOutPassCallbacks, bool bIsPassEnabled)
 {
-    if (PassId == EPostProcessingPass::MotionBlur)
+    if (PassId == EPostProcessingPass::Tonemap)
     {
         InOutPassCallbacks.Add(FAfterPassCallbackDelegate::CreateRaw(this, &FGaussianSplatViewExtension::PostProcessPass_RenderThread));
     }

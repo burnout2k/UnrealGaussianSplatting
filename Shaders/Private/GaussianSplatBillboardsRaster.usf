@@ -46,9 +46,20 @@ float3 WorldDirToLocal(uint InstanceID, float3 WorldDir)
         dot(WorldToLocalRow2.xyz, WorldDir));
 }
 
+float3 UELocalDirToColmapLocal(float3 UELocalDir)
+{
+    // Import converts COLMAP basis to UE basis as UE = (Z, X, -Y).
+    // SH coefficients remain stored in the original COLMAP basis, so convert
+    // the local view direction back before evaluating SH.
+    return float3(
+        UELocalDir.y,
+        -UELocalDir.z,
+        UELocalDir.x);
+}
+
 float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
 {
-    float3 Dir = -normalize(WorldDirToLocal(InstanceID, ViewDirWS));
+    float3 Dir = -normalize(UELocalDirToColmapLocal(WorldDirToLocal(InstanceID, ViewDirWS)));
     float X = Dir.x;
     float Y = Dir.y;
     float Z = Dir.z;
