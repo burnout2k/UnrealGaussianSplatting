@@ -5,10 +5,19 @@
 #include "DetailCustomization/GaussianSplatAssetDetails.h"
 #include "DetailCustomization/GaussianSplatComponentDetails.h"
 #include "GaussianSplatAsset.h"
+#include "Framework/Docking/TabManager.h"
 #include "IAssetTools.h"
+#include "LevelEditor.h"
 #include "PropertyEditorModule.h"
+#include "ToolMenus.h"
+#include "UI/SGaussianSplatEditorPanel.h"
+#include "Widgets/Docking/SDockTab.h"
 
-// 这个类型动作只负责让内容浏览器认识这个自定义 Asset 类型，并给它一个显示名/颜色。
+namespace
+{
+    static const FName GaussianSplatEditorTabName(TEXT("GaussianSplatEditor"));
+}
+
 class FGaussianSplatAssetTypeActions final : public FAssetTypeActions_Base
 {
 public:
@@ -38,33 +47,44 @@ class FGaussianSplattingEditorModule final : public IModuleInterface
 public:
     virtual void StartupModule() override
     {
-        // 注册自定义 Asset 类型动作，让内容浏览器能把 GaussianSplatAsset 当成独立资源展示。
         IAssetTools& AssetTools = FAssetToolsModule::GetModule().Get();
         const TSharedRef<IAssetTypeActions> Action = MakeShared<FGaussianSplatAssetTypeActions>();
         AssetTools.RegisterAssetTypeActions(Action);
         RegisteredAssetTypeActions.Add(Action);
 
-        // 注册 Details 面板自定义布局，让 Asset 和 Component 的属性面板更易读。
         FPropertyEditorModule& PropertyModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>(TEXT("PropertyEditor"));
         PropertyModule.RegisterCustomClassLayout(TEXT("GaussianSplatAsset"), FOnGetDetailCustomizationInstance::CreateStatic(&FGaussianSplatAssetDetails::MakeInstance));
         PropertyModule.RegisterCustomClassLayout(TEXT("GaussianSplatComponent"), FOnGetDetailCustomizationInstance::CreateStatic(&FGaussianSplatComponentDetails::MakeInstance));
         PropertyModule.NotifyCustomizationModuleChanged();
+
+        FGlobalTabmanager::Get()->RegisterNomadTabSpawner(
+            GaussianSplatEditorTabName,
+            FOnSpawnTab::CreateRaw(this, &FGaussianSplattingEditorModule::SpawnEditorTab))
+            .SetDisplayName(NSLOCTEXT("GaussianSplatting", "GaussianSplatEditorTabTitle", "Gaussian Splat Editor"))
+            .SetMenuType(ETabSpawnerMenuType::Hidden);
+
+        UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FGaussianSplattingEditorModule::RegisterMenus));
     }
 
     virtual void ShutdownModule() override
     {
-        // 编辑器模块关闭时做对称反注册，避免模块热重载后残留旧注册项。
-        if (!FModuleManager::Get().IsModuleLoaded(TEXT("AssetTools")))
+        if (UToolMenus* ToolMenus = UToolMenus::TryGet())
         {
-            return;
+            UToolMenus::UnRegisterStartupCallback(this);
+            ToolMenus->UnregisterOwner(this);
         }
 
-        IAssetTools& AssetTools = FAssetToolsModule::GetModule().Get();
-        for (const TSharedRef<IAssetTypeActions>& Action : RegisteredAssetTypeActions)
+        FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(GaussianSplatEditorTabName);
+
+        if (FModuleManager::Get().IsModuleLoaded(TEXT("AssetTools")))
         {
-            AssetTools.UnregisterAssetTypeActions(Action);
+            IAssetTools& AssetTools = FAssetToolsModule::GetModule().Get();
+            for (const TSharedRef<IAssetTypeActions>& Action : RegisteredAssetTypeActions)
+            {
+                AssetTools.UnregisterAssetTypeActions(Action);
+            }
+            RegisteredAssetTypeActions.Reset();
         }
-        RegisteredAssetTypeActions.Reset();
 
         if (FModuleManager::Get().IsModuleLoaded(TEXT("PropertyEditor")))
         {
@@ -76,7 +96,34 @@ public:
     }
 
 private:
-    // 保存已注册的 AssetTypeActions，便于 Shutdown 时逐一注销。
+    TSharedRef<SDockTab> SpawnEditorTab(const FSpawnTabArgs& Args)
+    {
+        return SNew(SDockTab)
+            .TabRole(ETabRole::NomadTab)
+            [
+                SNew(SGaussianSplatEditorPanel)
+            ];
+    }
+
+    void RegisterMenus()
+    {
+        FToolMenuOwnerScoped OwnerScoped(this);
+
+        UToolMenu* WindowMenu = UToolMenus::Get()->ExtendMenu(TEXT("LevelEditor.MainMenu.Window"));
+        FToolMenuSection& Section = WindowMenu->FindOrAddSection(TEXT("WindowLayout"));
+        Section.AddMenuEntry(
+            TEXT("OpenGaussianSplatEditor"),
+            NSLOCTEXT("GaussianSplatting", "OpenGaussianSplatEditor", "Gaussian Splat Editor"),
+            NSLOCTEXT("GaussianSplatting", "OpenGaussianSplatEditorTooltip", "Open the Gaussian Splat editor panel."),
+            FSlateIcon(),
+            FUIAction(FExecuteAction::CreateRaw(this, &FGaussianSplattingEditorModule::OpenEditorTab)));
+    }
+
+    void OpenEditorTab()
+    {
+        FGlobalTabmanager::Get()->TryInvokeTab(GaussianSplatEditorTabName);
+    }
+
     TArray<TSharedRef<IAssetTypeActions>> RegisteredAssetTypeActions;
 };
 

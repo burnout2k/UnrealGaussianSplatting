@@ -18,6 +18,7 @@ public class GaussianSplattingEditor : ModuleRules
         {
             "AssetRegistry",
             "AssetTools",
+            "ContentBrowser",
             "EditorFramework",
             "InteractiveToolsFramework",
             "LevelEditor",

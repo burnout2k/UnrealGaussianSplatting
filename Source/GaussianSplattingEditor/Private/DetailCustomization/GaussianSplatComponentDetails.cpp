@@ -29,7 +29,7 @@ void FGaussianSplatComponentDetails::CustomizeDetails(IDetailLayoutBuilder& Deta
 		}
 	}
 
-	IDetailCategoryBuilder& Category = DetailBuilder.EditCategory(TEXT("Gaussian Splat|Component"));
+	IDetailCategoryBuilder& Category = DetailBuilder.EditCategory(TEXT("Gaussian Splat"));
 
 	// 展示当前组件是否绑定了 Asset，以及绑定 Asset 后的点数。
 	Category.AddCustomRow(FText::FromString(TEXT("Asset Status")))
@@ -54,11 +54,11 @@ void FGaussianSplatComponentDetails::CustomizeDetails(IDetailLayoutBuilder& Deta
 	];
 
 	// 手动触发渲染状态重建，方便调试 SceneProxy / ViewExtension 是否同步到最新状态。
-	Category.AddCustomRow(FText::FromString(TEXT("Rebuild Render State")))
+	Category.AddCustomRow(FText::FromString(TEXT("Refresh Component Rendering")))
 	.WholeRowContent()
 	[
 		SNew(SButton)
-		.Text(FText::FromString(TEXT("Rebuild Render State")))
+		.Text(FText::FromString(TEXT("Refresh Component Rendering")))
 		.OnClicked_Lambda([Component]()
 		{
 			if (Component)
