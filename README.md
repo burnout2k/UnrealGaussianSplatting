@@ -281,6 +281,28 @@ visible=1043xxx of 3885113 drawn (26.9%) | sort runs over 4194304 padded
 Note the sort is sized from the **padded** count, not the visible count, so it
 currently costs the same regardless of where the camera looks.
 
+## Measured non-wins
+
+Tried and reverted, so they are not re-attempted:
+
+**Spherical-harmonic degree.** A CVar clamping evaluated SH bands (3/2/1/0) made
+no measurable difference: 20.09 / 19.55 / 19.25 / 19.38 ms, with degree 0 --
+which skips *every* SH read -- landing between 1 and 2. All noise.
+
+The 932 MB SH buffer looks alarming but only the visible splats are read each
+frame: ~512 K visible x 240 B is ~123 MB, roughly 0.4 ms of bandwidth, and even
+at 1.7 M visible it is only ~1.4 ms. **SH is a memory-footprint problem, not a
+bandwidth one.** Packing to half3 (932 MB -> ~350 MB) is still worth doing if
+VRAM is tight -- the renderer sits at ~6.7 GB of 8 GB -- but it will not buy
+frames.
+
+**Alpha cutoff.** Raising the discard threshold from 1/255 to 0.02 and 0.05 to
+cut overdraw: 19.4 / 19.62 / 19.26 ms. Also noise.
+
+So the remaining raster cost is fragment and blend work, not buffer reads, and
+has no cheap knob. Reducing it means drawing fewer or smaller splats -- LOD, or
+a tile-based rasterizer with early alpha termination.
+
 ## Current Limitations
 
 - Interactive editing tools are not connected yet
