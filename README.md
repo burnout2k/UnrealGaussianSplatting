@@ -73,6 +73,11 @@ During import, the plugin performs:
 - bounds generation
 - GPU resource initialization
 
+Large assets retain all imported splats in the asset. `MaxGpuPointCount`
+controls how many evenly sampled splats are uploaded to the GPU; it defaults to
+1,000,000 so the renderer can coexist with a large Unreal/CARLA scene on an
+8 GB GPU. Increase it only when the available GPU memory permits.
+
 ### 2. Display in a Level
 
 The simplest workflow is:

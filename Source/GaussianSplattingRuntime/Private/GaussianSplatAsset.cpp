@@ -5,9 +5,13 @@
 #include "GaussianSplatComponent.h"
 #include "Render/GaussianSplatRenderResources.h"
 
+DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatAsset, Log, All);
+
 void UGaussianSplatAsset::Serialize(FArchive& Ar)
 {
-    // UObject 默认不会自动序列化这些裸 TArray 成员，所以这里显式写入。
+    // The large data arrays are intentionally not UPROPERTY fields. Serialize
+    // them once here so multi-million-point assets stay compact and do not
+    // become editable array widgets in the Details panel.
     Super::Serialize(Ar);
     Ar << Positions;
     Ar << Covariances;
@@ -111,7 +115,20 @@ void UGaussianSplatAsset::BuildRenderResources()
     ReleaseRenderResources();
 
     RenderResources = MakeUnique<FGaussianSplatRenderResources>();
-    RenderResources->BuildFromAssetData(Positions, Covariances, ColorsOpacity, SHCoefficients);
+    RenderResources->BuildFromAssetData(
+        Positions,
+        Covariances,
+        ColorsOpacity,
+        SHCoefficients,
+        FMath::Max(1000, MaxGpuPointCount));
+
+    UE_LOG(
+        LogGaussianSplatAsset,
+        Display,
+        TEXT("Prepared %u of %d Gaussian splats for GPU upload (MaxGpuPointCount=%d)"),
+        RenderResources->GetPointCount(),
+        Positions.Num(),
+        MaxGpuPointCount);
 
     // 把 FRenderResource 注册到渲染线程初始化队列。
     BeginInitResource(RenderResources.Get());

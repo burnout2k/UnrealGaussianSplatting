@@ -116,9 +116,12 @@ void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread(const UWorld* Ta
             continue;
         }
 
+        const int32 GpuPointCount = static_cast<int32>(RenderResources->GetPointCount());
         const float Density = FMath::Clamp(Component->DensityScale, 0.001f, 1.0f);
-        const int32 Stride = FMath::Max(1, FMath::RoundToInt(1.0f / Density));
+        const int32 DensityStride = FMath::Max(1, FMath::RoundToInt(1.0f / Density));
         const int32 LocalMax = FMath::Max(1, Component->MaxRenderPoints);
+        const int32 LimitStride = FMath::Max(1, FMath::DivideAndRoundUp(GpuPointCount, LocalMax));
+        const int32 Stride = FMath::Max(DensityStride, LimitStride);
         const FTransform LocalToWorld = Component->GetComponentTransform();
 
         const FMatrix ComponentToWorldNoScale = FRotationMatrix::Make(LocalToWorld.GetRotation());
@@ -147,7 +150,7 @@ void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread(const UWorld* Ta
             0.0f);
         Batch.PointSize = FMath::Clamp(Component->PointSize, 0.1f, 32.0f);
         Batch.OpacityScale = FMath::Clamp(Component->OpacityScale, 0.0f, 8.0f);
-        Batch.AssetPointCount = static_cast<uint32>(Asset->GetPointCount());
+        Batch.AssetPointCount = RenderResources->GetPointCount();
         Batch.Stride = static_cast<uint32>(Stride);
         Batch.MaxRenderPoints = static_cast<uint32>(LocalMax);
         NewPoints.Add(Batch);

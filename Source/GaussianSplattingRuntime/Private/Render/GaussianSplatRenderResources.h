@@ -13,7 +13,8 @@ public:
         const TArray<FVector3f>& InPositions,
         const TArray<FGaussianCovariance3f>& InCovariances,
         const TArray<FVector4f>& InColorsOpacity,
-        const TArray<float>& InSHCoefficients);
+        const TArray<float>& InSHCoefficients,
+        int32 MaxPointCount);
 
     virtual void InitRHI(FRHICommandListBase& RHICmdList) override;
     virtual void ReleaseRHI() override;

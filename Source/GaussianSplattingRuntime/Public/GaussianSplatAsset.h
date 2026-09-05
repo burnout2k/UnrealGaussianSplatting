@@ -58,17 +58,22 @@ class GAUSSIANSPLATTINGRUNTIME_API UGaussianSplatAsset : public UObject
     GENERATED_BODY()
 
 public:
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Gaussian Splat")
+    // These arrays are serialized explicitly in Serialize(). Keeping them out of
+    // UPROPERTY avoids writing every splat twice and prevents the Details panel
+    // from trying to build millions of editable array rows.
     TArray<FVector3f> Positions;
 
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Gaussian Splat")
     TArray<FGaussianCovariance3f> Covariances;
 
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Gaussian Splat")
     TArray<FVector4f> ColorsOpacity;
 
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Gaussian Splat")
     TArray<float> SHCoefficients;
+
+    // The complete source data remains in the asset. Only an evenly sampled
+    // subset is uploaded to the GPU so large captures fit alongside CARLA on
+    // memory-constrained GPUs.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splat", meta = (ClampMin = "1000"))
+    int32 MaxGpuPointCount = 1000000;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Gaussian Splat")
     FBoxSphereBounds Bounds;

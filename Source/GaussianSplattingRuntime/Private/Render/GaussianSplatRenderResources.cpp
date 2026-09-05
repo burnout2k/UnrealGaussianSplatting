@@ -7,37 +7,46 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
     const TArray<FVector3f>& InPositions,
     const TArray<FGaussianCovariance3f>& InCovariances,
     const TArray<FVector4f>& InColorsOpacity,
-    const TArray<float>& InSHCoefficients)
+    const TArray<float>& InSHCoefficients,
+    int32 MaxPointCount)
 {
-    PointCount = InPositions.Num();
+    const int32 SourcePointCount = InPositions.Num();
+    PointCount = static_cast<uint32>(FMath::Min(SourcePointCount, FMath::Max(0, MaxPointCount)));
 
     PositionData.Empty(PointCount);
     Covariance0Data.Empty(PointCount);
     Covariance1Data.Empty(PointCount);
     ColorData.Empty(PointCount);
-    SHData.Empty(InSHCoefficients.Num() / 3);
+    SHData.Empty(PointCount * 15);
 
-    for (int32 Index = 0; Index < InPositions.Num(); ++Index)
+    for (uint32 Index = 0; Index < PointCount; ++Index)
     {
-        const FVector3f Position = InPositions[Index];
-        const FGaussianCovariance3f Covariance = InCovariances.IsValidIndex(Index)
-            ? InCovariances[Index]
+        const int32 SourceIndex = PointCount > 1
+            ? static_cast<int32>((static_cast<int64>(Index) * (SourcePointCount - 1)) / (PointCount - 1))
+            : 0;
+        const FVector3f Position = InPositions[SourceIndex];
+        const FGaussianCovariance3f Covariance = InCovariances.IsValidIndex(SourceIndex)
+            ? InCovariances[SourceIndex]
             : GaussianSplatBoundsUtils::MakeIsotropic(0.02f);
-        const FVector4f Color = InColorsOpacity[Index];
+        const FVector4f Color = InColorsOpacity.IsValidIndex(SourceIndex)
+            ? InColorsOpacity[SourceIndex]
+            : FVector4f(1.0f, 1.0f, 1.0f, 1.0f);
 
         PositionData.Add(FVector4f(Position.X, Position.Y, Position.Z, 1.0f));
         Covariance0Data.Add(FVector4f(Covariance.XX, Covariance.XY, Covariance.XZ, Covariance.YY));
         Covariance1Data.Add(FVector4f(Covariance.YZ, Covariance.ZZ, 0.0f, 0.0f));
         ColorData.Add(Color);
-    }
 
-    for (int32 Index = 0; Index + 2 < InSHCoefficients.Num(); Index += 3)
-    {
-        SHData.Add(FVector4f(
-            InSHCoefficients[Index + 0],
-            InSHCoefficients[Index + 1],
-            InSHCoefficients[Index + 2],
-            0.0f));
+        const int32 SHBase = SourceIndex * 45;
+        for (int32 CoeffIndex = 0; CoeffIndex < 15; ++CoeffIndex)
+        {
+            const int32 CoeffBase = SHBase + CoeffIndex * 3;
+            SHData.Add(FVector4f(
+                InSHCoefficients.IsValidIndex(CoeffBase + 0) ? InSHCoefficients[CoeffBase + 0] : 0.0f,
+                InSHCoefficients.IsValidIndex(CoeffBase + 1) ? InSHCoefficients[CoeffBase + 1] : 0.0f,
+                InSHCoefficients.IsValidIndex(CoeffBase + 2) ? InSHCoefficients[CoeffBase + 2] : 0.0f,
+                0.0f));
+        }
     }
 }
 
