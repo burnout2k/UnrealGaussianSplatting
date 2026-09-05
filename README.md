@@ -171,6 +171,30 @@ This is a practical compensation for the common size mismatch between Gaussian /
 
 If you are using older placed instances, or if your source data already matches Unreal scale, you may still need to adjust actor scale manually.
 
+## Profiling
+
+The renderer declares its own GPU stats, so `stat GPU` breaks splat cost down by phase:
+
+| Stat | Covers |
+|---|---|
+| `GaussianSplat/Cull` | frustum rejection + visible-list compaction |
+| `GaussianSplat/Sort` | the bitonic depth sort |
+| `GaussianSplat/Raster` | billboard/point rasterization |
+| `GaussianSplat/Composite` | blending the splat layer back onto scene colour |
+
+Without these the cost is attributed to whatever engine bucket happens to be open
+(it appeared under `SortLights`), which makes the profile misleading.
+
+The cull pass also reports how many splats survived rejection. Watch the log
+category `LogGaussianSplatProfile` (printed once per 60 frames):
+
+```
+visible=1043xxx of 3885113 drawn (26.9%) | sort runs over 4194304 padded
+```
+
+Note the sort is sized from the **padded** count, not the visible count, so it
+currently costs the same regardless of where the camera looks.
+
 ## Current Limitations
 
 - Interactive editing tools are not connected yet

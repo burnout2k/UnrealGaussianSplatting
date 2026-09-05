@@ -12,6 +12,87 @@
 #include "SceneView.h"
 #include "ScreenPass.h"
 #include "SystemTextures.h"
+#include "HAL/IConsoleManager.h"
+#include "RHIGPUReadback.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatProfile, Log, All);
+
+
+namespace GaussianSplatProfiling
+{
+    // Instrumentation only. The cull pass already writes the number of splats that
+    // survive frustum rejection into IndirectArgsBuffer[1], but nothing read it
+    // back, so the sort is sized from the padded point count rather than from what
+    // is actually on screen. Copy that counter to the CPU a few frames late.
+    static constexpr int32 NumReadbackSlots = 4;
+
+    struct FVisibleCountState
+    {
+        TUniquePtr<FRHIGPUBufferReadback> Slots[NumReadbackSlots];
+        int32 WriteSlot = 0;
+        uint32 LastVisibleCount = 0;
+        uint32 FrameCounter = 0;
+    };
+
+    static FVisibleCountState GVisibleCount;
+
+    void EnqueueVisibleCountReadback(
+        FRDGBuilder& GraphBuilder,
+        FRDGBufferRef IndirectArgsBuffer,
+        uint32 RenderPointCount,
+        uint32 PaddedPointCount)
+    {
+        FVisibleCountState& State = GVisibleCount;
+        const uint32 IndirectArgsBytes = 4 * sizeof(uint32);
+
+        // Drain the oldest slot before reusing it, so this never stalls the GPU.
+        const int32 ReadSlot = (State.WriteSlot + 1) % NumReadbackSlots;
+        if (State.Slots[ReadSlot].IsValid() && State.Slots[ReadSlot]->IsReady())
+        {
+            if (const uint32* Data = static_cast<const uint32*>(State.Slots[ReadSlot]->Lock(IndirectArgsBytes)))
+            {
+                State.LastVisibleCount = Data[1];
+            }
+            State.Slots[ReadSlot]->Unlock();
+        }
+
+        if (!State.Slots[State.WriteSlot].IsValid())
+        {
+            State.Slots[State.WriteSlot] = MakeUnique<FRHIGPUBufferReadback>(TEXT("GaussianSplat.VisibleCount"));
+        }
+        AddEnqueueCopyPass(GraphBuilder, State.Slots[State.WriteSlot].Get(), IndirectArgsBuffer, IndirectArgsBytes);
+        State.WriteSlot = (State.WriteSlot + 1) % NumReadbackSlots;
+
+        if ((State.FrameCounter++ % 60) == 0 && State.LastVisibleCount > 0)
+        {
+            const float VisiblePercent = 100.0f * static_cast<float>(State.LastVisibleCount) /
+                static_cast<float>(FMath::Max(1u, RenderPointCount));
+            UE_LOG(
+                LogGaussianSplatProfile,
+                Display,
+                TEXT("visible=%u of %u drawn (%.1f%%) | sort runs over %u padded"),
+                State.LastVisibleCount,
+                RenderPointCount,
+                VisiblePercent,
+                PaddedPointCount);
+        }
+    }
+
+    // A/B measurement switch. The bitonic sort records 253 dispatches per frame
+    // at full density, and per-pass barriers are suspected to dominate over the
+    // sort maths itself. Skipping the sort renders splats in cull order, which
+    // blends wrongly but isolates the sort's true cost in wall-clock terms.
+    static TAutoConsoleVariable<int32> CVarSkipSort(
+        TEXT("r.GaussianSplat.SkipSort"),
+        0,
+        TEXT("1 = skip the depth sort entirely (blending will be wrong; for profiling only)."),
+        ECVF_RenderThreadSafe);
+
+    bool ShouldSkipSort()
+    {
+        return CVarSkipSort.GetValueOnRenderThread() != 0;
+    }
+}
 
 BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatPointsRasterPassParameters, )
     SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatPointsRasterVS::FParameters, VS)
@@ -125,7 +206,7 @@ namespace GaussianSplatPasses
                 FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), PaddedPointCount),
                 TEXT("GaussianSplat.KeyBuffer"));
             FRDGBufferDesc IndirectArgsDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 4);
-            IndirectArgsDesc.Usage |= BUF_DrawIndirect | BUF_UnorderedAccess;
+            IndirectArgsDesc.Usage |= BUF_DrawIndirect | BUF_UnorderedAccess | BUF_SourceCopy;
             FRDGBufferRef IndirectArgsBuffer = GraphBuilder.CreateBuffer(
                 IndirectArgsDesc,
                 TEXT("GaussianSplat.IndirectArgs"));
@@ -174,35 +255,38 @@ namespace GaussianSplatPasses
                     InitSortParameters,
                     FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
 
-                for (uint32 K = 2; K <= PaddedPointCount; K <<= 1)
+                if (!GaussianSplatProfiling::ShouldSkipSort())
                 {
-                    for (uint32 J = K >> 1; J > 0; J >>= 1)
+                    for (uint32 K = 2; K <= PaddedPointCount; K <<= 1)
                     {
-                        FGaussianSplatPointsCullCS::FParameters* SortParameters = GraphBuilder.AllocParameters<FGaussianSplatPointsCullCS::FParameters>();
-                        SortParameters->NumElements = RenderPointCount;
-                        SortParameters->PaddedNumElements = PaddedPointCount;
-                        SortParameters->Stride = Stride;
-                        SortParameters->SortK = K;
-                        SortParameters->SortJ = J;
-                        SortParameters->PassType = 1;
-                        SortParameters->ViewWorldOrigin = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
-                        SortParameters->ViewForward = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
-                        SortParameters->ViewRectMin = FVector2f::ZeroVector;
-                        SortParameters->ViewSize = FVector2f::ZeroVector;
-                        SortParameters->PointSize = 0.0f;
-                        SortParameters->ViewProjectionMatrix = FMatrix44f::Identity;
-                        SortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
-                        SortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
-                        SortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
-                        SortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
-                        SortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
+                        for (uint32 J = K >> 1; J > 0; J >>= 1)
+                        {
+                            FGaussianSplatPointsCullCS::FParameters* SortParameters = GraphBuilder.AllocParameters<FGaussianSplatPointsCullCS::FParameters>();
+                            SortParameters->NumElements = RenderPointCount;
+                            SortParameters->PaddedNumElements = PaddedPointCount;
+                            SortParameters->Stride = Stride;
+                            SortParameters->SortK = K;
+                            SortParameters->SortJ = J;
+                            SortParameters->PassType = 1;
+                            SortParameters->ViewWorldOrigin = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+                            SortParameters->ViewForward = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+                            SortParameters->ViewRectMin = FVector2f::ZeroVector;
+                            SortParameters->ViewSize = FVector2f::ZeroVector;
+                            SortParameters->PointSize = 0.0f;
+                            SortParameters->ViewProjectionMatrix = FMatrix44f::Identity;
+                            SortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
+                            SortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
+                            SortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
+                            SortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
+                            SortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
 
-                        FComputeShaderUtils::AddPass(
-                            GraphBuilder,
-                            RDG_EVENT_NAME("GaussianSplatPointsSort.Bitonic K=%u J=%u", K, J),
-                            PointsCullCS,
-                            SortParameters,
-                            FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
+                            FComputeShaderUtils::AddPass(
+                                GraphBuilder,
+                                RDG_EVENT_NAME("GaussianSplatPointsSort.Bitonic K=%u J=%u", K, J),
+                                PointsCullCS,
+                                SortParameters,
+                                FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
+                        }
                     }
                 }
 
@@ -289,39 +373,42 @@ namespace GaussianSplatPasses
                     InitSortParameters,
                     FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
 
-                for (uint32 K = 2; K <= PaddedPointCount; K <<= 1)
+                if (!GaussianSplatProfiling::ShouldSkipSort())
                 {
-                    for (uint32 J = K >> 1; J > 0; J >>= 1)
+                    for (uint32 K = 2; K <= PaddedPointCount; K <<= 1)
                     {
-                        FGaussianSplatBillboardsCullCS::FParameters* SortParameters = GraphBuilder.AllocParameters<FGaussianSplatBillboardsCullCS::FParameters>();
-                        SortParameters->NumElements = RenderPointCount;
-                        SortParameters->PaddedNumElements = PaddedPointCount;
-                        SortParameters->Stride = Stride;
-                        SortParameters->SortK = K;
-                        SortParameters->SortJ = J;
-                        SortParameters->PassType = 1;
-                        SortParameters->ViewWorldOrigin = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
-                        SortParameters->ViewForward = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
-                        SortParameters->ViewRectMin = FVector2f::ZeroVector;
-                        SortParameters->ViewSize = FVector2f::ZeroVector;
-                        SortParameters->PointSize = 0.0f;
-                        SortParameters->ViewMatrix = FMatrix44f::Identity;
-                        SortParameters->ProjectionMatrix = FMatrix44f::Identity;
-                        SortParameters->ViewProjectionMatrix = FMatrix44f::Identity;
-                        SortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
-                        SortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
-                        SortParameters->SplatCovariance0Buffer = Resources->GetCovariance0SRV();
-                        SortParameters->SplatCovariance1Buffer = Resources->GetCovariance1SRV();
-                        SortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
-                        SortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
-                        SortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
+                        for (uint32 J = K >> 1; J > 0; J >>= 1)
+                        {
+                            FGaussianSplatBillboardsCullCS::FParameters* SortParameters = GraphBuilder.AllocParameters<FGaussianSplatBillboardsCullCS::FParameters>();
+                            SortParameters->NumElements = RenderPointCount;
+                            SortParameters->PaddedNumElements = PaddedPointCount;
+                            SortParameters->Stride = Stride;
+                            SortParameters->SortK = K;
+                            SortParameters->SortJ = J;
+                            SortParameters->PassType = 1;
+                            SortParameters->ViewWorldOrigin = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+                            SortParameters->ViewForward = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+                            SortParameters->ViewRectMin = FVector2f::ZeroVector;
+                            SortParameters->ViewSize = FVector2f::ZeroVector;
+                            SortParameters->PointSize = 0.0f;
+                            SortParameters->ViewMatrix = FMatrix44f::Identity;
+                            SortParameters->ProjectionMatrix = FMatrix44f::Identity;
+                            SortParameters->ViewProjectionMatrix = FMatrix44f::Identity;
+                            SortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
+                            SortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
+                            SortParameters->SplatCovariance0Buffer = Resources->GetCovariance0SRV();
+                            SortParameters->SplatCovariance1Buffer = Resources->GetCovariance1SRV();
+                            SortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
+                            SortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
+                            SortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
 
-                        FComputeShaderUtils::AddPass(
-                            GraphBuilder,
-                            RDG_EVENT_NAME("GaussianSplatBillboardsSort.Bitonic K=%u J=%u", K, J),
-                            BillboardsCullCS,
-                            SortParameters,
-                            FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
+                            FComputeShaderUtils::AddPass(
+                                GraphBuilder,
+                                RDG_EVENT_NAME("GaussianSplatBillboardsSort.Bitonic K=%u J=%u", K, J),
+                                BillboardsCullCS,
+                                SortParameters,
+                                FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
+                        }
                     }
                 }
 
@@ -384,6 +471,15 @@ namespace GaussianSplatPasses
                         SetShaderParameters(RHICmdList, BillboardsRasterPS, BillboardsRasterPS.GetPixelShader(), PassParameters->PS);
                         RHICmdList.DrawPrimitiveIndirect(IndirectArgsBuffer->GetIndirectRHICallBuffer(), 0);
                     });
+            }
+
+            if (bFirstBatch)
+            {
+                GaussianSplatProfiling::EnqueueVisibleCountReadback(
+                    GraphBuilder,
+                    IndirectArgsBuffer,
+                    RenderPointCount,
+                    PaddedPointCount);
             }
 
             bFirstBatch = false;
