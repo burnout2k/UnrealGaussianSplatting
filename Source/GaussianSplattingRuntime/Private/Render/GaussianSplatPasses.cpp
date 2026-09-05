@@ -9,7 +9,23 @@
 #include "RenderGraphResources.h"
 #include "RenderUtils.h"
 #include "RHI.h"
+#include "SceneView.h"
 #include "ScreenPass.h"
+#include "SystemTextures.h"
+
+BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatPointsRasterPassParameters, )
+    SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatPointsRasterVS::FParameters, VS)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatPointsRasterPS::FParameters, PS)
+    RDG_BUFFER_ACCESS(IndirectArgsBuffer, ERHIAccess::IndirectArgs)
+    RENDER_TARGET_BINDING_SLOTS()
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatBillboardsRasterPassParameters, )
+    SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatBillboardsRasterVS::FParameters, VS)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatBillboardsRasterPS::FParameters, PS)
+    RDG_BUFFER_ACCESS(IndirectArgsBuffer, ERHIAccess::IndirectArgs)
+    RENDER_TARGET_BINDING_SLOTS()
+END_SHADER_PARAMETER_STRUCT()
 
 namespace GaussianSplatPasses
 {
@@ -18,6 +34,7 @@ namespace GaussianSplatPasses
         const FSceneView& View,
         const FScreenPassTexture& SceneColor,
         const FScreenPassRenderTarget& Output,
+        FRDGTextureRef SceneDepthTexture,
         const TArray<FGaussianSplatRenderBatch>& Batches)
     {
         if (!SceneColor.IsValid() || !Output.IsValid() || Batches.IsEmpty())
@@ -41,6 +58,34 @@ namespace GaussianSplatPasses
             TexCreate_ShaderResource | TexCreate_RenderTargetable);
         FRDGTextureRef SplatTexture = GraphBuilder.CreateTexture(SplatTextureDesc, TEXT("GaussianSplat.SplatTexture"));
         const FScreenPassRenderTarget SplatOutput(SplatTexture, ERenderTargetLoadAction::EClear);
+        const bool bUseSceneDepth =
+            SceneDepthTexture != nullptr &&
+            EnumHasAnyFlags(SceneDepthTexture->Desc.Flags, TexCreate_ShaderResource) &&
+            SceneDepthTexture->Desc.NumSamples == 1;
+        FRDGTextureRef DepthTextureForSampling = bUseSceneDepth
+            ? SceneDepthTexture
+            : GSystemTextures.GetDepthDummy(GraphBuilder);
+        const TUniformBufferRef<FViewUniformShaderParameters> ViewUniformBuffer = View.ViewUniformBuffer;
+
+        const auto SetDepthTestParameters = [
+            bUseSceneDepth,
+            ViewRect,
+            DepthTextureForSampling,
+            ViewUniformBuffer](FGaussianSplatDepthTestParameters& Parameters)
+        {
+            Parameters.View = ViewUniformBuffer;
+            Parameters.UseSceneDepth = bUseSceneDepth ? 1u : 0u;
+            Parameters.OutputViewRectMin = FVector2f(
+                static_cast<float>(ViewRect.Min.X),
+                static_cast<float>(ViewRect.Min.Y));
+            Parameters.OutputViewSize = FVector2f(
+                static_cast<float>(ViewRect.Width()),
+                static_cast<float>(ViewRect.Height()));
+            Parameters.SceneDepthTextureSize = FVector2f(
+                static_cast<float>(DepthTextureForSampling->Desc.Extent.X),
+                static_cast<float>(DepthTextureForSampling->Desc.Extent.Y));
+            Parameters.SceneDepthTexture = DepthTextureForSampling;
+        };
 
         const FVector2f SceneColorTextureSize(
             static_cast<float>(FMath::Max(1, SceneColorExtent.X)),
@@ -161,7 +206,8 @@ namespace GaussianSplatPasses
                     }
                 }
 
-                FGaussianSplatPointsRasterVS::FParameters* RasterParameters = GraphBuilder.AllocParameters<FGaussianSplatPointsRasterVS::FParameters>();
+                FGaussianSplatPointsRasterPassParameters* PassParameters = GraphBuilder.AllocParameters<FGaussianSplatPointsRasterPassParameters>();
+                FGaussianSplatPointsRasterVS::FParameters* RasterParameters = &PassParameters->VS;
                 RasterParameters->ViewRectMin = FVector2f(static_cast<float>(ViewRect.Min.X), static_cast<float>(ViewRect.Min.Y));
                 RasterParameters->ViewSize = FVector2f(static_cast<float>(ViewRect.Width()), static_cast<float>(ViewRect.Height()));
                 RasterParameters->PointSize = Batch.PointSize;
@@ -172,16 +218,17 @@ namespace GaussianSplatPasses
                 RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(OrderBuffer, PF_R32_UINT));
                 RasterParameters->SplatPositionBuffer = Resources->GetPositionSRV();
                 RasterParameters->SplatColorBuffer = Resources->GetColorSRV();
-                RasterParameters->IndirectArgsBuffer = IndirectArgsBuffer;
-                RasterParameters->RenderTargets[0] = FRenderTargetBinding(
+                SetDepthTestParameters(PassParameters->PS.DepthTest);
+                PassParameters->IndirectArgsBuffer = IndirectArgsBuffer;
+                PassParameters->RenderTargets[0] = FRenderTargetBinding(
                     SplatOutput.Texture,
                     bFirstBatch ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad);
 
                 GraphBuilder.AddPass(
                     RDG_EVENT_NAME("GaussianSplatPointsRaster.DrawInstanced"),
-                    RasterParameters,
+                    PassParameters,
                     ERDGPassFlags::Raster,
-                    [RasterParameters, PointsRasterVS, PointsRasterPS, ViewRect, IndirectArgsBuffer](FRHICommandList& RHICmdList)
+                    [PassParameters, PointsRasterVS, PointsRasterPS, ViewRect, IndirectArgsBuffer](FRHICommandList& RHICmdList)
                     {
                         RHICmdList.SetViewport(
                             static_cast<float>(ViewRect.Min.X),
@@ -205,8 +252,8 @@ namespace GaussianSplatPasses
                         GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PointsRasterPS.GetPixelShader();
 
                         SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
-                        SetShaderParameters(RHICmdList, PointsRasterVS, PointsRasterVS.GetVertexShader(), *RasterParameters);
-                        SetShaderParameters(RHICmdList, PointsRasterPS, PointsRasterPS.GetPixelShader(), FGaussianSplatPointsRasterPS::FParameters());
+                        SetShaderParameters(RHICmdList, PointsRasterVS, PointsRasterVS.GetVertexShader(), PassParameters->VS);
+                        SetShaderParameters(RHICmdList, PointsRasterPS, PointsRasterPS.GetPixelShader(), PassParameters->PS);
                         RHICmdList.DrawPrimitiveIndirect(IndirectArgsBuffer->GetIndirectRHICallBuffer(), 0);
                     });
             }
@@ -278,7 +325,8 @@ namespace GaussianSplatPasses
                     }
                 }
 
-                FGaussianSplatBillboardsRasterVS::FParameters* RasterParameters = GraphBuilder.AllocParameters<FGaussianSplatBillboardsRasterVS::FParameters>();
+                FGaussianSplatBillboardsRasterPassParameters* PassParameters = GraphBuilder.AllocParameters<FGaussianSplatBillboardsRasterPassParameters>();
+                FGaussianSplatBillboardsRasterVS::FParameters* RasterParameters = &PassParameters->VS;
                 RasterParameters->ViewRectMin = FVector2f(static_cast<float>(ViewRect.Min.X), static_cast<float>(ViewRect.Min.Y));
                 RasterParameters->ViewSize = FVector2f(static_cast<float>(ViewRect.Width()), static_cast<float>(ViewRect.Height()));
                 RasterParameters->ViewWorldOrigin = FVector4f(ViewOrigin.X, ViewOrigin.Y, ViewOrigin.Z, 0.0f);
@@ -298,16 +346,17 @@ namespace GaussianSplatPasses
                 RasterParameters->SplatCovariance1Buffer = Resources->GetCovariance1SRV();
                 RasterParameters->SplatColorBuffer = Resources->GetColorSRV();
                 RasterParameters->SplatSHBuffer = Resources->GetSHSRV();
-                RasterParameters->IndirectArgsBuffer = IndirectArgsBuffer;
-                RasterParameters->RenderTargets[0] = FRenderTargetBinding(
+                SetDepthTestParameters(PassParameters->PS.DepthTest);
+                PassParameters->IndirectArgsBuffer = IndirectArgsBuffer;
+                PassParameters->RenderTargets[0] = FRenderTargetBinding(
                     SplatOutput.Texture,
                     bFirstBatch ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad);
 
                 GraphBuilder.AddPass(
                     RDG_EVENT_NAME("GaussianSplatBillboardsRaster.DrawInstanced"),
-                    RasterParameters,
+                    PassParameters,
                     ERDGPassFlags::Raster,
-                    [RasterParameters, BillboardsRasterVS, BillboardsRasterPS, ViewRect, IndirectArgsBuffer](FRHICommandList& RHICmdList)
+                    [PassParameters, BillboardsRasterVS, BillboardsRasterPS, ViewRect, IndirectArgsBuffer](FRHICommandList& RHICmdList)
                     {
                         RHICmdList.SetViewport(
                             static_cast<float>(ViewRect.Min.X),
@@ -331,8 +380,8 @@ namespace GaussianSplatPasses
                         GraphicsPSOInit.BoundShaderState.PixelShaderRHI = BillboardsRasterPS.GetPixelShader();
 
                         SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
-                        SetShaderParameters(RHICmdList, BillboardsRasterVS, BillboardsRasterVS.GetVertexShader(), *RasterParameters);
-                        SetShaderParameters(RHICmdList, BillboardsRasterPS, BillboardsRasterPS.GetPixelShader(), FGaussianSplatBillboardsRasterPS::FParameters());
+                        SetShaderParameters(RHICmdList, BillboardsRasterVS, BillboardsRasterVS.GetVertexShader(), PassParameters->VS);
+                        SetShaderParameters(RHICmdList, BillboardsRasterPS, BillboardsRasterPS.GetPixelShader(), PassParameters->PS);
                         RHICmdList.DrawPrimitiveIndirect(IndirectArgsBuffer->GetIndirectRHICallBuffer(), 0);
                     });
             }

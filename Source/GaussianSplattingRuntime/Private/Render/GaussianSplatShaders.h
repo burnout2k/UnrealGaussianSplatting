@@ -3,6 +3,15 @@
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
 
+BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatDepthTestParameters, )
+    SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+    SHADER_PARAMETER(uint32, UseSceneDepth)
+    SHADER_PARAMETER(FVector2f, OutputViewRectMin)
+    SHADER_PARAMETER(FVector2f, OutputViewSize)
+    SHADER_PARAMETER(FVector2f, SceneDepthTextureSize)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
+END_SHADER_PARAMETER_STRUCT()
+
 class FGaussianSplatPointsCullCS final : public FGlobalShader
 {
 public:
@@ -78,8 +87,6 @@ public:
         SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, SplatOrderBuffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatPositionBuffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatColorBuffer)
-        RDG_BUFFER_ACCESS(IndirectArgsBuffer, ERHIAccess::IndirectArgs)
-        RENDER_TARGET_BINDING_SLOTS()
     END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -90,6 +97,7 @@ public:
     SHADER_USE_PARAMETER_STRUCT(FGaussianSplatPointsRasterPS, FGlobalShader);
 
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatDepthTestParameters, DepthTest)
     END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -119,8 +127,6 @@ public:
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatCovariance1Buffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatColorBuffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatSHBuffer)
-        RDG_BUFFER_ACCESS(IndirectArgsBuffer, ERHIAccess::IndirectArgs)
-        RENDER_TARGET_BINDING_SLOTS()
     END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -131,6 +137,7 @@ public:
     SHADER_USE_PARAMETER_STRUCT(FGaussianSplatBillboardsRasterPS, FGlobalShader);
 
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatDepthTestParameters, DepthTest)
     END_SHADER_PARAMETER_STRUCT()
 };
 

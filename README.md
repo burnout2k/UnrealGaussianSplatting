@@ -28,6 +28,8 @@ This plugin is currently developed against **Unreal Engine 5.5.4**.
 - `Points` mode for debugging and validation
 - `Gaussian Billboards` mode as the main rendering path
 - Support for SH color, opacity, density scaling, and basic runtime controls
+- Depth-aware composition so nearer opaque Unreal objects remain visible in
+  front of Gaussian splats
 
 ## Project Layout
 
@@ -161,6 +163,8 @@ If you are using older placed instances, or if your source data already matches 
 - The current main rendering path is still a billboard-based 3DGS integration
 - Rendering quality is still behind a full original 3DGS rasterizer
 - More complete antialiasing / footprint / coverage alignment is still missing
+- Billboard occlusion uses each Gaussian's center depth; splats do not write to
+  Unreal's scene depth buffer
 - Runtime experience is still basic
   - no full loader actor workflow
   - no streaming / LOD solution yet

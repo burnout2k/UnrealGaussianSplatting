@@ -1,5 +1,6 @@
 #include "/Engine/Public/Platform.ush"
 #include "GaussianSplatCommon.ush"
+#include "GaussianSplatDepthTest.ush"
 
 StructuredBuffer<uint> SplatOrderBuffer;
 StructuredBuffer<float4> SplatPositionBuffer;
@@ -93,10 +94,11 @@ float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
     return max(Result, 0.0);
 }
 
-float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
+float2 ProjectToPixel(float3 WorldPos, out float SafeClipW, out float DeviceZ)
 {
     float4 Clip = mul(float4(WorldPos, 1.0), ViewProjectionMatrix);
     SafeClipW = max(abs(Clip.w), 1e-4);
+    DeviceZ = Clip.z / SafeClipW;
 
     float2 Ndc = Clip.xy / SafeClipW;
     return float2(
@@ -112,7 +114,8 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 
     float3 CenterWS = mul(float4(SplatPositionBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
     float SafeClipW = 0.0;
-    float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW);
+    float DeviceZ = 0.0;
+    float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW, DeviceZ);
     if (SafeClipW <= 1e-4)
     {
         Output.Position = asfloat(0x7fc00000);
@@ -164,7 +167,9 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     float2 Ndc = float2(
         2.0 * PixelPosInView.x / max(ViewSize.x, 1.0) - 1.0,
         1.0 - 2.0 * PixelPosInView.y / max(ViewSize.y, 1.0));
-    Output.Position = float4(Ndc, 0.0, 1.0);
+    // Use the Gaussian center depth for the billboard footprint. The raster
+    // pass reads, but does not modify, Unreal's opaque scene depth.
+    Output.Position = float4(Ndc, DeviceZ, 1.0);
     Output.QuadPos = QuadPos;
 
     float3 ViewDirWS = normalize(ViewWorldOrigin.xyz - CenterWS);
@@ -180,6 +185,8 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 
 float4 MainPS(VSOutput Input) : SV_Target0
 {
+    ApplyGaussianSplatSceneDepthTest(Input.Position);
+
     float Weight = exp(-dot(Input.QuadPos, Input.QuadPos));
     float Alpha = saturate(Input.Color.a * Weight);
     if (Alpha < (1.0 / 255.0))

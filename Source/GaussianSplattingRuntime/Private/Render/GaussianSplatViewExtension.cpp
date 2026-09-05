@@ -71,7 +71,23 @@ FScreenPassTexture FGaussianSplatViewExtension::PostProcessPass_RenderThread(FRD
         Output = FScreenPassRenderTarget::CreateFromInput(GraphBuilder, SceneColor, View.GetOverwriteLoadAction(), TEXT("GaussianSplat.PostProcessOutput"));
     }
 
-    return GaussianSplatPasses::AddPostProcessPass(GraphBuilder, View, SceneColor, Output, LocalPoints);
+    FRDGTextureRef SceneDepthTexture = nullptr;
+    if (Inputs.SceneTextures.SceneTextures)
+    {
+        SceneDepthTexture = Inputs.SceneTextures.SceneTextures->GetParameters()->SceneDepthTexture;
+    }
+    else if (Inputs.SceneTextures.MobileSceneTextures)
+    {
+        SceneDepthTexture = Inputs.SceneTextures.MobileSceneTextures->GetParameters()->SceneDepthTexture;
+    }
+
+    return GaussianSplatPasses::AddPostProcessPass(
+        GraphBuilder,
+        View,
+        SceneColor,
+        Output,
+        SceneDepthTexture,
+        LocalPoints);
 }
 
 void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread(const UWorld* TargetWorld)

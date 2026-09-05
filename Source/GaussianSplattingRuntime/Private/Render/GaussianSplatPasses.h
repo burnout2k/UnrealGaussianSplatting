@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "RenderGraphFwd.h"
 
 class FRDGBuilder;
 class FSceneView;
@@ -44,5 +45,6 @@ namespace GaussianSplatPasses
         const FSceneView& View,
         const FScreenPassTexture& SceneColor,
         const FScreenPassRenderTarget& Output,
+        FRDGTextureRef SceneDepthTexture,
         const TArray<FGaussianSplatRenderBatch>& Batches);
 }

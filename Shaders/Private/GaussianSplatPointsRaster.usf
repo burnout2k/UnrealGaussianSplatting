@@ -1,4 +1,5 @@
 #include "/Engine/Public/Platform.ush"
+#include "GaussianSplatDepthTest.ush"
 
 StructuredBuffer<uint> SplatOrderBuffer;
 StructuredBuffer<float4> SplatPositionBuffer;
@@ -18,10 +19,11 @@ struct VSOutput
     nointerpolation float4 Color : COLOR0;
 };
 
-float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
+float2 ProjectToPixel(float3 WorldPos, out float SafeClipW, out float DeviceZ)
 {
     float4 Clip = mul(float4(WorldPos, 1.0), ViewProjectionMatrix);
     SafeClipW = max(abs(Clip.w), 1e-4);
+    DeviceZ = Clip.z / SafeClipW;
 
     float2 Ndc = Clip.xy / SafeClipW;
     return float2(
@@ -37,7 +39,8 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 
     float3 CenterWS = mul(float4(SplatPositionBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
     float SafeClipW = 0.0;
-    float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW);
+    float DeviceZ = 0.0;
+    float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW, DeviceZ);
     if (SafeClipW <= 1e-4)
     {
         Output.Position = asfloat(0x7fc00000);
@@ -62,7 +65,9 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     float2 Ndc = float2(
         2.0 * PixelPosInView.x / max(ViewSize.x, 1.0) - 1.0,
         1.0 - 2.0 * PixelPosInView.y / max(ViewSize.y, 1.0));
-    Output.Position = float4(Ndc, 0.0, 1.0);
+    // Preserve the projected center depth so Unreal's opaque scene depth can
+    // occlude this preview point without writing splat depth back to the scene.
+    Output.Position = float4(Ndc, DeviceZ, 1.0);
 
     float4 BaseColor = SplatColorBuffer[InstanceID];
     Output.Color = float4(BaseColor.rgb, saturate(BaseColor.a * OpacityScale));
@@ -71,6 +76,8 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 
 float4 MainPS(VSOutput Input) : SV_Target0
 {
+    ApplyGaussianSplatSceneDepthTest(Input.Position);
+
     if (Input.Color.a < (1.0 / 255.0))
     {
         discard;

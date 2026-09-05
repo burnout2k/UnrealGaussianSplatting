@@ -1,0 +1,34 @@
+#pragma once
+
+#include "/Engine/Private/Common.ush"
+
+Texture2D SceneDepthTexture;
+
+uint UseSceneDepth;
+float2 OutputViewRectMin;
+float2 OutputViewSize;
+float2 SceneDepthTextureSize;
+
+void ApplyGaussianSplatSceneDepthTest(float4 PixelPosition)
+{
+    if (UseSceneDepth == 0)
+    {
+        return;
+    }
+
+    const float2 OutputPixel = PixelPosition.xy - OutputViewRectMin;
+    const float2 ViewUV = saturate(OutputPixel / max(OutputViewSize, float2(1.0, 1.0)));
+    const float2 DepthPixel = float2(View.ViewRectMinAndSize.xy) + ViewUV * float2(View.ViewRectMinAndSize.zw);
+    const int2 MaxDepthPixel = max(int2(SceneDepthTextureSize) - 1, int2(0, 0));
+    const int2 DepthPixelCoord = clamp(int2(DepthPixel), int2(0, 0), MaxDepthPixel);
+    const float SceneDeviceZ = SceneDepthTexture.Load(int3(DepthPixelCoord, 0)).r;
+
+#if HAS_INVERTED_Z_BUFFER
+    if (PixelPosition.z < SceneDeviceZ)
+#else
+    if (PixelPosition.z > SceneDeviceZ)
+#endif
+    {
+        discard;
+    }
+}
