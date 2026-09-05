@@ -49,7 +49,7 @@ public:
     bool bFrustumCull = true;
 
     // 防止调试绘制时把过多点一次性塞给 CPU 侧 PDI。
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splat|Preview", meta = (ClampMin = "1000", ClampMax = "2000000"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splat|Preview", meta = (ClampMin = "1000", ClampMax = "8000000"))
     int32 MaxRenderPoints = 250000;
 
     // 选择具体显示方式。Billboards 是运行时的主要目标模式。

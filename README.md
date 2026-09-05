@@ -93,6 +93,13 @@ Main component parameters:
 - `MaxRenderPoints`
 - `PreviewRenderMode`
 
+`MaxRenderPoints` limits the number drawn per view, while the asset-level
+`MaxGpuPointCount` limits the persistent GPU buffers. Both values must be at
+least the desired render count: increasing only `MaxGpuPointCount` uploads more
+splats but does not raise the per-view draw limit. `MaxRenderPoints` defaults to
+250,000 and can be raised to 8,000,000, but multi-million-splat rendering has a
+substantial sorting and GPU-memory cost.
+
 ### 3. Standalone Editor Panel
 
 Open:
