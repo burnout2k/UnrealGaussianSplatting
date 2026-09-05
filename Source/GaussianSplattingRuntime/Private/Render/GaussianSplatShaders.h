@@ -149,6 +149,7 @@ public:
 
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
         SHADER_PARAMETER(FVector2f, SceneColorTextureSize)
+        SHADER_PARAMETER(uint32, ConvertSplatToLinear)
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
         SHADER_PARAMETER_SAMPLER(SamplerState, SceneColorSampler)
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SplatTexture)

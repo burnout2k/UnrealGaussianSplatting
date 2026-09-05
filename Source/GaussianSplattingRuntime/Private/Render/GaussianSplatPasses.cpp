@@ -391,6 +391,11 @@ namespace GaussianSplatPasses
 
         FGaussianSplatCompositePS::FParameters* CompositeParameters = GraphBuilder.AllocParameters<FGaussianSplatCompositePS::FParameters>();
         CompositeParameters->SceneColorTextureSize = SceneColorTextureSize;
+        // CARLA RGB captures use tone-mapped linear sRGB here, whereas the
+        // normal SDR viewport uses display-encoded colours. SplatTexture is
+        // accumulated in the splat data's display space for both views.
+        CompositeParameters->ConvertSplatToLinear =
+            View.Family != nullptr && View.Family->SceneCaptureSource == SCS_FinalToneCurveHDR ? 1u : 0u;
         CompositeParameters->SceneColorTexture = SceneColor.Texture;
         CompositeParameters->SceneColorSampler = TStaticSamplerState<SF_Point>::GetRHI();
         CompositeParameters->SplatTexture = SplatTexture;

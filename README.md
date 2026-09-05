@@ -31,6 +31,23 @@ This plugin is currently developed against **Unreal Engine 5.5.4**.
 - Depth-aware composition so nearer opaque Unreal objects remain visible in
   front of Gaussian splats
 
+## CARLA RGB colour matching
+
+CARLA's `SCS_FinalToneCurveHDR` RGB capture expects tone-mapped linear sRGB
+at the plugin's after-tonemap composite pass. The normal SDR viewport expects
+display-encoded colours. For this capture mode only, the compositor decodes the
+accumulated splat layer from sRGB to linear before blending it with Unreal's
+scene colour. It unpremultiplies and re-premultiplies alpha around the conversion
+to preserve transparent edges. The viewport path, native scene colour, and
+depth testing are unchanged; other capture/HDR output modes are not covered by
+this correction.
+
+Rebuild the plugin and recook/repackage shaders before testing a packaged
+server. Existing splat assets do not need reimporting or point-count changes.
+Compare the server viewport and an attached CARLA RGB camera at the same pose,
+including both opaque scenery and splat edges beside a normal Unreal vehicle.
+This corrects colour encoding, not differences in camera exposure or lighting.
+
 ## Project Layout
 
 - `Source/GaussianSplattingRuntime`
