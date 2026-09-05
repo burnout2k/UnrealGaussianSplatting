@@ -25,14 +25,21 @@ void LoadCovariance3D(
     Cov3D1 = float3(Cov0.w, Cov1.x, Cov1.y) * ScaleFactor2;
 }
 
-float3 CalcCovariance2D(
+float3 CalcConic(float3 Cov2D)
+{
+    float det = Cov2D.x * Cov2D.z - Cov2D.y * Cov2D.y;
+    return float3(Cov2D.z, -Cov2D.y, Cov2D.x) * rcp(max(det, 1e-8));
+}
+
+float3 CalcCovariance2DEx(
     float3 WorldPos,
     float3 Cov3D0,
     float3 Cov3D1,
     float4x4 LocalToWorldMatrix,
     float4x4 ViewMatrix,
     float4x4 ProjectionMatrix,
-    float2 ViewSize)
+    float2 ViewSize,
+    out float2 OutDepthGradientPx)
 {
     float3x3 V = MakeFloat3x3FromRows(
         float3(Cov3D0.x, Cov3D0.y, Cov3D0.z),
@@ -85,13 +92,49 @@ float3 CalcCovariance2D(
     float CovXX = dot(CovRow0, LocalJacobianRow0) + 0.3;
     float CovXY = dot(CovRow0, LocalJacobianRow1);
     float CovYY = dot(CovRow1, LocalJacobianRow1) + 0.3;
-    return float3(CovXX, CovXY, CovYY);
+    float3 Cov2D = float3(CovXX, CovXY, CovYY);
+
+    // A Gaussian is a volume, so its depth is not constant across the screen
+    // footprint. Testing the whole splat against its center depth makes
+    // occlusion all-or-nothing, which shows up as background splats bleeding
+    // over the silhouette of nearer geometry.
+    //
+    // For a Gaussian the expected depth conditioned on a screen offset is
+    // LINEAR in that offset: E[dz | dp] = Cov(z, xy) * inverse(Cov2D) * dp.
+    // Emitting that gradient lets the vertex shader give each quad corner its
+    // own depth and the rasterizer interpolate between them for free.
+    float3 ClipGradZ = float3(ViewProjectionMatrix[0][2], ViewProjectionMatrix[1][2], ViewProjectionMatrix[2][2]);
+    float3 JacobianRow2 = (ClipGradZ * SafeW - Clip.z * ClipGradW) * InvW2;
+    float3 LocalJacobianRow2 = float3(
+        dot(JacobianRow2, LocalToWorldRow0),
+        dot(JacobianRow2, LocalToWorldRow1),
+        dot(JacobianRow2, LocalToWorldRow2));
+    float3 CovRow2 = mul(LocalJacobianRow2, V);
+    float CovXZ = dot(CovRow2, LocalJacobianRow0);
+    float CovYZ = dot(CovRow2, LocalJacobianRow1);
+
+    float3 Conic = CalcConic(Cov2D);
+    OutDepthGradientPx = float2(
+        CovXZ * Conic.x + CovYZ * Conic.y,
+        CovXZ * Conic.y + CovYZ * Conic.z);
+
+    return Cov2D;
 }
 
-float3 CalcConic(float3 Cov2D)
+// Original signature, for callers that do not need the depth gradient.
+float3 CalcCovariance2D(
+    float3 WorldPos,
+    float3 Cov3D0,
+    float3 Cov3D1,
+    float4x4 LocalToWorldMatrix,
+    float4x4 ViewMatrix,
+    float4x4 ProjectionMatrix,
+    float2 ViewSize)
 {
-    float det = Cov2D.x * Cov2D.z - Cov2D.y * Cov2D.y;
-    return float3(Cov2D.z, -Cov2D.y, Cov2D.x) * rcp(max(det, 1e-8));
+    float2 UnusedGradient;
+    return CalcCovariance2DEx(
+        WorldPos, Cov3D0, Cov3D1, LocalToWorldMatrix,
+        ViewMatrix, ProjectionMatrix, ViewSize, UnusedGradient);
 }
 
 float CalcPowerFromConic(float3 Conic, float2 Delta)

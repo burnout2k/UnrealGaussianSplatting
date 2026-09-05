@@ -118,6 +118,19 @@ namespace GaussianSplatProfiling
     {
         return static_cast<uint32>(FMath::Clamp(CVarSortKeyBits.GetValueOnRenderThread(), 8, 32));
     }
+
+    static TAutoConsoleVariable<int32> CVarPerPixelDepth(
+        TEXT("r.GaussianSplat.PerPixelDepth"),
+        1,
+        TEXT("1 = depth-test each splat pixel against the Gaussian's own depth there; ")
+        TEXT("0 = test the whole splat against its center depth (the original ")
+        TEXT("behaviour, which lets splats bleed over nearer geometry)."),
+        ECVF_RenderThreadSafe);
+
+    bool ShouldUsePerPixelDepth()
+    {
+        return CVarPerPixelDepth.GetValueOnRenderThread() != 0;
+    }
 }
 
 namespace GaussianSplatSorting
@@ -610,6 +623,7 @@ namespace GaussianSplatPasses
                 RasterParameters->SplatCovariance0Buffer = Resources->GetCovariance0SRV();
                 RasterParameters->SplatCovariance1Buffer = Resources->GetCovariance1SRV();
                 RasterParameters->SplatColorBuffer = Resources->GetColorSRV();
+                RasterParameters->PerPixelDepth = GaussianSplatProfiling::ShouldUsePerPixelDepth() ? 1u : 0u;
                 RasterParameters->SplatSHBuffer = Resources->GetSHSRV();
                 SetDepthTestParameters(PassParameters->PS.DepthTest);
                 PassParameters->IndirectArgsBuffer = IndirectArgsBuffer;

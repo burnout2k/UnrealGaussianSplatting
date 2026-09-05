@@ -15,6 +15,7 @@ float4 ViewWorldOrigin;
 float PointSize;
 float OpacityScale;
 uint Stride;
+uint PerPixelDepth;
 float4x4 ViewMatrix;
 float4x4 LocalToWorldMatrix;
 float4x4 ProjectionMatrix;
@@ -126,14 +127,16 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     float3 Cov3D1;
     LoadCovariance3D(SplatCovariance0Buffer, SplatCovariance1Buffer, InstanceID, PointSize * 0.35, Cov3D0, Cov3D1);
 
-    float3 Cov2D = CalcCovariance2D(
+    float2 DepthGradientPx;
+    float3 Cov2D = CalcCovariance2DEx(
         CenterWS,
         Cov3D0,
         Cov3D1,
         LocalToWorldMatrix,
         ViewMatrix,
         ProjectionMatrix,
-        ViewSize);
+        ViewSize,
+        DepthGradientPx);
 
     Cov2D.x = max(Cov2D.x, 1.0);
     Cov2D.z = max(Cov2D.z, 1.0);
@@ -167,9 +170,19 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     float2 Ndc = float2(
         2.0 * PixelPosInView.x / max(ViewSize.x, 1.0) - 1.0,
         1.0 - 2.0 * PixelPosInView.y / max(ViewSize.y, 1.0));
-    // Use the Gaussian center depth for the billboard footprint. The raster
-    // pass reads, but does not modify, Unreal's opaque scene depth.
-    Output.Position = float4(Ndc, DeviceZ, 1.0);
+    // Give each quad corner the Gaussian's own depth at that offset instead of
+    // reusing the center depth, so the rasterizer interpolates a depth that
+    // follows the splat across its footprint. Without this the scene-depth test
+    // is all-or-nothing per splat and background splats bleed over the
+    // silhouette of nearer objects. Clamped because a splat seen nearly edge-on
+    // has a steep gradient that could otherwise push a corner out of range.
+    // The raster pass reads, but does not modify, Unreal's opaque scene depth.
+    float CornerDeviceZ = DeviceZ;
+    if (PerPixelDepth != 0)
+    {
+        CornerDeviceZ = clamp(DeviceZ + dot(DepthGradientPx, DeltaPx), 0.0, 1.0);
+    }
+    Output.Position = float4(Ndc, CornerDeviceZ, 1.0);
     Output.QuadPos = QuadPos;
 
     float3 ViewDirWS = normalize(ViewWorldOrigin.xyz - CenterWS);

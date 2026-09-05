@@ -171,6 +171,30 @@ This is a practical compensation for the common size mismatch between Gaussian /
 
 If you are using older placed instances, or if your source data already matches Unreal scale, you may still need to adjust actor scale manually.
 
+## Depth occlusion
+
+Splats read Unreal's opaque scene depth and reject pixels behind nearer
+geometry, so vehicles and props stay visible inside a splat map. Splats never
+write depth, so they cannot occlude Unreal geometry, only be occluded by it.
+
+`r.GaussianSplat.PerPixelDepth` (default 1) controls how the splat's own depth
+is derived:
+
+- `0` -- one depth per splat, its projected centre. Occlusion is all-or-nothing
+  per splat.
+- `1` -- depth varies across the footprint. For a Gaussian the expected depth
+  conditioned on a screen offset is *linear* in that offset
+  (`Cov(z,xy) * inverse(Cov2D) * offset`), so the vertex shader gives each quad
+  corner its own depth and the rasterizer interpolates. Measured cost: neutral.
+
+Per-pixel is clearest on large hard surfaces intersecting a lot of splat volume.
+It does **not** help where splats are genuinely in front of an object -- capture
+floaters, or an object embedded in a splat surface such as a car resting on a
+splat-reconstructed road. That blending is correct behaviour, not a depth bug.
+
+Known limitation: occlusion uses the Gaussian's depth, not a per-pixel surface
+intersection, so boundaries against hard geometry stay soft.
+
 ## Depth sorting
 
 Splats are semi-transparent, so they must be drawn in depth order every frame.
