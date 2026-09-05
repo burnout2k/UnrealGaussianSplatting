@@ -171,6 +171,44 @@ This is a practical compensation for the common size mismatch between Gaussian /
 
 If you are using older placed instances, or if your source data already matches Unreal scale, you may still need to adjust actor scale manually.
 
+## Depth sorting
+
+Splats are semi-transparent, so they must be drawn in depth order every frame.
+Two implementations, selected by `r.GaussianSplat.SortMode`:
+
+| Mode | Sort | Dispatches at 3.9M splats |
+|---|---|---|
+| `0` | bitonic network | 253 |
+| `1` (default) | UE GPU radix sort (`SortGPUBuffers`) | 8 |
+
+Bitonic needs `½·log₂N·(log₂N+1)` stages, each a separate dispatch with a full
+pipeline drain between them, and pads the array to a power of two. Radix sorts
+4 bits per pass, so a 32-bit key takes 8 passes regardless of element count, and
+needs no padding.
+
+Measured on tartu_demo (3,885,113 splats, 8 GB GPU, one viewport):
+
+| | Frame |
+|---|---|
+| bitonic | 55.1 ms |
+| radix | 32.8 ms |
+| no sort at all (`r.GaussianSplat.SkipSort 1`) | 22.9 ms |
+
+So the sort went from 32.2 ms to 9.9 ms. It does not reach the ~3 ms the pass
+count suggests, most likely because `GPUSort.cpp` caps itself at
+`MAX_GROUP_COUNT 64` (8,192 threads in flight) -- tuned for particle counts, not
+millions of splats. Raising it further means porting a modern high-occupancy
+`DeviceRadixSort` into the plugin rather than editing engine source.
+
+Notes for anyone changing this:
+- The key/value buffers are typed (`PF_R32_UINT`, `Buffer<uint>`), not
+  structured, because that is what the radix shaders bind.
+- The rasterizer is bound at record time, so which ping-pong buffer holds the
+  result is *predicted* on the CPU from the pass count. `GetGPUSortPassCount()`
+  is not `ENGINE_API`, so that logic is mirrored locally and cross-checked
+  against the sort's actual return value at runtime -- a mismatch logs an error
+  under `LogGaussianSplatProfile`.
+
 ## Profiling
 
 The renderer declares its own GPU stats, so `stat GPU` breaks splat cost down by phase:

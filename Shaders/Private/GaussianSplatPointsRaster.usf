@@ -1,7 +1,7 @@
 #include "/Engine/Public/Platform.ush"
 #include "GaussianSplatDepthTest.ush"
 
-StructuredBuffer<uint> SplatOrderBuffer;
+Buffer<uint> SplatOrderBuffer;
 StructuredBuffer<float4> SplatPositionBuffer;
 StructuredBuffer<float4> SplatColorBuffer;
 

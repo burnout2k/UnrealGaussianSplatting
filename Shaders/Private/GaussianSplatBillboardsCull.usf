@@ -5,8 +5,8 @@ StructuredBuffer<float4> SplatPositionBuffer;
 StructuredBuffer<float4> SplatCovariance0Buffer;
 StructuredBuffer<float4> SplatCovariance1Buffer;
 
-RWStructuredBuffer<uint> SplatOrderBufferUAV;
-RWStructuredBuffer<uint> SplatKeyBufferUAV;
+RWBuffer<uint> SplatOrderBufferUAV;
+RWBuffer<uint> SplatKeyBufferUAV;
 RWBuffer<uint> SplatIndirectArgsUAV;
 
 uint NumElements;

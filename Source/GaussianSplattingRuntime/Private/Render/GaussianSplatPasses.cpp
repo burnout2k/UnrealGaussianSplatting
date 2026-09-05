@@ -13,6 +13,7 @@
 #include "ScreenPass.h"
 #include "SystemTextures.h"
 #include "HAL/IConsoleManager.h"
+#include "GPUSort.h"
 #include "RHIGPUReadback.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatProfile, Log, All);
@@ -91,6 +92,128 @@ namespace GaussianSplatProfiling
     bool ShouldSkipSort()
     {
         return CVarSkipSort.GetValueOnRenderThread() != 0;
+    }
+
+    static TAutoConsoleVariable<int32> CVarSortMode(
+        TEXT("r.GaussianSplat.SortMode"),
+        1,
+        TEXT("0 = bitonic (253 dispatches), 1 = UE GPU radix sort (8 passes)."),
+        ECVF_RenderThreadSafe);
+
+    bool ShouldUseRadixSort()
+    {
+        return CVarSortMode.GetValueOnRenderThread() == 1;
+    }
+}
+
+namespace GaussianSplatSorting
+{
+    // Only buffer *access* is declared, not views: RDG rejects a resource bound as
+    // both SRV and UAV in one pass, and the radix sort needs both. Views come from
+    // the pooled buffers inside the pass, where SortGPUBuffers does its own
+    // transitions.
+    BEGIN_SHADER_PARAMETER_STRUCT(FRadixSortPassParameters, )
+        RDG_BUFFER_ACCESS(Keys0, ERHIAccess::UAVCompute)
+        RDG_BUFFER_ACCESS(Keys1, ERHIAccess::UAVCompute)
+        RDG_BUFFER_ACCESS(Values0, ERHIAccess::UAVCompute)
+        RDG_BUFFER_ACCESS(Values1, ERHIAccess::UAVCompute)
+    END_SHADER_PARAMETER_STRUCT()
+
+    // GetGPUSortPassCount() is declared without ENGINE_API, so it does not link
+    // from outside the Engine module. Mirror it here; the constants are private
+    // #defines in GPUSort.cpp (GPUSORT_BITCOUNT 32, RADIX_BITS 4). The prediction
+    // is checked against SortGPUBuffers' actual return value at runtime.
+    static int32 GetRadixSortPassCount(uint32 KeyMask)
+    {
+        constexpr int32 SortBitCount = 32;
+        constexpr int32 RadixBits = 4;
+        int32 PassesRequired = 0;
+        uint32 PassBits = (1u << RadixBits) - 1u;
+        for (int32 PassIndex = 0; PassIndex < SortBitCount / RadixBits; ++PassIndex)
+        {
+            if ((PassBits & KeyMask) != 0)
+            {
+                ++PassesRequired;
+            }
+            PassBits <<= RadixBits;
+        }
+        return PassesRequired;
+    }
+
+    // Replaces the bitonic network with UE's 4-bit-digit radix sort: 8 passes for a
+    // full 32-bit key instead of 253, and no power-of-two padding. Returns whichever
+    // value buffer ends up holding the sorted splat indices.
+    FRDGBufferRef AddRadixSortPass(
+        FRDGBuilder& GraphBuilder,
+        ERHIFeatureLevel::Type FeatureLevel,
+        FRDGBufferRef Values0,
+        FRDGBufferRef Values1,
+        FRDGBufferRef Keys0,
+        FRDGBufferRef Keys1,
+        uint32 Count)
+    {
+        const uint32 KeyMask = 0xFFFFFFFFu;
+        const int32 PassCount = GetRadixSortPassCount(KeyMask);
+        if (Count == 0 || PassCount == 0)
+        {
+            return Values0;
+        }
+
+        const TRefCountPtr<FRDGPooledBuffer> PooledKeys0 = GraphBuilder.ConvertToExternalBuffer(Keys0);
+        const TRefCountPtr<FRDGPooledBuffer> PooledKeys1 = GraphBuilder.ConvertToExternalBuffer(Keys1);
+        const TRefCountPtr<FRDGPooledBuffer> PooledValues0 = GraphBuilder.ConvertToExternalBuffer(Values0);
+        const TRefCountPtr<FRDGPooledBuffer> PooledValues1 = GraphBuilder.ConvertToExternalBuffer(Values1);
+
+        FRadixSortPassParameters* Parameters = GraphBuilder.AllocParameters<FRadixSortPassParameters>();
+        Parameters->Keys0 = Keys0;
+        Parameters->Keys1 = Keys1;
+        Parameters->Values0 = Values0;
+        Parameters->Values1 = Values1;
+
+        GraphBuilder.AddPass(
+            RDG_EVENT_NAME("GaussianSplatRadixSort (%u keys, %d passes)", Count, PassCount),
+            Parameters,
+            ERDGPassFlags::Compute,
+            [PooledKeys0, PooledKeys1, PooledValues0, PooledValues1, FeatureLevel, Count, KeyMask,
+             PredictedResultIndex = PassCount % 2]
+            (FRHICommandList& RHICmdList)
+            {
+                const FRHIBufferSRVCreateInfo SRVInfo(PF_R32_UINT);
+                const FRHIBufferUAVCreateInfo UAVInfo(PF_R32_UINT);
+
+                FGPUSortBuffers SortBuffers;
+                SortBuffers.RemoteKeySRVs[0] = PooledKeys0->GetOrCreateSRV(RHICmdList, SRVInfo);
+                SortBuffers.RemoteKeySRVs[1] = PooledKeys1->GetOrCreateSRV(RHICmdList, SRVInfo);
+                SortBuffers.RemoteKeyUAVs[0] = PooledKeys0->GetOrCreateUAV(RHICmdList, UAVInfo);
+                SortBuffers.RemoteKeyUAVs[1] = PooledKeys1->GetOrCreateUAV(RHICmdList, UAVInfo);
+                SortBuffers.RemoteValueSRVs[0] = PooledValues0->GetOrCreateSRV(RHICmdList, SRVInfo);
+                SortBuffers.RemoteValueSRVs[1] = PooledValues1->GetOrCreateSRV(RHICmdList, SRVInfo);
+                SortBuffers.RemoteValueUAVs[0] = PooledValues0->GetOrCreateUAV(RHICmdList, UAVInfo);
+                SortBuffers.RemoteValueUAVs[1] = PooledValues1->GetOrCreateUAV(RHICmdList, UAVInfo);
+
+                const int32 ResultIndex = SortGPUBuffers(
+                    RHICmdList,
+                    SortBuffers,
+                    /*BufferIndex=*/ 0,
+                    KeyMask,
+                    static_cast<int32>(Count),
+                    FeatureLevel);
+
+                // The rasterizer was bound at record time using the predicted index.
+                // If these ever disagree the splats would draw from the wrong buffer,
+                // so surface it loudly rather than rendering silent garbage.
+                if (ResultIndex != PredictedResultIndex)
+                {
+                    UE_LOG(
+                        LogGaussianSplatProfile,
+                        Error,
+                        TEXT("Radix sort landed in buffer %d but %d was predicted; splat order is wrong."),
+                        ResultIndex,
+                        PredictedResultIndex);
+                }
+            });
+
+        return (PassCount % 2) == 0 ? Values0 : Values1;
     }
 }
 
@@ -199,12 +322,18 @@ namespace GaussianSplatPasses
 
             const uint32 PaddedPointCount = FMath::RoundUpToPowerOfTwo(FMath::Max(1u, RenderPointCount));
 
-            FRDGBufferRef OrderBuffer = GraphBuilder.CreateBuffer(
-                FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), PaddedPointCount),
-                TEXT("GaussianSplat.OrderBuffer"));
-            FRDGBufferRef KeyBuffer = GraphBuilder.CreateBuffer(
-                FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), PaddedPointCount),
-                TEXT("GaussianSplat.KeyBuffer"));
+            // Typed (PF_R32_UINT), not structured: the radix sort binds these as
+            // Buffer<uint>/RWBuffer<uint>. The Alt pair is its ping-pong target and
+            // is untouched by the bitonic path.
+            const auto CreateSortBuffer = [&GraphBuilder, PaddedPointCount](const TCHAR* Name)
+            {
+                return GraphBuilder.CreateBuffer(
+                    FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), PaddedPointCount), Name);
+            };
+            FRDGBufferRef OrderBuffer = CreateSortBuffer(TEXT("GaussianSplat.OrderBuffer"));
+            FRDGBufferRef KeyBuffer = CreateSortBuffer(TEXT("GaussianSplat.KeyBuffer"));
+            FRDGBufferRef OrderBufferAlt = CreateSortBuffer(TEXT("GaussianSplat.OrderBufferAlt"));
+            FRDGBufferRef KeyBufferAlt = CreateSortBuffer(TEXT("GaussianSplat.KeyBufferAlt"));
             FRDGBufferDesc IndirectArgsDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 4);
             IndirectArgsDesc.Usage |= BUF_DrawIndirect | BUF_UnorderedAccess | BUF_SourceCopy;
             FRDGBufferRef IndirectArgsBuffer = GraphBuilder.CreateBuffer(
@@ -218,6 +347,14 @@ namespace GaussianSplatPasses
             AddClearUAVPass(
                 GraphBuilder,
                 GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT)),
+                0xffffffffu);
+            AddClearUAVPass(
+                GraphBuilder,
+                GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBufferAlt, PF_R32_UINT)),
+                0u);
+            AddClearUAVPass(
+                GraphBuilder,
+                GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBufferAlt, PF_R32_UINT)),
                 0xffffffffu);
             AddClearUAVPass(
                 GraphBuilder,
@@ -255,7 +392,19 @@ namespace GaussianSplatPasses
                     InitSortParameters,
                     FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
 
-                if (!GaussianSplatProfiling::ShouldSkipSort())
+                FRDGBufferRef SortedOrderBuffer = OrderBuffer;
+                if (GaussianSplatProfiling::ShouldUseRadixSort())
+                {
+                    SortedOrderBuffer = GaussianSplatSorting::AddRadixSortPass(
+                        GraphBuilder,
+                        View.GetFeatureLevel(),
+                        OrderBuffer,
+                        OrderBufferAlt,
+                        KeyBuffer,
+                        KeyBufferAlt,
+                        RenderPointCount);
+                }
+                else if (!GaussianSplatProfiling::ShouldSkipSort())
                 {
                     for (uint32 K = 2; K <= PaddedPointCount; K <<= 1)
                     {
@@ -299,7 +448,7 @@ namespace GaussianSplatPasses
                 RasterParameters->Stride = Stride;
                 RasterParameters->LocalToWorldMatrix = Batch.LocalToWorld;
                 RasterParameters->ViewProjectionMatrix = ViewProjection;
-                RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(OrderBuffer, PF_R32_UINT));
+                RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedOrderBuffer, PF_R32_UINT));
                 RasterParameters->SplatPositionBuffer = Resources->GetPositionSRV();
                 RasterParameters->SplatColorBuffer = Resources->GetColorSRV();
                 SetDepthTestParameters(PassParameters->PS.DepthTest);
@@ -373,7 +522,19 @@ namespace GaussianSplatPasses
                     InitSortParameters,
                     FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
 
-                if (!GaussianSplatProfiling::ShouldSkipSort())
+                FRDGBufferRef SortedOrderBuffer = OrderBuffer;
+                if (GaussianSplatProfiling::ShouldUseRadixSort())
+                {
+                    SortedOrderBuffer = GaussianSplatSorting::AddRadixSortPass(
+                        GraphBuilder,
+                        View.GetFeatureLevel(),
+                        OrderBuffer,
+                        OrderBufferAlt,
+                        KeyBuffer,
+                        KeyBufferAlt,
+                        RenderPointCount);
+                }
+                else if (!GaussianSplatProfiling::ShouldSkipSort())
                 {
                     for (uint32 K = 2; K <= PaddedPointCount; K <<= 1)
                     {
@@ -427,7 +588,7 @@ namespace GaussianSplatPasses
                 RasterParameters->WorldToLocalRow0 = Batch.WorldToLocalRow0;
                 RasterParameters->WorldToLocalRow1 = Batch.WorldToLocalRow1;
                 RasterParameters->WorldToLocalRow2 = Batch.WorldToLocalRow2;
-                RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(OrderBuffer, PF_R32_UINT));
+                RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedOrderBuffer, PF_R32_UINT));
                 RasterParameters->SplatPositionBuffer = Resources->GetPositionSRV();
                 RasterParameters->SplatCovariance0Buffer = Resources->GetCovariance0SRV();
                 RasterParameters->SplatCovariance1Buffer = Resources->GetCovariance1SRV();
