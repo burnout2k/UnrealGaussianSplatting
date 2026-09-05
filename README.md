@@ -186,19 +186,43 @@ pipeline drain between them, and pads the array to a power of two. Radix sorts
 4 bits per pass, so a 32-bit key takes 8 passes regardless of element count, and
 needs no padding.
 
-Measured on tartu_demo (3,885,113 splats, 8 GB GPU, one viewport):
+### Key width
+
+`EncodeDepthKey()` is `asuint()` of the view-space depth. That is monotonic for
+positive floats, so the key can be shifted right to drop low mantissa bits
+without breaking ordering -- and fewer significant bits means fewer radix
+passes. `r.GaussianSplat.SortKeyBits` controls this (one pass per 4 bits):
+
+| Bits | Passes | tartu_demo |
+|---|---|---|
+| 32 | 8 | 30.8 ms |
+| **20 (default)** | **5** | **27.9 ms** -- no visible difference from 32 |
+| 16 | 4 | visibly wrong; do not use |
+
+Ties are drawn in cull order rather than true depth order. Radix is stable, so
+the error is consistent frame to frame rather than flickering, which makes it
+easy to miss on a still image -- move the camera when evaluating a new value.
+
+### Measurements
+
+On tartu_demo (3,885,113 splats, 8 GB GPU, one viewport):
 
 | | Frame |
 |---|---|
-| bitonic | 55.1 ms |
-| radix | 32.8 ms |
+| bitonic, 32-bit keys | 55.1 ms (18 fps) |
+| radix, 32-bit keys | 32.8 ms (30 fps) |
+| radix, 20-bit keys | 27.9 ms (36 fps) |
 | no sort at all (`r.GaussianSplat.SkipSort 1`) | 22.9 ms |
 
-So the sort went from 32.2 ms to 9.9 ms. It does not reach the ~3 ms the pass
+So the sort went from ~32 ms to ~5 ms. It does not reach the ~3 ms the pass
 count suggests, most likely because `GPUSort.cpp` caps itself at
 `MAX_GROUP_COUNT 64` (8,192 threads in flight) -- tuned for particle counts, not
 millions of splats. Raising it further means porting a modern high-occupancy
 `DeviceRadixSort` into the plugin rather than editing engine source.
+
+All three knobs are plain CVars -- console for the session,
+`[SystemSettings]` in `Config/DefaultEngine.ini` to persist (works in packaged
+builds, which have no console), or `-ExecCmds=` on the command line.
 
 Notes for anyone changing this:
 - The key/value buffers are typed (`PF_R32_UINT`, `Buffer<uint>`), not

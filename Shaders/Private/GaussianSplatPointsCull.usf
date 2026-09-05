@@ -2,6 +2,7 @@
 
 StructuredBuffer<float4> SplatPositionBuffer;
 
+uint SortKeyShift;
 RWBuffer<uint> SplatOrderBufferUAV;
 RWBuffer<uint> SplatKeyBufferUAV;
 RWBuffer<uint> SplatIndirectArgsUAV;
@@ -88,7 +89,7 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
                 uint VisibleIndex = 0;
                 InterlockedAdd(SplatIndirectArgsUAV[1], 1, VisibleIndex);
                 SplatOrderBufferUAV[VisibleIndex] = Index;
-                SplatKeyBufferUAV[VisibleIndex] = EncodeDepthKey(Depth);
+                SplatKeyBufferUAV[VisibleIndex] = EncodeDepthKey(Depth) >> SortKeyShift;
             }
         }
         return;

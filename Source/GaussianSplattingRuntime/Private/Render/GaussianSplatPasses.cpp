@@ -104,6 +104,20 @@ namespace GaussianSplatProfiling
     {
         return CVarSortMode.GetValueOnRenderThread() == 1;
     }
+
+    static TAutoConsoleVariable<int32> CVarSortKeyBits(
+        TEXT("r.GaussianSplat.SortKeyBits"),
+        20,
+        TEXT("Significant bits of the depth key (8-32). The radix sort spends one ")
+        TEXT("pass per 4 bits, so the default 20 costs 5 passes instead of 8. Fewer ")
+        TEXT("bits means more ties: 20 was indistinguishable from 32 on tartu_demo, ")
+        TEXT("16 was visibly wrong. Raise to 32 if close splats misorder."),
+        ECVF_RenderThreadSafe);
+
+    uint32 GetSortKeyBits()
+    {
+        return static_cast<uint32>(FMath::Clamp(CVarSortKeyBits.GetValueOnRenderThread(), 8, 32));
+    }
 }
 
 namespace GaussianSplatSorting
@@ -152,7 +166,8 @@ namespace GaussianSplatSorting
         FRDGBufferRef Keys1,
         uint32 Count)
     {
-        const uint32 KeyMask = 0xFFFFFFFFu;
+        const uint32 KeyBits = GaussianSplatProfiling::GetSortKeyBits();
+        const uint32 KeyMask = (KeyBits >= 32u) ? 0xFFFFFFFFu : ((1u << KeyBits) - 1u);
         const int32 PassCount = GetRadixSortPassCount(KeyMask);
         if (Count == 0 || PassCount == 0)
         {
@@ -381,6 +396,7 @@ namespace GaussianSplatPasses
                 InitSortParameters->ViewProjectionMatrix = ViewProjection;
                 InitSortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
                 InitSortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
+                InitSortParameters->SortKeyShift = 32u - GaussianSplatProfiling::GetSortKeyBits();
                 InitSortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                 InitSortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
                 InitSortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
@@ -511,6 +527,7 @@ namespace GaussianSplatPasses
                 InitSortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
                 InitSortParameters->SplatCovariance0Buffer = Resources->GetCovariance0SRV();
                 InitSortParameters->SplatCovariance1Buffer = Resources->GetCovariance1SRV();
+                InitSortParameters->SortKeyShift = 32u - GaussianSplatProfiling::GetSortKeyBits();
                 InitSortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                 InitSortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
                 InitSortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
