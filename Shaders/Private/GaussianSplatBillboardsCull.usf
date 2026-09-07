@@ -4,6 +4,7 @@
 StructuredBuffer<float4> SplatPositionBuffer;
 StructuredBuffer<float4> SplatCovariance0Buffer;
 StructuredBuffer<float4> SplatCovariance1Buffer;
+StructuredBuffer<float4> SplatColorBuffer;
 
 uint SortKeyShift;
 RWBuffer<uint> SplatOrderBufferUAV;
@@ -21,6 +22,9 @@ float4 ViewForward;
 float2 ViewRectMin;
 float2 ViewSize;
 float PointSize;
+float OpacityScale;
+float MinSplatOpacity;
+float MaxSplatDistance;
 float4x4 ViewMatrix;
 float4x4 ProjectionMatrix;
 float4x4 ViewProjectionMatrix;
@@ -47,6 +51,22 @@ bool IsSplatVisible(uint AssetIndex, out float Depth)
     float3 CenterWS = mul(float4(SplatPositionBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
     Depth = dot(CenterWS - ViewWorldOrigin.xyz, ViewForward.xyz);
     if (Depth <= 0.0)
+    {
+        return false;
+    }
+
+    // Bound the work for street-level views: without this the far side of the
+    // capture is rasterised at full density even when it covers a few pixels.
+    if (MaxSplatDistance > 0.0 && Depth > MaxSplatDistance)
+    {
+        return false;
+    }
+
+    // A splat this faint contributes only haze wherever it lands, and millions
+    // of them stack into the milky veil that dense captures show. Rejecting it
+    // here skips its whole rasterisation, not just its faint pixels.
+    if (MinSplatOpacity > 0.0 &&
+        saturate(SplatColorBuffer[AssetIndex].w * OpacityScale) < MinSplatOpacity)
     {
         return false;
     }

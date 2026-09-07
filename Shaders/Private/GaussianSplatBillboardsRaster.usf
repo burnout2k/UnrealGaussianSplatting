@@ -16,6 +16,7 @@ float PointSize;
 float OpacityScale;
 uint Stride;
 uint PerPixelDepth;
+float AlphaCutoff;
 float4x4 ViewMatrix;
 float4x4 LocalToWorldMatrix;
 float4x4 ProjectionMatrix;
@@ -202,7 +203,7 @@ float4 MainPS(VSOutput Input) : SV_Target0
 
     float Weight = exp(-dot(Input.QuadPos, Input.QuadPos));
     float Alpha = saturate(Input.Color.a * Weight);
-    if (Alpha < (1.0 / 255.0))
+    if (Alpha < AlphaCutoff)
     {
         discard;
     }

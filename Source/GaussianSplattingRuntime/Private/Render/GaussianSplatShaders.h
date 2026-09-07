@@ -65,6 +65,10 @@ public:
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatPositionBuffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatCovariance0Buffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatCovariance1Buffer)
+        SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatColorBuffer)
+        SHADER_PARAMETER(float, OpacityScale)
+        SHADER_PARAMETER(float, MinSplatOpacity)
+        SHADER_PARAMETER(float, MaxSplatDistance)
         SHADER_PARAMETER(uint32, SortKeyShift)
         SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, SplatOrderBufferUAV)
         SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, SplatKeyBufferUAV)
@@ -140,6 +144,7 @@ public:
     SHADER_USE_PARAMETER_STRUCT(FGaussianSplatBillboardsRasterPS, FGlobalShader);
 
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER(float, AlphaCutoff)
         SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatDepthTestParameters, DepthTest)
     END_SHADER_PARAMETER_STRUCT()
 };

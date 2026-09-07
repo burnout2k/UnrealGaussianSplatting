@@ -131,6 +131,50 @@ namespace GaussianSplatProfiling
     {
         return CVarPerPixelDepth.GetValueOnRenderThread() != 0;
     }
+
+    // Raster-side levers, aimed at dense captures. Millions of faint,
+    // overlapping Gaussians accumulate into a milky veil that washes out the
+    // scene; these three attack it from different angles. All default to
+    // existing behaviour.
+    static TAutoConsoleVariable<float> CVarAlphaCutoff(
+        TEXT("r.GaussianSplat.AlphaCutoff"),
+        1.0f / 255.0f,
+        TEXT("Discard splat pixels below this alpha before blending (0-1). ")
+        TEXT("Trims the faint outer tails of every Gaussian. Too high and ")
+        TEXT("splats stop fading softly and thin structures go patchy."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<float> CVarMinSplatOpacity(
+        TEXT("r.GaussianSplat.MinSplatOpacity"),
+        0.0f,
+        TEXT("Reject splats whose effective opacity is below this (0 = off). ")
+        TEXT("Unlike AlphaCutoff this drops the whole splat during culling, so ")
+        TEXT("it never rasterises at all -- cheaper, and aimed at splats that ")
+        TEXT("are faint everywhere rather than just at their edges."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<float> CVarMaxSplatDistance(
+        TEXT("r.GaussianSplat.MaxSplatDistance"),
+        0.0f,
+        TEXT("Reject splats beyond this view depth in Unreal units (0 = off). ")
+        TEXT("Bounds the work for street-level views, which otherwise draw the ")
+        TEXT("far side of the capture at full density."),
+        ECVF_RenderThreadSafe);
+
+    float GetAlphaCutoff()
+    {
+        return FMath::Clamp(CVarAlphaCutoff.GetValueOnRenderThread(), 0.0f, 1.0f);
+    }
+
+    float GetMinSplatOpacity()
+    {
+        return FMath::Clamp(CVarMinSplatOpacity.GetValueOnRenderThread(), 0.0f, 1.0f);
+    }
+
+    float GetMaxSplatDistance()
+    {
+        return FMath::Max(CVarMaxSplatDistance.GetValueOnRenderThread(), 0.0f);
+    }
 }
 
 namespace GaussianSplatSorting
@@ -540,6 +584,10 @@ namespace GaussianSplatPasses
                 InitSortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
                 InitSortParameters->SplatCovariance0Buffer = Resources->GetCovariance0SRV();
                 InitSortParameters->SplatCovariance1Buffer = Resources->GetCovariance1SRV();
+                InitSortParameters->SplatColorBuffer = Resources->GetColorSRV();
+                InitSortParameters->OpacityScale = Batch.OpacityScale;
+                InitSortParameters->MinSplatOpacity = GaussianSplatProfiling::GetMinSplatOpacity();
+                InitSortParameters->MaxSplatDistance = GaussianSplatProfiling::GetMaxSplatDistance();
                 InitSortParameters->SortKeyShift = 32u - GaussianSplatProfiling::GetSortKeyBits();
                 InitSortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                 InitSortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
@@ -625,6 +673,7 @@ namespace GaussianSplatPasses
                 RasterParameters->SplatColorBuffer = Resources->GetColorSRV();
                 RasterParameters->PerPixelDepth = GaussianSplatProfiling::ShouldUsePerPixelDepth() ? 1u : 0u;
                 RasterParameters->SplatSHBuffer = Resources->GetSHSRV();
+                PassParameters->PS.AlphaCutoff = GaussianSplatProfiling::GetAlphaCutoff();
                 SetDepthTestParameters(PassParameters->PS.DepthTest);
                 PassParameters->IndirectArgsBuffer = IndirectArgsBuffer;
                 PassParameters->RenderTargets[0] = FRenderTargetBinding(

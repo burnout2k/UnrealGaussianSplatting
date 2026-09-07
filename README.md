@@ -281,6 +281,29 @@ visible=1043xxx of 3885113 drawn (26.9%) | sort runs over 4194304 padded
 Note the sort is sized from the **padded** count, not the visible count, so it
 currently costs the same regardless of where the camera looks.
 
+## Dense-capture levers
+
+Millions of faint, overlapping Gaussians accumulate into a milky veil that washes
+out the scene -- visible on a 6M-splat capture where halving `MaxRenderPoints`
+made the image *clearer*, not worse, because it removed haze rather than detail.
+Three CVars attack that, all defaulting to previous behaviour:
+
+| CVar | Default | Effect |
+|---|---|---|
+| `r.GaussianSplat.AlphaCutoff` | `0.004` (1/255) | discards splat *pixels* below this alpha before blending, trimming each Gaussian's faint tails |
+| `r.GaussianSplat.MinSplatOpacity` | `0` (off) | rejects whole splats during culling when their effective opacity is below this -- cheaper than AlphaCutoff, since they never rasterise |
+| `r.GaussianSplat.MaxSplatDistance` | `0` (off) | rejects splats beyond this view depth in world units; frustum culling drops what is off to the sides, this drops what is too far ahead |
+
+`MinSplatOpacity` is the sharper instrument for haze: a splat that is 2% opaque
+contributes nothing but veil *everywhere*, so dropping it in the cull pass skips
+its whole rasterisation. `MaxSplatDistance` bounds street-level views, which
+otherwise draw the far side of the capture at full density -- note it is a hard
+cut with no fade, so raise it until the boundary stops being visible.
+
+**Not yet measured.** These compiled and the CVars are live, but their effect on
+frame time and image quality has not been recorded. Unlike the sort work, treat
+the numbers as unknown until someone sweeps them.
+
 ## Measured non-wins
 
 Tried and reverted, so they are not re-attempted:
