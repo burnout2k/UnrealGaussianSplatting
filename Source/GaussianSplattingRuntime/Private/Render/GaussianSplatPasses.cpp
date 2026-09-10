@@ -501,20 +501,45 @@ namespace GaussianSplatPasses
                 continue;
             }
 
-            const uint32 PaddedPointCount = FMath::RoundUpToPowerOfTwo(FMath::Max(1u, RenderPointCount));
+            const bool bUseRadixSort = GaussianSplatProfiling::ShouldUseRadixSort();
+
+            const uint32 SortCount =
+                GaussianSplatProfiling::GetSortCount(RenderPointCount, View.GetViewKey());
+
+            // Bitonic compares each element against Index ^ K, so its buffers must
+            // be a power of two. Radix needs no padding at all: SortGPUBuffers
+            // splits the count into whole tiles plus an ExtraKeyCount remainder,
+            // and every global write in RadixSortShaders.usf is guarded by that
+            // remainder, with scatter destinations from a prefix sum over exactly
+            // Count. Rounding 85.8M up to 134.2M was pure bitonic tax.
+            const uint32 PaddedPointCount = bUseRadixSort
+                ? RenderPointCount
+                : FMath::RoundUpToPowerOfTwo(FMath::Max(1u, RenderPointCount));
+
+            // Both pairs are sized from the upload, never from the per-frame visible
+            // count. Sizing the Alt pair to the sort was tried and reverted: the
+            // visible count swings from ~11 K to ~32 M within a single camera move,
+            // so every distinct value asked RDG for a differently-sized buffer, the
+            // pool accumulated all of them, and VRAM ran out -- "Failed to allocate
+            // Device Memory" for 24M/25M/26M/32M-element buffers, plus stutter. A
+            // pooled buffer is only free if its size is stable across frames.
+            //
+            // The Alt pair is untouched by the bitonic path, but allocating it at 1
+            // there would just make the size flip whenever SortMode changes, so it
+            // tracks the primary pair unconditionally.
+            const uint32 AltCount = PaddedPointCount;
 
             // Typed (PF_R32_UINT), not structured: the radix sort binds these as
-            // Buffer<uint>/RWBuffer<uint>. The Alt pair is its ping-pong target and
-            // is untouched by the bitonic path.
-            const auto CreateSortBuffer = [&GraphBuilder, PaddedPointCount](const TCHAR* Name)
+            // Buffer<uint>/RWBuffer<uint>.
+            const auto CreateSortBuffer = [&GraphBuilder](uint32 NumElements, const TCHAR* Name)
             {
                 return GraphBuilder.CreateBuffer(
-                    FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), PaddedPointCount), Name);
+                    FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), FMath::Max(1u, NumElements)), Name);
             };
-            FRDGBufferRef OrderBuffer = CreateSortBuffer(TEXT("GaussianSplat.OrderBuffer"));
-            FRDGBufferRef KeyBuffer = CreateSortBuffer(TEXT("GaussianSplat.KeyBuffer"));
-            FRDGBufferRef OrderBufferAlt = CreateSortBuffer(TEXT("GaussianSplat.OrderBufferAlt"));
-            FRDGBufferRef KeyBufferAlt = CreateSortBuffer(TEXT("GaussianSplat.KeyBufferAlt"));
+            FRDGBufferRef OrderBuffer = CreateSortBuffer(PaddedPointCount, TEXT("GaussianSplat.OrderBuffer"));
+            FRDGBufferRef KeyBuffer = CreateSortBuffer(PaddedPointCount, TEXT("GaussianSplat.KeyBuffer"));
+            FRDGBufferRef OrderBufferAlt = CreateSortBuffer(AltCount, TEXT("GaussianSplat.OrderBufferAlt"));
+            FRDGBufferRef KeyBufferAlt = CreateSortBuffer(AltCount, TEXT("GaussianSplat.KeyBufferAlt"));
             FRDGBufferDesc IndirectArgsDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), 4);
             IndirectArgsDesc.Usage |= BUF_DrawIndirect | BUF_UnorderedAccess | BUF_SourceCopy;
             FRDGBufferRef IndirectArgsBuffer = GraphBuilder.CreateBuffer(
@@ -574,11 +599,8 @@ namespace GaussianSplatPasses
                     InitSortParameters,
                     FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
 
-                const uint32 SortCount =
-                    GaussianSplatProfiling::GetSortCount(RenderPointCount, View.GetViewKey());
-
                 FRDGBufferRef SortedOrderBuffer = OrderBuffer;
-                if (GaussianSplatProfiling::ShouldUseRadixSort())
+                if (bUseRadixSort)
                 {
                     SortedOrderBuffer = GaussianSplatSorting::AddRadixSortPass(
                         GraphBuilder,
@@ -713,11 +735,8 @@ namespace GaussianSplatPasses
                     InitSortParameters,
                     FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
 
-                const uint32 SortCount =
-                    GaussianSplatProfiling::GetSortCount(RenderPointCount, View.GetViewKey());
-
                 FRDGBufferRef SortedOrderBuffer = OrderBuffer;
-                if (GaussianSplatProfiling::ShouldUseRadixSort())
+                if (bUseRadixSort)
                 {
                     SortedOrderBuffer = GaussianSplatSorting::AddRadixSortPass(
                         GraphBuilder,
