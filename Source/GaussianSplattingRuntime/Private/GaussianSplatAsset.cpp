@@ -1,6 +1,7 @@
 #include "GaussianSplatAsset.h"
 
 #include "EngineUtils.h"
+#include "HAL/IConsoleManager.h"
 #include "GaussianSplatBoundsUtils.h"
 #include "GaussianSplatComponent.h"
 #include "Render/GaussianSplatRenderResources.h"
@@ -109,10 +110,42 @@ const FGaussianSplatRenderResources* UGaussianSplatAsset::GetRenderResources() c
     return RenderResources.Get();
 }
 
+// A safety ceiling on the GPU upload. MaxGpuPointCount is saved into the asset,
+// so a value the card cannot fit turns into a crash loop: the editor reloads the
+// map on startup, tries the same upload, and dies before it can be edited. Vulkan
+// aborts the process on allocation failure rather than degrading, so this has to
+// be prevented rather than handled.
+//
+// Budget is per-splat cost times count, plus the depth sort's key/order ping-pong
+// which pads to a power of two -- at 64M that pair alone is ~1 GB.
+static TAutoConsoleVariable<int32> CVarMaxGpuPointCountCeiling(
+    TEXT("r.GaussianSplat.MaxGpuPointCountCeiling"),
+    32000000,
+    TEXT("Hard ceiling on how many splats any asset may upload, whatever its ")
+    TEXT("MaxGpuPointCount says. Guards against a saved value that exhausts VRAM ")
+    TEXT("and crash-loops the editor. Raise it if you have headroom to spare; the ")
+    TEXT("default suits roughly a 10 GB card."),
+    ECVF_RenderThreadSafe);
+
 void UGaussianSplatAsset::BuildRenderResources()
 {
     // 先释放旧资源，避免新旧 Buffer 同时悬挂。
     ReleaseRenderResources();
+
+    const int32 Ceiling = FMath::Max(1000, CVarMaxGpuPointCountCeiling.GetValueOnAnyThread());
+    const int32 RequestedPointCount = FMath::Max(1000, MaxGpuPointCount);
+    const int32 EffectivePointCount = FMath::Min(RequestedPointCount, Ceiling);
+    if (EffectivePointCount < RequestedPointCount)
+    {
+        UE_LOG(
+            LogGaussianSplatAsset,
+            Warning,
+            TEXT("MaxGpuPointCount %d exceeds the r.GaussianSplat.MaxGpuPointCountCeiling of %d; ")
+            TEXT("uploading %d instead. Raise the ceiling if this GPU has the memory."),
+            RequestedPointCount,
+            Ceiling,
+            EffectivePointCount);
+    }
 
     RenderResources = MakeUnique<FGaussianSplatRenderResources>();
     RenderResources->BuildFromAssetData(
@@ -120,15 +153,16 @@ void UGaussianSplatAsset::BuildRenderResources()
         Covariances,
         ColorsOpacity,
         SHCoefficients,
-        FMath::Max(1000, MaxGpuPointCount));
+        EffectivePointCount);
 
     UE_LOG(
         LogGaussianSplatAsset,
         Display,
-        TEXT("Prepared %u of %d Gaussian splats for GPU upload (MaxGpuPointCount=%d)"),
+        TEXT("Prepared %u of %d Gaussian splats for GPU upload (MaxGpuPointCount=%d, ceiling=%d)"),
         RenderResources->GetPointCount(),
         Positions.Num(),
-        MaxGpuPointCount);
+        MaxGpuPointCount,
+        Ceiling);
 
     // 把 FRenderResource 注册到渲染线程初始化队列。
     BeginInitResource(RenderResources.Get());

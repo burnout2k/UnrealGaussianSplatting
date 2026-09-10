@@ -25,6 +25,7 @@ float PointSize;
 float OpacityScale;
 float MinSplatOpacity;
 float MaxSplatDistance;
+float MinScreenVariance;
 float4x4 ViewMatrix;
 float4x4 ProjectionMatrix;
 float4x4 ViewProjectionMatrix;
@@ -91,8 +92,14 @@ bool IsSplatVisible(uint AssetIndex, out float Depth)
         ProjectionMatrix,
         ViewSize);
 
-    Cov2D.x = max(Cov2D.x, 1.0);
-    Cov2D.z = max(Cov2D.z, 1.0);
+    // Screen-space variance floor. CalcCovariance2D already adds the reference
+    // 3DGS low-pass of 0.3; this is an additional floor on top. At 1.0 the minimum
+    // quad is ~5.7x5.7 px for every splat at any distance, which defeats the free
+    // LOD perspective would otherwise give and makes distant splats as expensive as
+    // near ones. 0.0 leaves just the reference low-pass (~3.1x3.1 px) but lets far
+    // surfaces thin out and show holes.
+    Cov2D.x = max(Cov2D.x, MinScreenVariance);
+    Cov2D.z = max(Cov2D.z, MinScreenVariance);
 
     float Det = Cov2D.x * Cov2D.z - Cov2D.y * Cov2D.y;
     if (Det <= 1e-6)

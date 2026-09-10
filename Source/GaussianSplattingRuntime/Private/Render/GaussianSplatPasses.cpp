@@ -79,6 +79,51 @@ namespace GaussianSplatProfiling
         }
     }
 
+    // The sort is sized by how many splats were UPLOADED, but only the ones that
+    // survive frustum culling matter -- the rest are padding slots holding
+    // 0xffffffff, sorted to the end and then ignored. At street level only ~8% of
+    // splats are visible, so ~92% of the sort is wasted: measured 37.4 ms/frame of
+    // which only ~3.5 ms was actually rasterising 2.5M splats.
+    //
+    // The count is a GPU value and the sort needs it CPU-side, so use the readback
+    // (a frame or two stale) plus a margin. If the true count overshoots the margin,
+    // the excess splats are still drawn but in cull order rather than depth order --
+    // a transient blending artefact that corrects itself next frame, not a crash.
+    static TAutoConsoleVariable<int32> CVarSortVisibleOnly(
+        TEXT("r.GaussianSplat.SortVisibleOnly"),
+        1,
+        TEXT("1 = size the depth sort to the last known visible count plus a margin, ")
+        TEXT("0 = sort every uploaded splat (the original behaviour)."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<float> CVarSortVisibleMargin(
+        TEXT("r.GaussianSplat.SortVisibleMargin"),
+        1.25f,
+        TEXT("Safety factor on the stale visible count when sizing the sort. Higher ")
+        TEXT("costs sort time, lower risks briefly unsorted splats when the visible ")
+        TEXT("count jumps (a fast camera turn)."),
+        ECVF_RenderThreadSafe);
+
+    // How many entries the sort must actually cover this frame.
+    uint32 GetSortCount(uint32 RenderPointCount)
+    {
+        if (CVarSortVisibleOnly.GetValueOnRenderThread() == 0)
+        {
+            return RenderPointCount;
+        }
+
+        const uint32 LastVisible = GVisibleCount.LastVisibleCount;
+        if (LastVisible == 0)
+        {
+            // No readback yet (first frames after a load): sort everything.
+            return RenderPointCount;
+        }
+
+        const float Margin = FMath::Clamp(CVarSortVisibleMargin.GetValueOnRenderThread(), 1.0f, 4.0f);
+        const uint64 Padded = static_cast<uint64>(LastVisible * Margin) + 4096u;
+        return static_cast<uint32>(FMath::Min<uint64>(Padded, RenderPointCount));
+    }
+
     // A/B measurement switch. The bitonic sort records 253 dispatches per frame
     // at full density, and per-pass barriers are suspected to dominate over the
     // sort maths itself. Skipping the sort renders splats in cull order, which
@@ -174,6 +219,26 @@ namespace GaussianSplatProfiling
     float GetMaxSplatDistance()
     {
         return FMath::Max(CVarMaxSplatDistance.GetValueOnRenderThread(), 0.0f);
+    }
+
+    // Every splat is drawn as a quad sized from its projected covariance, and this
+    // floors that covariance. At the historical 1.0 the quad bottoms out around
+    // 5.7x5.7 px regardless of distance: 8M splats then cover ~256M pixels against
+    // a 2M-pixel screen, so the renderer is fill-rate bound and distant splats cost
+    // as much as near ones. CalcCovariance2D already applies the reference 3DGS
+    // low-pass of 0.3, so 0.0 here is reference behaviour (~3.1x3.1 px), not an
+    // absent low-pass. Lower means cheaper far field but thinner surfaces.
+    static TAutoConsoleVariable<float> CVarMinScreenVariance(
+        TEXT("r.GaussianSplat.MinScreenVariance"),
+        1.0f,
+        TEXT("Floor on projected screen-space variance in px^2. 1.0 = historical ")
+        TEXT("behaviour, 0.0 = reference 3DGS (the 0.3 low-pass alone). Lower cuts ")
+        TEXT("overdraw sharply but can open holes in distant surfaces."),
+        ECVF_RenderThreadSafe);
+
+    float GetMinScreenVariance()
+    {
+        return FMath::Clamp(CVarMinScreenVariance.GetValueOnRenderThread(), 0.0f, 16.0f);
     }
 }
 
@@ -475,7 +540,7 @@ namespace GaussianSplatPasses
                         OrderBufferAlt,
                         KeyBuffer,
                         KeyBufferAlt,
-                        RenderPointCount);
+                        GaussianSplatProfiling::GetSortCount(RenderPointCount));
                 }
                 else if (!GaussianSplatProfiling::ShouldSkipSort())
                 {
@@ -588,6 +653,7 @@ namespace GaussianSplatPasses
                 InitSortParameters->OpacityScale = Batch.OpacityScale;
                 InitSortParameters->MinSplatOpacity = GaussianSplatProfiling::GetMinSplatOpacity();
                 InitSortParameters->MaxSplatDistance = GaussianSplatProfiling::GetMaxSplatDistance();
+                InitSortParameters->MinScreenVariance = GaussianSplatProfiling::GetMinScreenVariance();
                 InitSortParameters->SortKeyShift = 32u - GaussianSplatProfiling::GetSortKeyBits();
                 InitSortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                 InitSortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
@@ -610,7 +676,7 @@ namespace GaussianSplatPasses
                         OrderBufferAlt,
                         KeyBuffer,
                         KeyBufferAlt,
-                        RenderPointCount);
+                        GaussianSplatProfiling::GetSortCount(RenderPointCount));
                 }
                 else if (!GaussianSplatProfiling::ShouldSkipSort())
                 {
@@ -673,6 +739,7 @@ namespace GaussianSplatPasses
                 RasterParameters->SplatColorBuffer = Resources->GetColorSRV();
                 RasterParameters->PerPixelDepth = GaussianSplatProfiling::ShouldUsePerPixelDepth() ? 1u : 0u;
                 RasterParameters->HasSH = Resources->HasSH() ? 1u : 0u;
+                RasterParameters->MinScreenVariance = GaussianSplatProfiling::GetMinScreenVariance();
                 RasterParameters->SplatSHBuffer = Resources->GetSHSRV();
                 PassParameters->PS.AlphaCutoff = GaussianSplatProfiling::GetAlphaCutoff();
                 SetDepthTestParameters(PassParameters->PS.DepthTest);
