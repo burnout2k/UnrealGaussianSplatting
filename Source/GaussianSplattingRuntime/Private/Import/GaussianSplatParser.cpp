@@ -6,6 +6,8 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
+DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatParser, Log, All);
+
 namespace
 {
     constexpr float SHC0 = 0.28209479177387814f;
@@ -79,15 +81,15 @@ namespace
         }
     }
 
-    bool ParseHeader(const TArray<uint8>& RawData, FPlyHeader& OutHeader)
+    bool ParseHeader(const TArray64<uint8>& RawData, FPlyHeader& OutHeader)
     {
         static const ANSICHAR EndA[] = "end_header\n";
         static const ANSICHAR EndB[] = "end_header\r\n";
 
-        int32 HeaderEnd = INDEX_NONE;
-        for (int32 I = 0; I < RawData.Num(); ++I)
+        int64 HeaderEnd = INDEX_NONE;
+        for (int64 I = 0; I < RawData.Num(); ++I)
         {
-            const int32 Remaining = RawData.Num() - I;
+            const int64 Remaining = RawData.Num() - I;
             if (Remaining >= UE_ARRAY_COUNT(EndA) - 1 && FMemory::Memcmp(RawData.GetData() + I, EndA, UE_ARRAY_COUNT(EndA) - 1) == 0)
             {
                 HeaderEnd = I + (UE_ARRAY_COUNT(EndA) - 1);
@@ -106,7 +108,7 @@ namespace
             return false;
         }
 
-        OutHeader.HeaderByteSize = HeaderEnd;
+        OutHeader.HeaderByteSize = static_cast<int32>(HeaderEnd);
         FUTF8ToTCHAR HeaderConvert(reinterpret_cast<const ANSICHAR*>(RawData.GetData()), HeaderEnd);
         const FString HeaderText(HeaderConvert.Length(), HeaderConvert.Get());
 
@@ -193,6 +195,28 @@ namespace
     float ReadValueOr(const TArray<float>& Values, int32 Index, float DefaultValue)
     {
         return Values.IsValidIndex(Index) ? Values[Index] : DefaultValue;
+    }
+
+    // A capture without f_rest_* properties has no view-dependent colour, only the
+    // f_dc base. Appending 45 zero floats per splat for those wastes 180 B/splat of
+    // RAM and asset size -- and at 85.8M splats it is 3.86 billion floats, which
+    // overflows TArray's int32 index and hard-crashes the editor mid-import.
+    bool CaptureHasSH(const TArray<int32>& RestIndices)
+    {
+        for (const int32 Index : RestIndices)
+        {
+            if (Index != INDEX_NONE)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // TArray is int32-indexed, so SH storage caps out well before the vertex count does.
+    bool SHWouldOverflow(int32 VertexCount)
+    {
+        return static_cast<int64>(VertexCount) * 45LL > static_cast<int64>(MAX_int32);
     }
 
     void AppendReorderedSH(const TArray<float>& Values, const TArray<int32>& RestIndices, UGaussianSplatAsset& Asset)
@@ -423,9 +447,17 @@ namespace
         Asset.SHCoefficients.Reset();
     }
 
-    bool FillAssetFromAscii(const TArray<uint8>& RawData, const FPlyHeader& Header, UGaussianSplatAsset& Asset)
+    bool FillAssetFromAscii(const TArray64<uint8>& RawData, const FPlyHeader& Header, UGaussianSplatAsset& Asset)
     {
-        const int32 BodyByteSize = RawData.Num() - Header.HeaderByteSize;
+        // The ascii path converts the whole body to an FString, so it is bounded by
+        // int32 regardless of the 64-bit read. Fail loudly rather than truncating:
+        // a >2 GB ascii PLY would silently import as garbage.
+        const int64 BodyByteSize64 = RawData.Num() - static_cast<int64>(Header.HeaderByteSize);
+        if (BodyByteSize64 > static_cast<int64>(MAX_int32))
+        {
+            return false;
+        }
+        const int32 BodyByteSize = static_cast<int32>(BodyByteSize64);
         FUTF8ToTCHAR BodyConvert(reinterpret_cast<const ANSICHAR*>(RawData.GetData() + Header.HeaderByteSize), BodyByteSize);
         const FString BodyText(BodyConvert.Length(), BodyConvert.Get());
 
@@ -441,6 +473,12 @@ namespace
         if (!ResolveCommonPropertyIndices(
             Header, XIndex, YIndex, ZIndex, Dc0Index, Dc1Index, Dc2Index, OpacityIndex,
             Scale0Index, Scale1Index, Scale2Index, Rot0Index, Rot1Index, Rot2Index, Rot3Index, RestIndices))
+        {
+            return false;
+        }
+
+        const bool bHasSH = CaptureHasSH(RestIndices);
+        if (bHasSH && SHWouldOverflow(Header.VertexCount))
         {
             return false;
         }
@@ -469,14 +507,17 @@ namespace
 
             const FLinearColor Color = BuildColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex);
             Asset.ColorsOpacity.Add(FVector4f(Color.R, Color.G, Color.B, Color.A));
-            AppendReorderedSH(Values, RestIndices, Asset);
+            if (bHasSH)
+            {
+                AppendReorderedSH(Values, RestIndices, Asset);
+            }
         }
 
         Asset.RefreshDerivedData();
         return true;
     }
 
-    bool FillAssetFromBinaryLE(const TArray<uint8>& RawData, const FPlyHeader& Header, UGaussianSplatAsset& Asset)
+    bool FillAssetFromBinaryLE(const TArray64<uint8>& RawData, const FPlyHeader& Header, UGaussianSplatAsset& Asset)
     {
         int32 XIndex, YIndex, ZIndex, Dc0Index, Dc1Index, Dc2Index, OpacityIndex, Scale0Index, Scale1Index, Scale2Index, Rot0Index, Rot1Index, Rot2Index, Rot3Index;
         TArray<int32> RestIndices;
@@ -504,6 +545,18 @@ namespace
             return false;
         }
 
+        const bool bHasSH = CaptureHasSH(RestIndices);
+        if (bHasSH && SHWouldOverflow(Header.VertexCount))
+        {
+            return false;
+        }
+        if (!bHasSH)
+        {
+            UE_LOG(LogGaussianSplatParser, Display,
+                TEXT("PLY has no f_rest_* properties: importing %d splats without spherical harmonics."),
+                Header.VertexCount);
+        }
+
         ResetAssetData(Asset, Header.VertexCount);
         const uint8* Cursor = RawData.GetData() + Header.HeaderByteSize;
         for (int32 I = 0; I < Header.VertexCount; ++I)
@@ -524,7 +577,10 @@ namespace
 
             const FLinearColor Color = BuildColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex);
             Asset.ColorsOpacity.Add(FVector4f(Color.R, Color.G, Color.B, Color.A));
-            AppendReorderedSH(Values, RestIndices, Asset);
+            if (bHasSH)
+            {
+                AppendReorderedSH(Values, RestIndices, Asset);
+            }
         }
 
         Asset.RefreshDerivedData();
@@ -536,7 +592,11 @@ namespace GaussianSplatParser
 {
     bool ParseFromFile(const FString& FilePath, UGaussianSplatAsset& OutAsset, FString& OutError)
     {
-        TArray<uint8> RawData;
+        // TArray is 32-bit indexed, so LoadFileToArray refuses anything over 2 GB
+        // ("too large for 32-bit reader, use TArray64"). Real captures exceed that:
+        // an 85.8M-splat PLY is 4.5 GiB. The binary reader below already walks a raw
+        // pointer with int64 offsets, so only the container had to change.
+        TArray64<uint8> RawData;
         if (!FFileHelper::LoadFileToArray(RawData, *FilePath))
         {
             OutError = FString::Printf(TEXT("Failed to read source file: %s"), *FPaths::ConvertRelativePathToFull(FilePath));
@@ -546,7 +606,7 @@ namespace GaussianSplatParser
         return ParseFromBytes(RawData, OutAsset, OutError);
     }
 
-    bool ParseFromBytes(const TArray<uint8>& RawData, UGaussianSplatAsset& OutAsset, FString& OutError)
+    bool ParseFromBytes(const TArray64<uint8>& RawData, UGaussianSplatAsset& OutAsset, FString& OutError)
     {
         FPlyHeader Header;
         if (!ParseHeader(RawData, Header))

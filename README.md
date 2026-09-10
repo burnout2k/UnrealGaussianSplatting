@@ -257,6 +257,40 @@ Notes for anyone changing this:
   against the sort's actual return value at runtime -- a mismatch logs an error
   under `LogGaussianSplatProfile`.
 
+## Large captures
+
+Two hard limits used to make big PLYs impossible to import; both are fixed.
+
+**Files over 2 GB.** The reader used `TArray<uint8>`, which is int32-indexed, so
+`LoadFileToArray` refused with *"too large for 32-bit reader, use TArray64"*.
+Now `TArray64`. The binary reader already walked a raw pointer with int64
+offsets, so only the container changed. The ascii path still converts the body
+to an `FString` and so is bounded by int32 regardless -- it now fails cleanly
+instead of silently truncating.
+
+**Captures over ~47M splats.** `SHCoefficients` is a `TArray<float>` holding 45
+floats per splat, which overflows int32 at 47,721,859 splats and hard-crashes
+the editor mid-import (*"Trying to resize TArray to an invalid size"*).
+
+The second is worse than it sounds, because a capture with **no** spherical
+harmonics still paid for it: the parser appended 45 zeros per splat regardless.
+It now detects the absence of `f_rest_*` properties and skips SH entirely.
+`BuildFromAssetData` already reads SH through `IsValidIndex()` with a `0.0f`
+fallback, so an empty array needs no renderer change. A capture that genuinely
+has SH and is too large now fails with an error rather than crashing.
+
+Measured on an 85,843,930-splat capture (4.5 GiB PLY, no SH):
+
+| | Before | After |
+|---|---|---|
+| RAM during import | crashed at ~15.5 GB of zero SH | ~10 GB |
+| Resulting `.uasset` | never completed | 4.2 GB |
+
+Note the GPU side still allocates 15 float4 per splat even with no SH, since
+`SHData` is built at `PointCount * 15` regardless. That is bounded by
+`MaxGpuPointCount`, but it is 240 of the 304 bytes per splat -- skipping it
+would need a no-SH flag and a shader branch.
+
 ## Profiling
 
 The renderer declares its own GPU stats, so `stat GPU` breaks splat cost down by phase:
