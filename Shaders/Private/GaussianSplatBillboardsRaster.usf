@@ -16,6 +16,7 @@ float PointSize;
 float OpacityScale;
 uint Stride;
 uint PerPixelDepth;
+uint HasSH;
 float AlphaCutoff;
 float4x4 ViewMatrix;
 float4x4 LocalToWorldMatrix;
@@ -68,6 +69,13 @@ float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
     float Z = Dir.z;
 
     float3 Result = BaseColor;
+    if (HasSH == 0)
+    {
+        // Degree-0 capture: the SH buffer holds one dummy element, not per-splat
+        // data. Reading it would sample garbage.
+        return max(Result, 0.0);
+    }
+
     Result += SH_C1 * (-LoadSHCoeff(InstanceID, 0) * Y + LoadSHCoeff(InstanceID, 1) * Z - LoadSHCoeff(InstanceID, 2) * X);
 
     float XX = X * X;

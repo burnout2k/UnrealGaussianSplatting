@@ -17,7 +17,13 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
     Covariance0Data.Empty(PointCount);
     Covariance1Data.Empty(PointCount);
     ColorData.Empty(PointCount);
-    SHData.Empty(PointCount * 15);
+
+    // A capture exported at SH degree 0 has no f_rest_* data, so every one of the
+    // 15 float4 per splat would be zero: 240 of the 304 bytes per splat on the GPU,
+    // read every frame and multiplied by nothing. Skip the buffer entirely and let
+    // the shader branch past SH evaluation.
+    bHasSH = !InSHCoefficients.IsEmpty();
+    SHData.Empty(bHasSH ? PointCount * 15 : 1);
 
     for (uint32 Index = 0; Index < PointCount; ++Index)
     {
@@ -37,6 +43,11 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
         Covariance1Data.Add(FVector4f(Covariance.YZ, Covariance.ZZ, 0.0f, 0.0f));
         ColorData.Add(Color);
 
+        if (!bHasSH)
+        {
+            continue;
+        }
+
         const int32 SHBase = SourceIndex * 45;
         for (int32 CoeffIndex = 0; CoeffIndex < 15; ++CoeffIndex)
         {
@@ -47,6 +58,13 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
                 InSHCoefficients.IsValidIndex(CoeffBase + 2) ? InSHCoefficients[CoeffBase + 2] : 0.0f,
                 0.0f));
         }
+    }
+
+    // One dummy element keeps the SRV valid to bind. Binding a null SRV is not
+    // allowed, and the shader never reads this when HasSH is 0.
+    if (!bHasSH)
+    {
+        SHData.Add(FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
     }
 }
 

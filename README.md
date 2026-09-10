@@ -286,10 +286,26 @@ Measured on an 85,843,930-splat capture (4.5 GiB PLY, no SH):
 | RAM during import | crashed at ~15.5 GB of zero SH | ~10 GB |
 | Resulting `.uasset` | never completed | 4.2 GB |
 
-Note the GPU side still allocates 15 float4 per splat even with no SH, since
-`SHData` is built at `PointCount * 15` regardless. That is bounded by
-`MaxGpuPointCount`, but it is 240 of the 304 bytes per splat -- skipping it
-would need a no-SH flag and a shader branch.
+The GPU buffer is skipped too when the asset has no SH. `BuildFromAssetData`
+sets `bHasSH` from whether `SHCoefficients` is empty, builds a single dummy
+element instead of `PointCount * 15` (a null SRV cannot be bound), and the
+rasterizer branches past SH evaluation on a `HasSH` flag.
+
+Measured at 8M splats uploaded, editor VRAM via `nvidia-smi`:
+
+| | VRAM | Frame |
+|---|---|---|
+| zero SH still uploaded | 6,975 MiB | 21.71 ms |
+| SH skipped | **5,126 MiB** | **20.37 ms** |
+
+1,849 MiB freed -- 242 B/splat, so ~64 B/splat instead of ~304. The frame time
+also improved: the rasterizer had been fetching 240 bytes of zeros per splat in
+depth-sorted order, which is cache-hostile. No visual change, since those
+coefficients were already zero.
+
+No re-import is needed for an asset imported after the parser fix: the empty
+`SHCoefficients` array is already serialised, and `bHasSH` is derived from it
+at load.
 
 ## Profiling
 

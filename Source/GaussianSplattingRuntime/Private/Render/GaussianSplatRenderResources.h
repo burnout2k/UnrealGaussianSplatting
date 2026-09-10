@@ -30,6 +30,10 @@ public:
     FShaderResourceViewRHIRef GetColorSRV() const { return ColorSRV; }
     FShaderResourceViewRHIRef GetSHSRV() const { return SHSRV; }
 
+    // False for captures exported at SH degree 0; the SH buffer is then a
+    // single dummy element and must not be sampled.
+    bool HasSH() const { return bHasSH; }
+
 private:
     template<typename ElementType>
     void InitStructuredBuffer(
@@ -40,6 +44,7 @@ private:
         FShaderResourceViewRHIRef& OutSRV);
 
     uint32 PointCount = 0;
+    bool bHasSH = false;
 
     TResourceArray<FVector4f, VERTEXBUFFER_ALIGNMENT> PositionData;
     TResourceArray<FVector4f, VERTEXBUFFER_ALIGNMENT> Covariance0Data;

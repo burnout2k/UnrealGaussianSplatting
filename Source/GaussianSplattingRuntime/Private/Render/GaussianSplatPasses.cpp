@@ -672,6 +672,7 @@ namespace GaussianSplatPasses
                 RasterParameters->SplatCovariance1Buffer = Resources->GetCovariance1SRV();
                 RasterParameters->SplatColorBuffer = Resources->GetColorSRV();
                 RasterParameters->PerPixelDepth = GaussianSplatProfiling::ShouldUsePerPixelDepth() ? 1u : 0u;
+                RasterParameters->HasSH = Resources->HasSH() ? 1u : 0u;
                 RasterParameters->SplatSHBuffer = Resources->GetSHSRV();
                 PassParameters->PS.AlphaCutoff = GaussianSplatProfiling::GetAlphaCutoff();
                 SetDepthTestParameters(PassParameters->PS.DepthTest);

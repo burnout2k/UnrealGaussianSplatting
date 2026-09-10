@@ -132,6 +132,7 @@ public:
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatCovariance0Buffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatCovariance1Buffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatColorBuffer)
+        SHADER_PARAMETER(uint32, HasSH)
         SHADER_PARAMETER(uint32, PerPixelDepth)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatSHBuffer)
     END_SHADER_PARAMETER_STRUCT()
