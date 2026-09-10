@@ -35,15 +35,27 @@ namespace GaussianSplatProfiling
         uint32 FrameCounter = 0;
     };
 
-    static FVisibleCountState GVisibleCount;
+    // Keyed per view, NOT global. A level renders more than one view -- the editor
+    // viewport plus, here, the sky/reflection capture on BP_Carla_Sky, which sees
+    // most of the map. With one shared slot each view overwrote the other's count,
+    // so the viewport sized its sort from the sky capture's ~62% and vice versa.
+    // That mis-sizing left regions the sort never covered, drawn in cull order, as
+    // a haze band sliding with the camera.
+    static TMap<uint32, FVisibleCountState> GVisibleCountByView;
+
+    FVisibleCountState& GetViewState(uint32 ViewKey)
+    {
+        return GVisibleCountByView.FindOrAdd(ViewKey);
+    }
 
     void EnqueueVisibleCountReadback(
         FRDGBuilder& GraphBuilder,
         FRDGBufferRef IndirectArgsBuffer,
         uint32 RenderPointCount,
-        uint32 PaddedPointCount)
+        uint32 PaddedPointCount,
+        uint32 ViewKey)
     {
-        FVisibleCountState& State = GVisibleCount;
+        FVisibleCountState& State = GetViewState(ViewKey);
         const uint32 IndirectArgsBytes = 4 * sizeof(uint32);
 
         // Drain the oldest slot before reusing it, so this never stalls the GPU.
@@ -71,7 +83,8 @@ namespace GaussianSplatProfiling
             UE_LOG(
                 LogGaussianSplatProfile,
                 Display,
-                TEXT("visible=%u of %u drawn (%.1f%%) | sort runs over %u padded"),
+                TEXT("view %u: visible=%u of %u drawn (%.1f%%) | sort runs over %u padded"),
+                ViewKey,
                 State.LastVisibleCount,
                 RenderPointCount,
                 VisiblePercent,
@@ -93,26 +106,39 @@ namespace GaussianSplatProfiling
         TEXT("r.GaussianSplat.SortVisibleOnly"),
         1,
         TEXT("1 = size the depth sort to the last known visible count plus a margin, ")
-        TEXT("0 = sort every uploaded splat (the original behaviour)."),
+        TEXT("0 = sort every uploaded splat (always correct, ~2x slower)."),
         ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<float> CVarSortVisibleMargin(
         TEXT("r.GaussianSplat.SortVisibleMargin"),
-        1.25f,
-        TEXT("Safety factor on the stale visible count when sizing the sort. Higher ")
-        TEXT("costs sort time, lower risks briefly unsorted splats when the visible ")
-        TEXT("count jumps (a fast camera turn)."),
+        2.0f,
+        TEXT("Safety factor on the stale visible count when sizing the sort. If the ")
+        TEXT("true count outruns it, the uncovered splats still draw -- in cull ")
+        TEXT("order rather than depth order -- which shows as a transient band ")
+        TEXT("during fast camera moves. 1.25/1.5/2.0 all measured the same, so ")
+        TEXT("there is no reason to run tight."),
         ECVF_RenderThreadSafe);
 
-    // How many entries the sort must actually cover this frame.
-    uint32 GetSortCount(uint32 RenderPointCount)
+    // Sized from the readback, which lags a frame or two.
+    //
+    // This is a prediction and it can be wrong: the visible count swings ~100x
+    // within a second when free-flying the editor camera over a 2.65 km capture.
+    // When it undershoots, the uncovered splats are a contiguous REGION of the map
+    // (cull order follows file order, which is spatially ordered), so the error is
+    // a visible band rather than scattered noise. A driving camera moves smoothly
+    // and does not provoke it; editor navigation does.
+    //
+    // The proper fix is spatial chunking, which makes the count exact and known on
+    // the CPU before the frame -- no prediction at all. Until then this is the best
+    // available: 16.75 ms against 35.57 ms for sorting everything.
+    uint32 GetSortCount(uint32 RenderPointCount, uint32 ViewKey)
     {
         if (CVarSortVisibleOnly.GetValueOnRenderThread() == 0)
         {
             return RenderPointCount;
         }
 
-        const uint32 LastVisible = GVisibleCount.LastVisibleCount;
+        const uint32 LastVisible = GetViewState(ViewKey).LastVisibleCount;
         if (LastVisible == 0)
         {
             // No readback yet (first frames after a load): sort everything.
@@ -120,8 +146,8 @@ namespace GaussianSplatProfiling
         }
 
         const float Margin = FMath::Clamp(CVarSortVisibleMargin.GetValueOnRenderThread(), 1.0f, 4.0f);
-        const uint64 Padded = static_cast<uint64>(LastVisible * Margin) + 4096u;
-        return static_cast<uint32>(FMath::Min<uint64>(Padded, RenderPointCount));
+        const uint64 Sized = static_cast<uint64>(LastVisible * Margin) + 4096u;
+        return static_cast<uint32>(FMath::Min<uint64>(Sized, RenderPointCount));
     }
 
     // A/B measurement switch. The bitonic sort records 253 dispatches per frame
@@ -289,7 +315,25 @@ namespace GaussianSplatSorting
         uint32 Count)
     {
         const uint32 KeyBits = GaussianSplatProfiling::GetSortKeyBits();
-        const uint32 KeyMask = (KeyBits >= 32u) ? 0xFFFFFFFFu : ((1u << KeyBits) - 1u);
+        uint32 KeyMask = (KeyBits >= 32u) ? 0xFFFFFFFFu : ((1u << KeyBits) - 1u);
+
+        // Force an EVEN pass count so the sort ends in the buffer it started in.
+        //
+        // The radix sort ping-pongs. With an odd pass count the result lands in the
+        // Alt buffer, whose tail beyond the sorted range is cleared to 0 -- so any
+        // splat the sort did not reach reads index 0 and renders as garbage. That
+        // was the black-mesh artefact on fast camera moves, where the stale visible
+        // count underestimates by up to 10x and no safety margin can cover it.
+        //
+        // With an even count the result is the primary buffer, which the cull pass
+        // just filled, so the unreached tail still holds valid indices in cull
+        // order. Overshoot then costs a few splats blended out of depth order
+        // instead of a hole in the scene. The extra digit is all zeros for every
+        // key, so the added pass is a stable no-op.
+        if ((GetRadixSortPassCount(KeyMask) % 2) != 0 && KeyMask != 0xFFFFFFFFu)
+        {
+            KeyMask = (KeyMask << 4) | 0xFu;
+        }
         const int32 PassCount = GetRadixSortPassCount(KeyMask);
         if (Count == 0 || PassCount == 0)
         {
@@ -530,6 +574,9 @@ namespace GaussianSplatPasses
                     InitSortParameters,
                     FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
 
+                const uint32 SortCount =
+                    GaussianSplatProfiling::GetSortCount(RenderPointCount, View.GetViewKey());
+
                 FRDGBufferRef SortedOrderBuffer = OrderBuffer;
                 if (GaussianSplatProfiling::ShouldUseRadixSort())
                 {
@@ -540,7 +587,7 @@ namespace GaussianSplatPasses
                         OrderBufferAlt,
                         KeyBuffer,
                         KeyBufferAlt,
-                        GaussianSplatProfiling::GetSortCount(RenderPointCount));
+                        SortCount);
                 }
                 else if (!GaussianSplatProfiling::ShouldSkipSort())
                 {
@@ -666,6 +713,9 @@ namespace GaussianSplatPasses
                     InitSortParameters,
                     FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
 
+                const uint32 SortCount =
+                    GaussianSplatProfiling::GetSortCount(RenderPointCount, View.GetViewKey());
+
                 FRDGBufferRef SortedOrderBuffer = OrderBuffer;
                 if (GaussianSplatProfiling::ShouldUseRadixSort())
                 {
@@ -676,7 +726,7 @@ namespace GaussianSplatPasses
                         OrderBufferAlt,
                         KeyBuffer,
                         KeyBufferAlt,
-                        GaussianSplatProfiling::GetSortCount(RenderPointCount));
+                        SortCount);
                 }
                 else if (!GaussianSplatProfiling::ShouldSkipSort())
                 {
@@ -788,7 +838,8 @@ namespace GaussianSplatPasses
                     GraphBuilder,
                     IndirectArgsBuffer,
                     RenderPointCount,
-                    PaddedPointCount);
+                    PaddedPointCount,
+                    View.GetViewKey());
             }
 
             bFirstBatch = false;
