@@ -14,6 +14,7 @@ public:
         const TArray<FGaussianCovariance3f>& InCovariances,
         const TArray<FVector4f>& InColorsOpacity,
         const TArray<float>& InSHCoefficients,
+        const TArray<FGaussianSplatCell>& InCells,
         int32 MaxPointCount);
 
     virtual void InitRHI(FRHICommandListBase& RHICmdList) override;
@@ -34,6 +35,10 @@ public:
     // single dummy element and must not be sampled.
     bool HasSH() const { return bHasSH; }
 
+    // Cells in UPLOAD index space, not asset index space. Only a prefix of each
+    // asset cell is resident, so the two numbering schemes differ.
+    const TArray<FGaussianSplatCell>& GetCells() const { return Cells; }
+
 private:
     template<typename ElementType>
     void InitStructuredBuffer(
@@ -45,6 +50,8 @@ private:
 
     uint32 PointCount = 0;
     bool bHasSH = false;
+
+    TArray<FGaussianSplatCell> Cells;
 
     TResourceArray<FVector4f, VERTEXBUFFER_ALIGNMENT> PositionData;
     TResourceArray<FVector4f, VERTEXBUFFER_ALIGNMENT> Covariance0Data;

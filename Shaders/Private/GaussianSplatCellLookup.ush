@@ -1,0 +1,45 @@
+#pragma once
+
+// Maps a dispatch (or draw instance) index to a resident splat index.
+//
+// Without cells the mapping is one multiply: the renderer walked every Stride-th
+// splat of the whole capture, so index and splat differ by a constant factor.
+//
+// With cells it is piecewise. Each frame the CPU frustum-culls the cells, gives
+// every survivor a keep-count from its distance to the camera, and writes one
+// entry per selected cell: x = where that cell's splats start in the resident
+// buffer, y = where its run starts in the dispatch. Recovering the splat for a
+// thread is then a search for the last entry whose run has already begun --
+// about ten steps for a thousand cells, against a full covariance projection
+// further down the same shader.
+//
+// Cells are importance-ordered, so a cell's run is its most significant splats.
+StructuredBuffer<uint2> SplatCellRanges;
+uint SplatCellCount;
+
+uint ResolveSplatSourceIndex(uint Index, uint Stride)
+{
+    if (SplatCellCount == 0)
+    {
+        return Index * max(Stride, 1);
+    }
+
+    uint Lo = 0;
+    uint Hi = SplatCellCount - 1;
+
+    [loop]
+    while (Lo < Hi)
+    {
+        const uint Mid = (Lo + Hi + 1) >> 1;
+        if (SplatCellRanges[Mid].y <= Index)
+        {
+            Lo = Mid;
+        }
+        else
+        {
+            Hi = Mid - 1;
+        }
+    }
+
+    return SplatCellRanges[Lo].x + (Index - SplatCellRanges[Lo].y);
+}

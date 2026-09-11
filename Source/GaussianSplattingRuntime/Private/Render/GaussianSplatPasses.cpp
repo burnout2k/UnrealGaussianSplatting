@@ -33,6 +33,12 @@ namespace GaussianSplatProfiling
         int32 WriteSlot = 0;
         uint32 LastVisibleCount = 0;
         uint32 FrameCounter = 0;
+
+        // Budget feedback (Cesium's trick): the multiplier applied to every
+        // cell's keep-fraction. Overshoot the budget and it tightens for the
+        // next frame; undershoot and it relaxes. Converges in a few frames and
+        // turns MaxRenderPoints from a guess into an enforced ceiling.
+        float LodBias = 1.0f;
     };
 
     // Keyed per view, NOT global. A level renders more than one view -- the editor
@@ -52,7 +58,8 @@ namespace GaussianSplatProfiling
         FRDGBuilder& GraphBuilder,
         FRDGBufferRef IndirectArgsBuffer,
         uint32 RenderPointCount,
-        uint32 PaddedPointCount,
+        uint32 SelectedCount,
+        uint32 SelectedCells,
         uint32 ViewKey)
     {
         FVisibleCountState& State = GetViewState(ViewKey);
@@ -79,16 +86,18 @@ namespace GaussianSplatProfiling
         if ((State.FrameCounter++ % 60) == 0 && State.LastVisibleCount > 0)
         {
             const float VisiblePercent = 100.0f * static_cast<float>(State.LastVisibleCount) /
-                static_cast<float>(FMath::Max(1u, RenderPointCount));
+                static_cast<float>(FMath::Max(1u, SelectedCount));
             UE_LOG(
                 LogGaussianSplatProfile,
                 Display,
-                TEXT("view %u: visible=%u of %u drawn (%.1f%%) | sort runs over %u padded"),
+                TEXT("view %u: lod selected %u of %u budget across %u cells | ")
+                TEXT("visible=%u (%.1f%% of selected)"),
                 ViewKey,
-                State.LastVisibleCount,
+                SelectedCount,
                 RenderPointCount,
-                VisiblePercent,
-                PaddedPointCount);
+                SelectedCells,
+                State.LastVisibleCount,
+                VisiblePercent);
         }
     }
 
@@ -149,6 +158,28 @@ namespace GaussianSplatProfiling
         const uint64 Sized = static_cast<uint64>(LastVisible * Margin) + 4096u;
         return static_cast<uint32>(FMath::Min<uint64>(Sized, RenderPointCount));
     }
+
+    static TAutoConsoleVariable<float> CVarLodFullDistance(
+        TEXT("r.GaussianSplat.LodFullDistance"),
+        6000.0f,
+        TEXT("World units within which a cell renders every resident splat. ")
+        TEXT("Beyond it the keep-fraction falls off as the inverse square of ")
+        TEXT("distance, matching how a cell's projected area shrinks."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<float> CVarLodMinFraction(
+        TEXT("r.GaussianSplat.LodMinFraction"),
+        0.02f,
+        TEXT("Floor on a cell's keep-fraction, so distant geometry thins but ")
+        TEXT("never disappears. 0 lets far cells drop out entirely."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<int32> CVarLodEnabled(
+        TEXT("r.GaussianSplat.Lod"),
+        1,
+        TEXT("1 = per-cell frustum culling and distance LOD, 0 = draw every ")
+        TEXT("resident splat (the pre-cell behaviour, for A/B)."),
+        ECVF_RenderThreadSafe);
 
     // A/B measurement switch. The bitonic sort records 253 dispatches per frame
     // at full density, and per-pass barriers are suspected to dominate over the
@@ -412,6 +443,131 @@ BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatBillboardsRasterPassParameters, )
     RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 
+namespace GaussianSplatLod
+{
+    struct FSelection
+    {
+        // Always sized to the cell count so the RDG pool sees one buffer size
+        // per asset instead of a new one whenever the camera moves. Only the
+        // first CellCount entries are meaningful.
+        TArray<FUintVector2> Ranges;
+        uint32 CellCount = 0;
+        uint32 TotalCount = 0;
+    };
+
+    // Per-cell frustum cull + distance LOD + budget feedback, replacing the
+    // single global stride.
+    //
+    // The stride was spatially blind: it thinned the road under the bumper
+    // exactly as hard as the forest two kilometres away, and from a whole-map
+    // view it drew every resident splat (measured: 40M drawn, 94.6 ms). Cells
+    // let each region answer for itself.
+    void SelectCells(
+        const TArray<FGaussianSplatCell>& Cells,
+        const FMatrix44f& LocalToWorld,
+        const FSceneView& View,
+        uint32 Budget,
+        float& InOutBias,
+        FSelection& Out)
+    {
+        Out.Ranges.Reset();
+        Out.Ranges.SetNumZeroed(FMath::Max(1, Cells.Num()));
+        Out.CellCount = 0;
+        Out.TotalCount = 0;
+
+        if (Cells.IsEmpty() || Budget == 0)
+        {
+            return;
+        }
+
+        const FMatrix ToWorld(LocalToWorld);
+        const FVector ViewOrigin = View.ViewMatrices.GetViewOrigin();
+        const double FullDistance =
+            FMath::Max(1.0f, GaussianSplatProfiling::CVarLodFullDistance.GetValueOnRenderThread());
+        const float MinFraction =
+            FMath::Clamp(GaussianSplatProfiling::CVarLodMinFraction.GetValueOnRenderThread(), 0.0f, 1.0f);
+        const float Bias = FMath::Clamp(InOutBias, 0.001f, 4.0f);
+
+        TArray<uint32> Firsts;
+        TArray<uint32> Takes;
+        Firsts.Reserve(Cells.Num());
+        Takes.Reserve(Cells.Num());
+
+        uint64 Total = 0;
+        for (const FGaussianSplatCell& Cell : Cells)
+        {
+            if (Cell.Count <= 0)
+            {
+                continue;
+            }
+
+            // Shrink-wrapped bounds, so a cell holding a few floaters presents a
+            // one-metre target rather than the full grid slot.
+            const FBox WorldBox =
+                FBox(FVector(Cell.BoundsMin), FVector(Cell.BoundsMax)).TransformBy(ToWorld);
+            if (!View.ViewFrustum.IntersectBox(WorldBox.GetCenter(), WorldBox.GetExtent()))
+            {
+                continue;
+            }
+
+            // Inverse square, because that is how a cell's projected area falls
+            // off; keeping splats proportional to it keeps screen-space density
+            // roughly constant instead of over-drawing the far field.
+            const double Distance = FMath::Max(
+                FMath::Sqrt(ComputeSquaredDistanceFromBoxToPoint(WorldBox.Min, WorldBox.Max, ViewOrigin)),
+                FullDistance);
+            const double Falloff = (FullDistance / Distance) * (FullDistance / Distance);
+            const float Fraction = FMath::Clamp(static_cast<float>(Bias * Falloff), MinFraction, 1.0f);
+
+            // Never fewer than one: a cell that is visible at all should leave
+            // some trace rather than pop out completely.
+            const uint32 Take = static_cast<uint32>(
+                FMath::Clamp(FMath::RoundToInt(Cell.Count * Fraction), 1, Cell.Count));
+
+            Firsts.Add(static_cast<uint32>(Cell.FirstIndex));
+            Takes.Add(Take);
+            Total += Take;
+        }
+
+        // The bias only corrects the NEXT frame, and the sort buffers are sized
+        // to the budget, so an overshoot has to be absorbed here and now.
+        if (Total > Budget)
+        {
+            const double Scale = static_cast<double>(Budget) / static_cast<double>(Total);
+            Total = 0;
+            for (uint32& Take : Takes)
+            {
+                Take = static_cast<uint32>(FMath::Max<int64>(1, FMath::RoundToInt(Take * Scale)));
+                Total += Take;
+            }
+
+            // Rounding and the one-splat floor can still leave a handful over.
+            for (int32 Index = Takes.Num() - 1; Index >= 0 && Total > Budget; --Index)
+            {
+                const uint32 Drop = static_cast<uint32>(FMath::Min<uint64>(Takes[Index] - 1, Total - Budget));
+                Takes[Index] -= Drop;
+                Total -= Drop;
+            }
+        }
+
+        uint32 Prefix = 0;
+        for (int32 Index = 0; Index < Takes.Num(); ++Index)
+        {
+            Out.Ranges[Out.CellCount++] = FUintVector2(Firsts[Index], Prefix);
+            Prefix += Takes[Index];
+        }
+        Out.TotalCount = Prefix;
+
+        // Cesium's feedback loop. Tighten immediately when over budget, relax
+        // slowly when under, so it settles rather than oscillating.
+        if (Out.TotalCount > 0)
+        {
+            const float Desired = static_cast<float>(Budget) / static_cast<float>(Out.TotalCount);
+            InOutBias = FMath::Clamp(Bias * FMath::Min(Desired, 1.05f), 0.001f, 4.0f);
+        }
+    }
+}
+
 namespace GaussianSplatPasses
 {
     FScreenPassTexture AddPostProcessPass(
@@ -493,6 +649,9 @@ namespace GaussianSplatPasses
             }
 
             const uint32 Stride = FMath::Max(1u, Batch.Stride);
+
+            // RenderPointCount is the BUDGET: what the renderer is allowed to
+            // draw, stable frame to frame, and therefore what sizes the buffers.
             const uint32 RenderPointCount = FMath::Min(
                 Batch.MaxRenderPoints,
                 FMath::DivideAndRoundUp(Batch.AssetPointCount, Stride));
@@ -501,10 +660,55 @@ namespace GaussianSplatPasses
                 continue;
             }
 
+            // DispatchCount is what per-cell LOD actually selected this frame.
+            // It swings with the camera, so it sizes ONLY the dispatch -- never
+            // an allocation. Sizing a pooled buffer from a per-frame count is
+            // what exhausted VRAM and stuttered when it was tried before.
+            GaussianSplatLod::FSelection Selection;
+            uint32 DispatchCount = RenderPointCount;
+            if (GaussianSplatProfiling::CVarLodEnabled.GetValueOnRenderThread() != 0 &&
+                !Resources->GetCells().IsEmpty())
+            {
+                GaussianSplatLod::SelectCells(
+                    Resources->GetCells(),
+                    Batch.LocalToWorld,
+                    View,
+                    RenderPointCount,
+                    GaussianSplatProfiling::GetViewState(View.GetViewKey()).LodBias,
+                    Selection);
+                DispatchCount = Selection.TotalCount;
+                if (DispatchCount == 0)
+                {
+                    // Every cell outside the frustum: nothing to draw at all.
+                    continue;
+                }
+            }
+
+            FRDGBufferRef CellRangeBuffer = CreateStructuredBuffer(
+                GraphBuilder,
+                TEXT("GaussianSplat.CellRanges"),
+                sizeof(FUintVector2),
+                FMath::Max(1, Selection.Ranges.Num()),
+                Selection.Ranges.IsEmpty() ? nullptr : Selection.Ranges.GetData(),
+                Selection.Ranges.Num() * sizeof(FUintVector2));
+            FRDGBufferSRVRef CellRangeSRV = GraphBuilder.CreateSRV(CellRangeBuffer);
+
             const bool bUseRadixSort = GaussianSplatProfiling::ShouldUseRadixSort();
 
-            const uint32 SortCount =
-                GaussianSplatProfiling::GetSortCount(RenderPointCount, View.GetViewKey());
+            // With cells, how many splats the cull can possibly emit is known on
+            // the CPU before the frame: it is DispatchCount. So the sort simply
+            // covers all of them, and the stale-visible-count prediction goes
+            // away -- along with the transient band of unsorted splats it
+            // produced whenever the view jumped from a near-empty screen to a
+            // full one faster than the readback could follow.
+            //
+            // It costs the difference between selected and actually-visible,
+            // about 25% more keys at street level, to remove an artefact class
+            // outright. Without cells there is no exact count, so the old
+            // prediction still applies.
+            const uint32 SortCount = (Selection.CellCount > 0)
+                ? DispatchCount
+                : GaussianSplatProfiling::GetSortCount(RenderPointCount, View.GetViewKey());
 
             // Bitonic compares each element against Index ^ K, so its buffers must
             // be a power of two. Radix needs no padding at all: SortGPUBuffers
@@ -573,9 +777,11 @@ namespace GaussianSplatPasses
             if (Batch.RenderMode == EGaussianSplatRenderMode::Points)
             {
                 FGaussianSplatPointsCullCS::FParameters* InitSortParameters = GraphBuilder.AllocParameters<FGaussianSplatPointsCullCS::FParameters>();
-                InitSortParameters->NumElements = RenderPointCount;
+                InitSortParameters->NumElements = DispatchCount;
                 InitSortParameters->PaddedNumElements = PaddedPointCount;
                 InitSortParameters->Stride = Stride;
+                InitSortParameters->SplatCellRanges = CellRangeSRV;
+                InitSortParameters->SplatCellCount = Selection.CellCount;
                 InitSortParameters->SortK = 0;
                 InitSortParameters->SortJ = 0;
                 InitSortParameters->PassType = 0;
@@ -597,7 +803,7 @@ namespace GaussianSplatPasses
                     RDG_EVENT_NAME("GaussianSplatPointsSort.Init"),
                     PointsCullCS,
                     InitSortParameters,
-                    FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
+                    FComputeShaderUtils::GetGroupCount(DispatchCount, 64));
 
                 FRDGBufferRef SortedOrderBuffer = OrderBuffer;
                 if (bUseRadixSort)
@@ -621,6 +827,8 @@ namespace GaussianSplatPasses
                             SortParameters->NumElements = RenderPointCount;
                             SortParameters->PaddedNumElements = PaddedPointCount;
                             SortParameters->Stride = Stride;
+                            SortParameters->SplatCellRanges = CellRangeSRV;
+                            SortParameters->SplatCellCount = Selection.CellCount;
                             SortParameters->SortK = K;
                             SortParameters->SortJ = J;
                             SortParameters->PassType = 1;
@@ -653,6 +861,8 @@ namespace GaussianSplatPasses
                 RasterParameters->PointSize = Batch.PointSize;
                 RasterParameters->OpacityScale = Batch.OpacityScale;
                 RasterParameters->Stride = Stride;
+                RasterParameters->SplatCellRanges = CellRangeSRV;
+                RasterParameters->SplatCellCount = Selection.CellCount;
                 RasterParameters->LocalToWorldMatrix = Batch.LocalToWorld;
                 RasterParameters->ViewProjectionMatrix = ViewProjection;
                 RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedOrderBuffer, PF_R32_UINT));
@@ -700,9 +910,11 @@ namespace GaussianSplatPasses
             else
             {
                 FGaussianSplatBillboardsCullCS::FParameters* InitSortParameters = GraphBuilder.AllocParameters<FGaussianSplatBillboardsCullCS::FParameters>();
-                InitSortParameters->NumElements = RenderPointCount;
+                InitSortParameters->NumElements = DispatchCount;
                 InitSortParameters->PaddedNumElements = PaddedPointCount;
                 InitSortParameters->Stride = Stride;
+                InitSortParameters->SplatCellRanges = CellRangeSRV;
+                InitSortParameters->SplatCellCount = Selection.CellCount;
                 InitSortParameters->SortK = 0;
                 InitSortParameters->SortJ = 0;
                 InitSortParameters->PassType = 0;
@@ -733,7 +945,7 @@ namespace GaussianSplatPasses
                     RDG_EVENT_NAME("GaussianSplatBillboardsSort.Init"),
                     BillboardsCullCS,
                     InitSortParameters,
-                    FComputeShaderUtils::GetGroupCount(PaddedPointCount, 64));
+                    FComputeShaderUtils::GetGroupCount(DispatchCount, 64));
 
                 FRDGBufferRef SortedOrderBuffer = OrderBuffer;
                 if (bUseRadixSort)
@@ -757,6 +969,8 @@ namespace GaussianSplatPasses
                             SortParameters->NumElements = RenderPointCount;
                             SortParameters->PaddedNumElements = PaddedPointCount;
                             SortParameters->Stride = Stride;
+                            SortParameters->SplatCellRanges = CellRangeSRV;
+                            SortParameters->SplatCellCount = Selection.CellCount;
                             SortParameters->SortK = K;
                             SortParameters->SortJ = J;
                             SortParameters->PassType = 1;
@@ -794,6 +1008,8 @@ namespace GaussianSplatPasses
                 RasterParameters->PointSize = Batch.PointSize;
                 RasterParameters->OpacityScale = Batch.OpacityScale;
                 RasterParameters->Stride = Stride;
+                RasterParameters->SplatCellRanges = CellRangeSRV;
+                RasterParameters->SplatCellCount = Selection.CellCount;
                 RasterParameters->ViewMatrix = ViewMatrix;
                 RasterParameters->LocalToWorldMatrix = Batch.LocalToWorld;
                 RasterParameters->ProjectionMatrix = ProjectionMatrix;
@@ -857,7 +1073,8 @@ namespace GaussianSplatPasses
                     GraphBuilder,
                     IndirectArgsBuffer,
                     RenderPointCount,
-                    PaddedPointCount,
+                    DispatchCount,
+                    Selection.CellCount,
                     View.GetViewKey());
             }
 

@@ -1,4 +1,5 @@
 #include "/Engine/Public/Platform.ush"
+#include "GaussianSplatCellLookup.ush"
 
 StructuredBuffer<float4> SplatPositionBuffer;
 
@@ -81,7 +82,7 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
 
         if (Index < NumElements)
         {
-            uint AssetIndex = Index * max(Stride, 1);
+            uint AssetIndex = ResolveSplatSourceIndex(Index, Stride);
             float Depth = 0.0;
             bool bVisible = IsSplatVisible(AssetIndex, Depth);
             if (bVisible)

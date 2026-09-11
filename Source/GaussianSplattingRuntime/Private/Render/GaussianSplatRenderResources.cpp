@@ -8,10 +8,79 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
     const TArray<FGaussianCovariance3f>& InCovariances,
     const TArray<FVector4f>& InColorsOpacity,
     const TArray<float>& InSHCoefficients,
+    const TArray<FGaussianSplatCell>& InCells,
     int32 MaxPointCount)
 {
     const int32 SourcePointCount = InPositions.Num();
-    PointCount = static_cast<uint32>(FMath::Min(SourcePointCount, FMath::Max(0, MaxPointCount)));
+    const int32 Budget = FMath::Max(0, MaxPointCount);
+
+    // Which splats become resident.
+    //
+    // Uniformly striding the whole asset (the original scheme) is spatially even
+    // but blind to importance -- it keeps every Nth splat in file order, so the
+    // road under the bumper is thinned exactly as hard as the forest 2 km away,
+    // and which splats survive is an accident of file layout.
+    //
+    // With cells there is a better answer at identical cost: take a PREFIX of
+    // each cell. Cells are importance-ordered, so a prefix is the most
+    // significant splats of that cell, and taking the same fraction everywhere
+    // keeps coverage spatially even. Same count, same VRAM, better choice.
+    //
+    // Splats parked past the last cell by MinCellOccupancy are simply never
+    // reached here, so excluded floaters cost no VRAM at all.
+    Cells.Reset();
+    TArray<int32> SourceOfDest;
+
+    if (InCells.IsEmpty())
+    {
+        // No cells (an asset that predates them, or one whose splats were all
+        // filtered out). Fall back to the original even sample.
+        const int32 Count = FMath::Min(SourcePointCount, Budget);
+        SourceOfDest.SetNumUninitialized(Count);
+        for (int32 Index = 0; Index < Count; ++Index)
+        {
+            SourceOfDest[Index] = Count > 1
+                ? static_cast<int32>((static_cast<int64>(Index) * (SourcePointCount - 1)) / (Count - 1))
+                : 0;
+        }
+    }
+    else
+    {
+        int64 TotalInCells = 0;
+        for (const FGaussianSplatCell& Cell : InCells)
+        {
+            TotalInCells += Cell.Count;
+        }
+
+        const double Ratio = (TotalInCells <= Budget || TotalInCells == 0)
+            ? 1.0
+            : static_cast<double>(Budget) / static_cast<double>(TotalInCells);
+
+        SourceOfDest.Reserve(FMath::Min<int64>(TotalInCells, Budget) + InCells.Num());
+        Cells.Reserve(InCells.Num());
+        for (const FGaussianSplatCell& Source : InCells)
+        {
+            // At least one splat per cell, so a cell never vanishes entirely
+            // from residency just because it is small.
+            const int32 Take = Ratio >= 1.0
+                ? Source.Count
+                : FMath::Clamp(FMath::RoundToInt(Source.Count * Ratio), 1, Source.Count);
+
+            FGaussianSplatCell Resident;
+            Resident.BoundsMin = Source.BoundsMin;
+            Resident.BoundsMax = Source.BoundsMax;
+            Resident.FirstIndex = SourceOfDest.Num();
+            Resident.Count = Take;
+            Cells.Add(Resident);
+
+            for (int32 Offset = 0; Offset < Take; ++Offset)
+            {
+                SourceOfDest.Add(Source.FirstIndex + Offset);
+            }
+        }
+    }
+
+    PointCount = static_cast<uint32>(SourceOfDest.Num());
 
     PositionData.Empty(PointCount);
     Covariance0Data.Empty(PointCount);
@@ -27,9 +96,7 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
 
     for (uint32 Index = 0; Index < PointCount; ++Index)
     {
-        const int32 SourceIndex = PointCount > 1
-            ? static_cast<int32>((static_cast<int64>(Index) * (SourcePointCount - 1)) / (PointCount - 1))
-            : 0;
+        const int32 SourceIndex = SourceOfDest[Index];
         const FVector3f Position = InPositions[SourceIndex];
         const FGaussianCovariance3f Covariance = InCovariances.IsValidIndex(SourceIndex)
             ? InCovariances[SourceIndex]

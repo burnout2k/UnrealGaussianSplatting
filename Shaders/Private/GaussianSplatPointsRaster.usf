@@ -1,5 +1,6 @@
 #include "/Engine/Public/Platform.ush"
 #include "GaussianSplatDepthTest.ush"
+#include "GaussianSplatCellLookup.ush"
 
 Buffer<uint> SplatOrderBuffer;
 StructuredBuffer<float4> SplatPositionBuffer;
@@ -35,7 +36,7 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 {
     VSOutput Output = (VSOutput)0;
 
-    InstanceID = SplatOrderBuffer[InstanceID] * max(Stride, 1);
+    InstanceID = ResolveSplatSourceIndex(SplatOrderBuffer[InstanceID], Stride);
 
     float3 CenterWS = mul(float4(SplatPositionBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
     float SafeClipW = 0.0;
