@@ -1,7 +1,7 @@
 #include "/Engine/Public/Platform.ush"
 #include "GaussianSplatCellLookup.ush"
 
-StructuredBuffer<float4> SplatPositionBuffer;
+StructuredBuffer<float4> SplatPositionColorBuffer;
 
 uint SortKeyShift;
 RWBuffer<uint> SplatOrderBufferUAV;
@@ -40,7 +40,7 @@ float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
 
 bool IsSplatVisible(uint AssetIndex, out float Depth)
 {
-    float3 CenterWS = mul(float4(SplatPositionBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
+    float3 CenterWS = mul(float4(SplatPositionColorBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
     Depth = dot(CenterWS - ViewWorldOrigin.xyz, ViewForward.xyz);
     if (Depth <= 0.0)
     {

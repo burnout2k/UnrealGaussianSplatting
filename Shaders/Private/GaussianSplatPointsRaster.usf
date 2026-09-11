@@ -1,10 +1,11 @@
 #include "/Engine/Public/Platform.ush"
 #include "GaussianSplatDepthTest.ush"
+#include "GaussianSplatCommon.ush"
 #include "GaussianSplatCellLookup.ush"
 
 Buffer<uint> SplatOrderBuffer;
-StructuredBuffer<float4> SplatPositionBuffer;
-StructuredBuffer<float4> SplatColorBuffer;
+StructuredBuffer<float4> SplatPositionColorBuffer;
+float2 SplatColorEncoding;
 
 float2 ViewRectMin;
 float2 ViewSize;
@@ -38,7 +39,7 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 
     InstanceID = ResolveSplatSourceIndex(SplatOrderBuffer[InstanceID], Stride);
 
-    float3 CenterWS = mul(float4(SplatPositionBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
+    float3 CenterWS = mul(float4(SplatPositionColorBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
     float SafeClipW = 0.0;
     float DeviceZ = 0.0;
     float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW, DeviceZ);
@@ -70,7 +71,7 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     // occlude this preview point without writing splat depth back to the scene.
     Output.Position = float4(Ndc, DeviceZ, 1.0);
 
-    float4 BaseColor = SplatColorBuffer[InstanceID];
+    float4 BaseColor = DecodeSplatColor(SplatPositionColorBuffer[InstanceID].w, SplatColorEncoding);
     Output.Color = float4(BaseColor.rgb, saturate(BaseColor.a * OpacityScale));
     return Output;
 }

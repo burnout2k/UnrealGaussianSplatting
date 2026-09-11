@@ -82,10 +82,38 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
 
     PointCount = static_cast<uint32>(SourceOfDest.Num());
 
-    PositionData.Empty(PointCount);
+    PositionColorData.Empty(PointCount);
     Covariance0Data.Empty(PointCount);
     Covariance1Data.Empty(PointCount);
-    ColorData.Empty(PointCount);
+
+    // Fit the RGB quantization range to what this capture actually contains.
+    //
+    // A fixed [0,1] would be wrong: 3DGS colour is 0.5 + 0.28209 * f_dc and is
+    // unbounded. Measured on the 85.8M Vuores capture, 2.4-7.6% of splats have a
+    // channel outside [0,1], peaking at 1.73 -- all of which a naive encoding
+    // would clamp to white. Fitting costs one pass over the resident subset and
+    // removes the question entirely.
+    float ColorMin = TNumericLimits<float>::Max();
+    float ColorMax = TNumericLimits<float>::Lowest();
+    for (int32 Index = 0; Index < SourceOfDest.Num(); ++Index)
+    {
+        const int32 SourceIndex = SourceOfDest[Index];
+        if (!InColorsOpacity.IsValidIndex(SourceIndex))
+        {
+            continue;
+        }
+
+        const FVector4f& Color = InColorsOpacity[SourceIndex];
+        ColorMin = FMath::Min3(ColorMin, FMath::Min(Color.X, Color.Y), Color.Z);
+        ColorMax = FMath::Max3(ColorMax, FMath::Max(Color.X, Color.Y), Color.Z);
+    }
+    if (ColorMin > ColorMax)
+    {
+        ColorMin = 0.0f;
+        ColorMax = 1.0f;
+    }
+    // A degenerate range (every splat one colour) would divide by zero.
+    ColorEncoding = FVector2f(ColorMin, FMath::Max(ColorMax - ColorMin, KINDA_SMALL_NUMBER));
 
     // A capture exported at SH degree 0 has no f_rest_* data, so every one of the
     // 15 float4 per splat would be zero: 240 of the 304 bytes per splat on the GPU,
@@ -105,10 +133,20 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
             ? InColorsOpacity[SourceIndex]
             : FVector4f(1.0f, 1.0f, 1.0f, 1.0f);
 
-        PositionData.Add(FVector4f(Position.X, Position.Y, Position.Z, 1.0f));
+        // Colour into the w lane position never used. RGB over the fitted
+        // range, opacity straight from its sigmoid [0,1].
+        const FVector3f Normalised = (FVector3f(Color.X, Color.Y, Color.Z) - FVector3f(ColorEncoding.X))
+            / ColorEncoding.Y;
+        const uint32 PackedColor =
+              static_cast<uint32>(FMath::RoundToInt(FMath::Clamp(Normalised.X, 0.0f, 1.0f) * 255.0f))
+            | static_cast<uint32>(FMath::RoundToInt(FMath::Clamp(Normalised.Y, 0.0f, 1.0f) * 255.0f)) << 8
+            | static_cast<uint32>(FMath::RoundToInt(FMath::Clamp(Normalised.Z, 0.0f, 1.0f) * 255.0f)) << 16
+            | static_cast<uint32>(FMath::RoundToInt(FMath::Clamp(Color.W, 0.0f, 1.0f) * 255.0f)) << 24;
+
+        PositionColorData.Add(FVector4f(
+            Position.X, Position.Y, Position.Z, *reinterpret_cast<const float*>(&PackedColor)));
         Covariance0Data.Add(FVector4f(Covariance.XX, Covariance.XY, Covariance.XZ, Covariance.YY));
-        Covariance1Data.Add(FVector4f(Covariance.YZ, Covariance.ZZ, 0.0f, 0.0f));
-        ColorData.Add(Color);
+        Covariance1Data.Add(FVector2f(Covariance.YZ, Covariance.ZZ));
 
         if (!bHasSH)
         {
@@ -160,24 +198,21 @@ void FGaussianSplatRenderResources::InitStructuredBuffer(
 
 void FGaussianSplatRenderResources::InitRHI(FRHICommandListBase& RHICmdList)
 {
-    InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.AssetPositions"), PositionData, PositionBuffer, PositionSRV);
+    InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.AssetPositionColor"), PositionColorData, PositionColorBuffer, PositionColorSRV);
     InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.AssetCovariance0"), Covariance0Data, Covariance0Buffer, Covariance0SRV);
     InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.AssetCovariance1"), Covariance1Data, Covariance1Buffer, Covariance1SRV);
-    InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.AssetColors"), ColorData, ColorBuffer, ColorSRV);
     InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.AssetSH"), SHData, SHBuffer, SHSRV);
 }
 
 void FGaussianSplatRenderResources::ReleaseRHI()
 {
-    PositionSRV.SafeRelease();
+    PositionColorSRV.SafeRelease();
     Covariance0SRV.SafeRelease();
     Covariance1SRV.SafeRelease();
-    ColorSRV.SafeRelease();
     SHSRV.SafeRelease();
 
-    PositionBuffer.SafeRelease();
+    PositionColorBuffer.SafeRelease();
     Covariance0Buffer.SafeRelease();
     Covariance1Buffer.SafeRelease();
-    ColorBuffer.SafeRelease();
     SHBuffer.SafeRelease();
 }

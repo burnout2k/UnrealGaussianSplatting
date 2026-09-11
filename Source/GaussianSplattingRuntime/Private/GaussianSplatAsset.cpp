@@ -396,10 +396,23 @@ const FGaussianSplatRenderResources* UGaussianSplatAsset::GetRenderResources() c
 static TAutoConsoleVariable<int32> CVarMaxGpuPointCountCeiling(
     TEXT("r.GaussianSplat.MaxGpuPointCountCeiling"),
     32000000,
-    TEXT("Hard ceiling on how many splats any asset may upload, whatever its ")
-    TEXT("MaxGpuPointCount says. Guards against a saved value that exhausts VRAM ")
-    TEXT("and crash-loops the editor. Raise it if you have headroom to spare; the ")
-    TEXT("default suits roughly a 10 GB card."),
+    TEXT("EDITOR ONLY ceiling on how many splats any asset may upload, whatever ")
+    TEXT("its MaxGpuPointCount says. The editor costs several GB of VRAM on top of ")
+    TEXT("the scene, so it needs a tighter cap than a packaged build, and a value ")
+    TEXT("that does not fit crash-loops it -- PostLoad retries the same upload every ")
+    TEXT("launch, and Vulkan aborts rather than degrading. Packaged builds use ")
+    TEXT("r.GaussianSplat.MaxGpuPointCountCeilingGame instead."),
+    ECVF_RenderThreadSafe);
+
+// Packaged builds carry none of the editor's overhead, so the cap that keeps the
+// editor alive would needlessly throw away splats on a CARLA server. 0 means no
+// cap at all: the asset's own MaxGpuPointCount is the only limit.
+static TAutoConsoleVariable<int32> CVarMaxGpuPointCountCeilingGame(
+    TEXT("r.GaussianSplat.MaxGpuPointCountCeilingGame"),
+    0,
+    TEXT("Ceiling applied OUTSIDE the editor (packaged game and server). 0 = no ")
+    TEXT("ceiling, so the asset's MaxGpuPointCount decides. Set a positive value ")
+    TEXT("only if a particular deployment needs to hold back."),
     ECVF_RenderThreadSafe);
 
 void UGaussianSplatAsset::BuildRenderResources()
@@ -407,7 +420,14 @@ void UGaussianSplatAsset::BuildRenderResources()
     // 先释放旧资源，避免新旧 Buffer 同时悬挂。
     ReleaseRenderResources();
 
-    const int32 Ceiling = FMath::Max(1000, CVarMaxGpuPointCountCeiling.GetValueOnAnyThread());
+    // The editor and a packaged build have very different budgets, so they get
+    // separate ceilings. This is what lets one committed config cap the editor
+    // (where the editor's own several GB leave little room) while a CARLA server
+    // built from the same project uploads everything.
+    const int32 Configured = GIsEditor
+        ? CVarMaxGpuPointCountCeiling.GetValueOnAnyThread()
+        : CVarMaxGpuPointCountCeilingGame.GetValueOnAnyThread();
+    const int32 Ceiling = Configured > 0 ? FMath::Max(1000, Configured) : MAX_int32;
     const int32 RequestedPointCount = FMath::Max(1000, MaxGpuPointCount);
     const int32 EffectivePointCount = FMath::Min(RequestedPointCount, Ceiling);
     if (EffectivePointCount < RequestedPointCount)
@@ -415,9 +435,10 @@ void UGaussianSplatAsset::BuildRenderResources()
         UE_LOG(
             LogGaussianSplatAsset,
             Warning,
-            TEXT("MaxGpuPointCount %d exceeds the r.GaussianSplat.MaxGpuPointCountCeiling of %d; ")
-            TEXT("uploading %d instead. Raise the ceiling if this GPU has the memory."),
+            TEXT("MaxGpuPointCount %d exceeds the %s ceiling of %d; uploading %d ")
+            TEXT("instead. Raise the ceiling if this GPU has the memory."),
             RequestedPointCount,
+            GIsEditor ? TEXT("editor") : TEXT("packaged-build"),
             Ceiling,
             EffectivePointCount);
     }
@@ -434,11 +455,15 @@ void UGaussianSplatAsset::BuildRenderResources()
     UE_LOG(
         LogGaussianSplatAsset,
         Display,
-        TEXT("Prepared %u of %d Gaussian splats for GPU upload across %d cells ")
+        TEXT("Prepared %u of %d Gaussian splats for GPU upload across %d cells, ")
+        TEXT("%.0f MiB at 40 B/splat, colour quantized over [%.3f, %.3f] ")
         TEXT("(MaxGpuPointCount=%d, ceiling=%d)"),
         RenderResources->GetPointCount(),
         Positions.Num(),
         RenderResources->GetCells().Num(),
+        RenderResources->GetPointCount() * 40.0 / (1024.0 * 1024.0),
+        RenderResources->GetColorEncoding().X,
+        RenderResources->GetColorEncoding().X + RenderResources->GetColorEncoding().Y,
         MaxGpuPointCount,
         Ceiling);
 

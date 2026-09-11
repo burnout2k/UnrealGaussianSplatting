@@ -9,20 +9,40 @@ float3x3 MakeFloat3x3FromRows(float3 Row0, float3 Row1, float3 Row2)
         Row2.x, Row2.y, Row2.z);
 }
 
+// Cov1 is float2, not float4: the upper covariance triangle is six floats, and
+// the old layout wasted the remaining two lanes of a float4 on every splat.
 void LoadCovariance3D(
     StructuredBuffer<float4> Covariance0Buffer,
-    StructuredBuffer<float4> Covariance1Buffer,
+    StructuredBuffer<float2> Covariance1Buffer,
     uint InstanceID,
     float ScaleFactor,
     out float3 Cov3D0,
     out float3 Cov3D1)
 {
     float4 Cov0 = Covariance0Buffer[InstanceID];
-    float4 Cov1 = Covariance1Buffer[InstanceID];
+    float2 Cov1 = Covariance1Buffer[InstanceID];
     float ScaleFactor2 = ScaleFactor * ScaleFactor;
 
     Cov3D0 = float3(Cov0.x, Cov0.y, Cov0.z) * ScaleFactor2;
     Cov3D1 = float3(Cov0.w, Cov1.x, Cov1.y) * ScaleFactor2;
+}
+
+// Colour rides in the position buffer's w lane as four bytes.
+//
+// RGB share one affine range fitted to the capture at build time. A fixed [0,1]
+// range would be wrong: 3DGS colour is 0.5 + 0.28209 * f_dc and is unbounded --
+// on this capture 2.4-7.6% of splats exceed 1.0, peaking at 1.73, and would
+// clamp. Opacity comes from a sigmoid so it is always [0,1] and needs no range.
+float4 DecodeSplatColor(float Packed, float2 Encoding)
+{
+    const uint Bits = asuint(Packed);
+    const float4 Quantised = float4(
+        Bits & 0xFF,
+        (Bits >> 8) & 0xFF,
+        (Bits >> 16) & 0xFF,
+        (Bits >> 24) & 0xFF) * (1.0 / 255.0);
+
+    return float4(Quantised.rgb * Encoding.y + Encoding.x, Quantised.a);
 }
 
 float3 CalcConic(float3 Cov2D)

@@ -2,10 +2,10 @@
 #include "GaussianSplatCommon.ush"
 #include "GaussianSplatCellLookup.ush"
 
-StructuredBuffer<float4> SplatPositionBuffer;
+StructuredBuffer<float4> SplatPositionColorBuffer;
 StructuredBuffer<float4> SplatCovariance0Buffer;
-StructuredBuffer<float4> SplatCovariance1Buffer;
-StructuredBuffer<float4> SplatColorBuffer;
+StructuredBuffer<float2> SplatCovariance1Buffer;
+float2 SplatColorEncoding;
 
 uint SortKeyShift;
 RWBuffer<uint> SplatOrderBufferUAV;
@@ -50,7 +50,7 @@ float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
 
 bool IsSplatVisible(uint AssetIndex, out float Depth)
 {
-    float3 CenterWS = mul(float4(SplatPositionBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
+    float3 CenterWS = mul(float4(SplatPositionColorBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
     Depth = dot(CenterWS - ViewWorldOrigin.xyz, ViewForward.xyz);
     if (Depth <= 0.0)
     {
@@ -68,7 +68,8 @@ bool IsSplatVisible(uint AssetIndex, out float Depth)
     // of them stack into the milky veil that dense captures show. Rejecting it
     // here skips its whole rasterisation, not just its faint pixels.
     if (MinSplatOpacity > 0.0 &&
-        saturate(SplatColorBuffer[AssetIndex].w * OpacityScale) < MinSplatOpacity)
+        saturate(DecodeSplatColor(SplatPositionColorBuffer[AssetIndex].w, SplatColorEncoding).w
+            * OpacityScale) < MinSplatOpacity)
     {
         return false;
     }

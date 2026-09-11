@@ -4,10 +4,10 @@
 #include "GaussianSplatCellLookup.ush"
 
 Buffer<uint> SplatOrderBuffer;
-StructuredBuffer<float4> SplatPositionBuffer;
+StructuredBuffer<float4> SplatPositionColorBuffer;
 StructuredBuffer<float4> SplatCovariance0Buffer;
-StructuredBuffer<float4> SplatCovariance1Buffer;
-StructuredBuffer<float4> SplatColorBuffer;
+StructuredBuffer<float2> SplatCovariance1Buffer;
+float2 SplatColorEncoding;
 StructuredBuffer<float4> SplatSHBuffer;
 
 float2 ViewRectMin;
@@ -124,7 +124,7 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 
     InstanceID = ResolveSplatSourceIndex(SplatOrderBuffer[InstanceID], Stride);
 
-    float3 CenterWS = mul(float4(SplatPositionBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
+    float3 CenterWS = mul(float4(SplatPositionColorBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
     float SafeClipW = 0.0;
     float DeviceZ = 0.0;
     float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW, DeviceZ);
@@ -203,7 +203,7 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     Output.QuadPos = QuadPos;
 
     float3 ViewDirWS = normalize(ViewWorldOrigin.xyz - CenterWS);
-    float4 BaseColor = SplatColorBuffer[InstanceID];
+    float4 BaseColor = DecodeSplatColor(SplatPositionColorBuffer[InstanceID].w, SplatColorEncoding);
     Output.Color = float4(
         EvaluateSH(
             BaseColor.rgb,

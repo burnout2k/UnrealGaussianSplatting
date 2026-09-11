@@ -90,11 +90,15 @@ namespace GaussianSplatProfiling
             UE_LOG(
                 LogGaussianSplatProfile,
                 Display,
-                TEXT("view %u: lod selected %u of %u budget across %u cells | ")
-                TEXT("visible=%u (%.1f%% of selected)"),
+                TEXT("view %u: lod selected %u of %u budget (%.0f MiB sort scratch) ")
+                TEXT("across %u cells | visible=%u (%.1f%% of selected)"),
                 ViewKey,
                 SelectedCount,
                 RenderPointCount,
+                // Four uint32 buffers -- key and order, doubled for the radix
+                // ping-pong. This is the entire VRAM cost of raising the budget,
+                // and it buys nothing once it exceeds what LOD ever selects.
+                RenderPointCount * 16.0 / (1024.0 * 1024.0),
                 SelectedCells,
                 State.LastVisibleCount,
                 VisiblePercent);
@@ -643,18 +647,30 @@ namespace GaussianSplatPasses
         for (const FGaussianSplatRenderBatch& Batch : Batches)
         {
             const FGaussianSplatRenderResources* Resources = Batch.Resources;
-            if (Resources == nullptr || Resources->GetPointCount() == 0 || Resources->GetPositionSRV() == nullptr)
+            if (Resources == nullptr || Resources->GetPointCount() == 0 || Resources->GetPositionColorSRV() == nullptr)
             {
                 continue;
             }
 
-            const uint32 Stride = FMath::Max(1u, Batch.Stride);
+            const bool bUseCells =
+                GaussianSplatProfiling::CVarLodEnabled.GetValueOnRenderThread() != 0 &&
+                !Resources->GetCells().IsEmpty();
 
-            // RenderPointCount is the BUDGET: what the renderer is allowed to
-            // draw, stable frame to frame, and therefore what sizes the buffers.
-            const uint32 RenderPointCount = FMath::Min(
-                Batch.MaxRenderPoints,
-                FMath::DivideAndRoundUp(Batch.AssetPointCount, Stride));
+            // The component's Stride is vestigial once cells exist: the cull
+            // resolves thread -> splat through the per-frame ranges, and LOD
+            // already sets density per cell from distance. Leaving it in place
+            // silently deformed the budget -- MaxRenderPoints 6M over 85.8M
+            // resident derived a stride of 15 and turned the budget into
+            // 5,721,924, while 90M derived a stride of 1 and made it the whole
+            // 85.8M, whose sort buffers (4 x 343 MB) then failed to allocate.
+            const uint32 Stride = bUseCells ? 1u : FMath::Max(1u, Batch.Stride);
+
+            // RenderPointCount is the BUDGET: what the renderer may draw, stable
+            // frame to frame, and therefore what sizes the buffers.
+            const uint32 RenderPointCount = bUseCells
+                ? FMath::Min(Batch.MaxRenderPoints, Batch.AssetPointCount)
+                : FMath::Min(Batch.MaxRenderPoints,
+                             FMath::DivideAndRoundUp(Batch.AssetPointCount, Stride));
             if (RenderPointCount == 0)
             {
                 continue;
@@ -666,8 +682,7 @@ namespace GaussianSplatPasses
             // what exhausted VRAM and stuttered when it was tried before.
             GaussianSplatLod::FSelection Selection;
             uint32 DispatchCount = RenderPointCount;
-            if (GaussianSplatProfiling::CVarLodEnabled.GetValueOnRenderThread() != 0 &&
-                !Resources->GetCells().IsEmpty())
+            if (bUseCells)
             {
                 GaussianSplatLod::SelectCells(
                     Resources->GetCells(),
@@ -792,7 +807,7 @@ namespace GaussianSplatPasses
                 InitSortParameters->PointSize = Batch.PointSize;
                 InitSortParameters->ViewProjectionMatrix = ViewProjection;
                 InitSortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
-                InitSortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
+                InitSortParameters->SplatPositionColorBuffer = Resources->GetPositionColorSRV();
                 InitSortParameters->SortKeyShift = 32u - GaussianSplatProfiling::GetSortKeyBits();
                 InitSortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                 InitSortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
@@ -839,7 +854,7 @@ namespace GaussianSplatPasses
                             SortParameters->PointSize = 0.0f;
                             SortParameters->ViewProjectionMatrix = FMatrix44f::Identity;
                             SortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
-                            SortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
+                            SortParameters->SplatPositionColorBuffer = Resources->GetPositionColorSRV();
                             SortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                             SortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
                             SortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
@@ -866,8 +881,8 @@ namespace GaussianSplatPasses
                 RasterParameters->LocalToWorldMatrix = Batch.LocalToWorld;
                 RasterParameters->ViewProjectionMatrix = ViewProjection;
                 RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedOrderBuffer, PF_R32_UINT));
-                RasterParameters->SplatPositionBuffer = Resources->GetPositionSRV();
-                RasterParameters->SplatColorBuffer = Resources->GetColorSRV();
+                RasterParameters->SplatPositionColorBuffer = Resources->GetPositionColorSRV();
+                RasterParameters->SplatColorEncoding = Resources->GetColorEncoding();
                 SetDepthTestParameters(PassParameters->PS.DepthTest);
                 PassParameters->IndirectArgsBuffer = IndirectArgsBuffer;
                 PassParameters->RenderTargets[0] = FRenderTargetBinding(
@@ -927,10 +942,10 @@ namespace GaussianSplatPasses
                 InitSortParameters->ProjectionMatrix = ProjectionMatrix;
                 InitSortParameters->ViewProjectionMatrix = ViewProjection;
                 InitSortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
-                InitSortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
+                InitSortParameters->SplatPositionColorBuffer = Resources->GetPositionColorSRV();
                 InitSortParameters->SplatCovariance0Buffer = Resources->GetCovariance0SRV();
                 InitSortParameters->SplatCovariance1Buffer = Resources->GetCovariance1SRV();
-                InitSortParameters->SplatColorBuffer = Resources->GetColorSRV();
+                InitSortParameters->SplatColorEncoding = Resources->GetColorEncoding();
                 InitSortParameters->OpacityScale = Batch.OpacityScale;
                 InitSortParameters->MinSplatOpacity = GaussianSplatProfiling::GetMinSplatOpacity();
                 InitSortParameters->MaxSplatDistance = GaussianSplatProfiling::GetMaxSplatDistance();
@@ -983,7 +998,7 @@ namespace GaussianSplatPasses
                             SortParameters->ProjectionMatrix = FMatrix44f::Identity;
                             SortParameters->ViewProjectionMatrix = FMatrix44f::Identity;
                             SortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
-                            SortParameters->SplatPositionBuffer = Resources->GetPositionSRV();
+                            SortParameters->SplatPositionColorBuffer = Resources->GetPositionColorSRV();
                             SortParameters->SplatCovariance0Buffer = Resources->GetCovariance0SRV();
                             SortParameters->SplatCovariance1Buffer = Resources->GetCovariance1SRV();
                             SortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
@@ -1018,10 +1033,10 @@ namespace GaussianSplatPasses
                 RasterParameters->WorldToLocalRow1 = Batch.WorldToLocalRow1;
                 RasterParameters->WorldToLocalRow2 = Batch.WorldToLocalRow2;
                 RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedOrderBuffer, PF_R32_UINT));
-                RasterParameters->SplatPositionBuffer = Resources->GetPositionSRV();
+                RasterParameters->SplatPositionColorBuffer = Resources->GetPositionColorSRV();
                 RasterParameters->SplatCovariance0Buffer = Resources->GetCovariance0SRV();
                 RasterParameters->SplatCovariance1Buffer = Resources->GetCovariance1SRV();
-                RasterParameters->SplatColorBuffer = Resources->GetColorSRV();
+                RasterParameters->SplatColorEncoding = Resources->GetColorEncoding();
                 RasterParameters->PerPixelDepth = GaussianSplatProfiling::ShouldUsePerPixelDepth() ? 1u : 0u;
                 RasterParameters->HasSH = Resources->HasSH() ? 1u : 0u;
                 RasterParameters->MinScreenVariance = GaussianSplatProfiling::GetMinScreenVariance();
