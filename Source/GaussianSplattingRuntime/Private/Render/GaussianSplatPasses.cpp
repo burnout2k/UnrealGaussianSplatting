@@ -492,8 +492,13 @@ namespace GaussianSplatLod
         const FVector ViewOrigin = View.ViewMatrices.GetViewOrigin();
         const double FullDistance =
             FMath::Max(1.0f, GaussianSplatProfiling::CVarLodFullDistance.GetValueOnRenderThread());
+        // r.GaussianSplat.Lod 0 means no distance thinning: every visible cell
+        // keeps all of its splats. The budget clamp below still applies, so this
+        // cannot overrun the sort buffers.
         const float MinFraction =
-            FMath::Clamp(GaussianSplatProfiling::CVarLodMinFraction.GetValueOnRenderThread(), 0.0f, 1.0f);
+            (GaussianSplatProfiling::CVarLodEnabled.GetValueOnRenderThread() != 0)
+                ? FMath::Clamp(GaussianSplatProfiling::CVarLodMinFraction.GetValueOnRenderThread(), 0.0f, 1.0f)
+                : 1.0f;
         const float Bias = FMath::Clamp(InOutBias, 0.001f, 4.0f);
 
         TArray<uint32> Firsts;
@@ -660,9 +665,12 @@ namespace GaussianSplatPasses
                 continue;
             }
 
-            const bool bUseCells =
-                GaussianSplatProfiling::CVarLodEnabled.GetValueOnRenderThread() != 0 &&
-                !Resources->GetCells().IsEmpty();
+            // Cells are MANDATORY once the asset has them. The 20 B record stores
+            // each position as a 16-bit fraction of its OWN cell, so without a cell
+            // index there is nothing to decode against -- the legacy stride path
+            // renders an empty screen. r.GaussianSplat.Lod therefore selects the
+            // distance falloff only (see SelectCells), never whether cells are used.
+            const bool bUseCells = !Resources->GetCells().IsEmpty();
 
             // The component's Stride is vestigial once cells exist: the cull
             // resolves thread -> splat through the per-frame ranges, and LOD
@@ -831,7 +839,7 @@ namespace GaussianSplatPasses
                     FComputeShaderUtils::GetGroupCount(DispatchCount, 64));
 
                 FRDGBufferRef SortedOrderBuffer = OrderBuffer;
-                if (bUseRadixSort)
+                if (!GaussianSplatProfiling::ShouldSkipSort() && bUseRadixSort)
                 {
                     SortedOrderBuffer = GaussianSplatSorting::AddRadixSortPass(
                         GraphBuilder,
@@ -977,7 +985,7 @@ namespace GaussianSplatPasses
                     FComputeShaderUtils::GetGroupCount(DispatchCount, 64));
 
                 FRDGBufferRef SortedOrderBuffer = OrderBuffer;
-                if (bUseRadixSort)
+                if (!GaussianSplatProfiling::ShouldSkipSort() && bUseRadixSort)
                 {
                     SortedOrderBuffer = GaussianSplatSorting::AddRadixSortPass(
                         GraphBuilder,
