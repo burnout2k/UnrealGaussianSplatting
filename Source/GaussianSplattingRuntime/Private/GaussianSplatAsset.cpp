@@ -480,12 +480,15 @@ void UGaussianSplatAsset::BuildRenderResources()
         LogGaussianSplatAsset,
         Display,
         TEXT("Prepared %u of %d Gaussian splats for GPU upload across %d cells, ")
-        TEXT("%.0f MiB at 40 B/splat, colour quantized over [%.3f, %.3f] ")
+        TEXT("%.0f MiB (%.1f B/splat), colour quantized over [%.3f, %.3f] ")
         TEXT("(MaxGpuPointCount=%d, ceiling=%d)"),
         RenderResources->GetPointCount(),
         Positions.Num(),
         RenderResources->GetCells().Num(),
-        RenderResources->GetPointCount() * 40.0 / (1024.0 * 1024.0),
+        RenderResources->GetGpuBytes() / (1024.0 * 1024.0),
+        RenderResources->GetPointCount() > 0
+            ? static_cast<double>(RenderResources->GetGpuBytes()) / RenderResources->GetPointCount()
+            : 0.0,
         RenderResources->GetColorEncoding().X,
         RenderResources->GetColorEncoding().X + RenderResources->GetColorEncoding().Y,
         MaxGpuPointCount,

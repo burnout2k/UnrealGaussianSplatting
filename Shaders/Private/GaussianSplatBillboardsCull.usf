@@ -2,10 +2,6 @@
 #include "GaussianSplatCommon.ush"
 #include "GaussianSplatCellLookup.ush"
 
-StructuredBuffer<float4> SplatPositionColorBuffer;
-StructuredBuffer<float4> SplatCovariance0Buffer;
-StructuredBuffer<float2> SplatCovariance1Buffer;
-float2 SplatColorEncoding;
 
 uint SortKeyShift;
 RWBuffer<uint> SplatOrderBufferUAV;
@@ -48,9 +44,9 @@ float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
         ViewRectMin.y + (0.5 - Ndc.y * 0.5) * ViewSize.y);
 }
 
-bool IsSplatVisible(uint AssetIndex, out float Depth)
+bool IsSplatVisible(FSplatRef Splat, out float Depth)
 {
-    float3 CenterWS = mul(float4(SplatPositionColorBuffer[AssetIndex].xyz, 1.0), LocalToWorldMatrix).xyz;
+    float3 CenterWS = mul(float4(DecodeSplatPosition(Splat.Index, Splat.Cell), 1.0), LocalToWorldMatrix).xyz;
     Depth = dot(CenterWS - ViewWorldOrigin.xyz, ViewForward.xyz);
     if (Depth <= 0.0)
     {
@@ -68,8 +64,7 @@ bool IsSplatVisible(uint AssetIndex, out float Depth)
     // of them stack into the milky veil that dense captures show. Rejecting it
     // here skips its whole rasterisation, not just its faint pixels.
     if (MinSplatOpacity > 0.0 &&
-        saturate(DecodeSplatColor(SplatPositionColorBuffer[AssetIndex].w, SplatColorEncoding).w
-            * OpacityScale) < MinSplatOpacity)
+        saturate(DecodeSplatColor(Splat.Index).w * OpacityScale) < MinSplatOpacity)
     {
         return false;
     }
@@ -83,7 +78,7 @@ bool IsSplatVisible(uint AssetIndex, out float Depth)
 
     float3 Cov3D0;
     float3 Cov3D1;
-    LoadCovariance3D(SplatCovariance0Buffer, SplatCovariance1Buffer, AssetIndex, PointSize * 0.35, Cov3D0, Cov3D1);
+    DecodeSplatCovariance(Splat.Index, PointSize * 0.35, Cov3D0, Cov3D1);
 
     float3 Cov2D = CalcCovariance2D(
         CenterWS,
@@ -141,9 +136,9 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
 
         if (Index < NumElements)
         {
-            uint AssetIndex = ResolveSplatSourceIndex(Index, Stride);
+            FSplatRef Splat = ResolveSplat(Index, Stride);
             float Depth = 0.0;
-            bool bVisible = IsSplatVisible(AssetIndex, Depth);
+            bool bVisible = IsSplatVisible(Splat, Depth);
             if (bVisible)
             {
                 uint VisibleIndex = 0;

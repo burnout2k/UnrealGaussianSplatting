@@ -4,10 +4,6 @@
 #include "GaussianSplatCellLookup.ush"
 
 Buffer<uint> SplatOrderBuffer;
-StructuredBuffer<float4> SplatPositionColorBuffer;
-StructuredBuffer<float4> SplatCovariance0Buffer;
-StructuredBuffer<float2> SplatCovariance1Buffer;
-float2 SplatColorEncoding;
 StructuredBuffer<float4> SplatSHBuffer;
 
 float2 ViewRectMin;
@@ -122,9 +118,10 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 {
     VSOutput Output = (VSOutput)0;
 
-    InstanceID = ResolveSplatSourceIndex(SplatOrderBuffer[InstanceID], Stride);
+    const FSplatRef Splat = ResolveSplat(SplatOrderBuffer[InstanceID], Stride);
+    InstanceID = Splat.Index;
 
-    float3 CenterWS = mul(float4(SplatPositionColorBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
+    float3 CenterWS = mul(float4(DecodeSplatPosition(Splat.Index, Splat.Cell), 1.0), LocalToWorldMatrix).xyz;
     float SafeClipW = 0.0;
     float DeviceZ = 0.0;
     float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW, DeviceZ);
@@ -136,7 +133,7 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 
     float3 Cov3D0;
     float3 Cov3D1;
-    LoadCovariance3D(SplatCovariance0Buffer, SplatCovariance1Buffer, InstanceID, PointSize * 0.35, Cov3D0, Cov3D1);
+    DecodeSplatCovariance(Splat.Index, PointSize * 0.35, Cov3D0, Cov3D1);
 
     float2 DepthGradientPx;
     float3 Cov2D = CalcCovariance2DEx(
@@ -203,7 +200,7 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     Output.QuadPos = QuadPos;
 
     float3 ViewDirWS = normalize(ViewWorldOrigin.xyz - CenterWS);
-    float4 BaseColor = DecodeSplatColor(SplatPositionColorBuffer[InstanceID].w, SplatColorEncoding);
+    float4 BaseColor = DecodeSplatColor(InstanceID);
     Output.Color = float4(
         EvaluateSH(
             BaseColor.rgb,

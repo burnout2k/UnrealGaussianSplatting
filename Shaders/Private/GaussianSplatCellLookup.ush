@@ -1,27 +1,57 @@
 #pragma once
 
-// Maps a dispatch (or draw instance) index to a resident splat index.
+// Getting from a dispatch thread (or draw instance) to a decoded splat.
 //
-// Without cells the mapping is one multiply: the renderer walked every Stride-th
-// splat of the whole capture, so index and splat differ by a constant factor.
+// Two things happen here. First the index mapping: without cells it is one
+// multiply, because the renderer walked every Stride-th splat of the capture.
+// With cells it is piecewise -- each frame the CPU frustum-culls the cells,
+// gives every survivor a keep-count from its distance, and writes one entry per
+// selected cell. Recovering the splat is a search for the last entry whose run
+// has already begun, about ten steps for a thousand cells.
 //
-// With cells it is piecewise. Each frame the CPU frustum-culls the cells, gives
-// every survivor a keep-count from its distance to the camera, and writes one
-// entry per selected cell: x = where that cell's splats start in the resident
-// buffer, y = where its run starts in the dispatch. Recovering the splat for a
-// thread is then a search for the last entry whose run has already begun --
-// about ten steps for a thousand cells, against a full covariance projection
-// further down the same shader.
+// Then the decode. A splat is 20 bytes:
 //
-// Cells are importance-ordered, so a cell's run is its most significant splats.
-StructuredBuffer<uint2> SplatCellRanges;
+//   A.x  posX | posY        16-bit fractions of the CELL's bounding box
+//   A.y  posZ | logScaleX
+//   A.z  logScaleY | logScaleZ    three fp16 of the LOG scale
+//   A.w  rotation                 smallest-three unit quaternion
+//   B    colour and opacity       four bytes
+//
+// Positions are per-cell because that is what makes them cheap: 16 bits across a
+// 64 m cell is ~1 mm, across the whole 2.4 km capture ~40 mm, and across its
+// outlier-stretched bounding box ~217 mm. The covariance is NOT stored -- six
+// squared lengths spanning many orders of magnitude quantize badly, while the
+// rotation and scale they are built from both quantize well.
+
+// x = first resident splat of the cell, y = where its run starts in the
+// dispatch, z = the cell's index into SplatCellBounds.
+StructuredBuffer<uint4> SplatCellRanges;
 uint SplatCellCount;
 
-uint ResolveSplatSourceIndex(uint Index, uint Stride)
+StructuredBuffer<uint4> SplatPackedA;
+StructuredBuffer<uint> SplatPackedB;
+
+// Two entries per cell: origin.xyz then extent.xyz.
+StructuredBuffer<float4> SplatCellBounds;
+
+// (min, range) that RGB was quantized over, fitted to the capture at build time.
+float2 SplatColorEncoding;
+
+struct FSplatRef
 {
+    uint Index;
+    uint Cell;
+};
+
+FSplatRef ResolveSplat(uint DispatchIndex, uint Stride)
+{
+    FSplatRef Result;
+
     if (SplatCellCount == 0)
     {
-        return Index * max(Stride, 1);
+        Result.Index = DispatchIndex * max(Stride, 1);
+        Result.Cell = 0;
+        return Result;
     }
 
     uint Lo = 0;
@@ -31,7 +61,7 @@ uint ResolveSplatSourceIndex(uint Index, uint Stride)
     while (Lo < Hi)
     {
         const uint Mid = (Lo + Hi + 1) >> 1;
-        if (SplatCellRanges[Mid].y <= Index)
+        if (SplatCellRanges[Mid].y <= DispatchIndex)
         {
             Lo = Mid;
         }
@@ -41,5 +71,88 @@ uint ResolveSplatSourceIndex(uint Index, uint Stride)
         }
     }
 
-    return SplatCellRanges[Lo].x + (Index - SplatCellRanges[Lo].y);
+    Result.Index = SplatCellRanges[Lo].x + (DispatchIndex - SplatCellRanges[Lo].y);
+    Result.Cell = SplatCellRanges[Lo].z;
+    return Result;
+}
+
+float3 DecodeSplatPosition(uint Index, uint Cell)
+{
+    const uint4 A = SplatPackedA[Index];
+    const float3 Fraction = float3(A.x & 0xFFFF, A.x >> 16, A.y & 0xFFFF) * (1.0 / 65535.0);
+    return SplatCellBounds[Cell * 2].xyz + Fraction * SplatCellBounds[Cell * 2 + 1].xyz;
+}
+
+// Smallest-three: 2 bits name the component that was dropped, 10 bits each carry
+// the rest over [-1/sqrt(2), 1/sqrt(2)]. The dropped one is recovered from the
+// unit-length constraint, and the encoder forced it positive so the positive
+// root is always the right one.
+float4 DecodeSplatRotation(uint Packed)
+{
+    const float Scale = 0.70710678 * (2.0 / 1023.0);
+    const float Bias = -0.70710678;
+
+    const float A = float((Packed >> 2) & 1023) * Scale + Bias;
+    const float B = float((Packed >> 12) & 1023) * Scale + Bias;
+    const float C = float((Packed >> 22) & 1023) * Scale + Bias;
+    const float D = sqrt(max(1.0 - (A * A + B * B + C * C), 0.0));
+
+    switch (Packed & 3)
+    {
+    case 0:  return float4(D, A, B, C);
+    case 1:  return float4(A, D, B, C);
+    case 2:  return float4(A, B, D, C);
+    default: return float4(A, B, C, D);
+    }
+}
+
+// Sigma = R S^2 R^T, accumulated as the outer products of the rotated axes. The
+// old layout stored these six numbers directly; rebuilding them costs a handful
+// of multiplies and saves 20 bytes a splat, and this shader is not ALU bound.
+void DecodeSplatCovariance(uint Index, float ScaleFactor, out float3 Cov3D0, out float3 Cov3D1)
+{
+    const uint4 Packed = SplatPackedA[Index];
+    const float4 Q = DecodeSplatRotation(Packed.w);
+    const float3 Scale = exp(float3(
+        f16tof32(Packed.y >> 16),
+        f16tof32(Packed.z & 0xFFFF),
+        f16tof32(Packed.z >> 16))) * ScaleFactor;
+
+    // Columns of the rotation matrix: the rotated unit axes.
+    const float3 Axis0 = float3(
+        1.0 - 2.0 * (Q.y * Q.y + Q.z * Q.z),
+        2.0 * (Q.x * Q.y + Q.w * Q.z),
+        2.0 * (Q.x * Q.z - Q.w * Q.y)) * Scale.x;
+    const float3 Axis1 = float3(
+        2.0 * (Q.x * Q.y - Q.w * Q.z),
+        1.0 - 2.0 * (Q.x * Q.x + Q.z * Q.z),
+        2.0 * (Q.y * Q.z + Q.w * Q.x)) * Scale.y;
+    const float3 Axis2 = float3(
+        2.0 * (Q.x * Q.z + Q.w * Q.y),
+        2.0 * (Q.y * Q.z - Q.w * Q.x),
+        1.0 - 2.0 * (Q.x * Q.x + Q.y * Q.y)) * Scale.z;
+
+    Cov3D0 = float3(
+        Axis0.x * Axis0.x + Axis1.x * Axis1.x + Axis2.x * Axis2.x,
+        Axis0.x * Axis0.y + Axis1.x * Axis1.y + Axis2.x * Axis2.y,
+        Axis0.x * Axis0.z + Axis1.x * Axis1.z + Axis2.x * Axis2.z);
+    Cov3D1 = float3(
+        Axis0.y * Axis0.y + Axis1.y * Axis1.y + Axis2.y * Axis2.y,
+        Axis0.y * Axis0.z + Axis1.y * Axis1.z + Axis2.y * Axis2.z,
+        Axis0.z * Axis0.z + Axis1.z * Axis1.z + Axis2.z * Axis2.z);
+}
+
+// RGB share one affine range fitted to the capture; a fixed [0,1] would clamp,
+// since 3DGS colour is 0.5 + 0.28209 * f_dc and this capture reaches 2.259.
+// Opacity comes from a sigmoid so it always occupies [0,1].
+float4 DecodeSplatColor(uint Index)
+{
+    const uint Bits = SplatPackedB[Index];
+    const float4 Quantised = float4(
+        Bits & 0xFF,
+        (Bits >> 8) & 0xFF,
+        (Bits >> 16) & 0xFF,
+        (Bits >> 24) & 0xFF) * (1.0 / 255.0);
+
+    return float4(Quantised.rgb * SplatColorEncoding.y + SplatColorEncoding.x, Quantised.a);
 }

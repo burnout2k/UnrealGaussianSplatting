@@ -4,8 +4,6 @@
 #include "GaussianSplatCellLookup.ush"
 
 Buffer<uint> SplatOrderBuffer;
-StructuredBuffer<float4> SplatPositionColorBuffer;
-float2 SplatColorEncoding;
 
 float2 ViewRectMin;
 float2 ViewSize;
@@ -37,9 +35,10 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 {
     VSOutput Output = (VSOutput)0;
 
-    InstanceID = ResolveSplatSourceIndex(SplatOrderBuffer[InstanceID], Stride);
+    const FSplatRef Splat = ResolveSplat(SplatOrderBuffer[InstanceID], Stride);
+    InstanceID = Splat.Index;
 
-    float3 CenterWS = mul(float4(SplatPositionColorBuffer[InstanceID].xyz, 1.0), LocalToWorldMatrix).xyz;
+    float3 CenterWS = mul(float4(DecodeSplatPosition(Splat.Index, Splat.Cell), 1.0), LocalToWorldMatrix).xyz;
     float SafeClipW = 0.0;
     float DeviceZ = 0.0;
     float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW, DeviceZ);
@@ -71,7 +70,7 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     // occlude this preview point without writing splat depth back to the scene.
     Output.Position = float4(Ndc, DeviceZ, 1.0);
 
-    float4 BaseColor = DecodeSplatColor(SplatPositionColorBuffer[InstanceID].w, SplatColorEncoding);
+    float4 BaseColor = DecodeSplatColor(InstanceID);
     Output.Color = float4(BaseColor.rgb, saturate(BaseColor.a * OpacityScale));
     return Output;
 }
