@@ -12,6 +12,8 @@ public:
     void BuildFromAssetData(
         const TArray<FVector3f>& InPositions,
         const TArray<FGaussianCovariance3f>& InCovariances,
+        const TArray<FQuat4f>& InRotations,
+        const TArray<FVector3f>& InLogScales,
         const TArray<FVector4f>& InColorsOpacity,
         const TArray<float>& InSHCoefficients,
         const TArray<FGaussianSplatCell>& InCells,

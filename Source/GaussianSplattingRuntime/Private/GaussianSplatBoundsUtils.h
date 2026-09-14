@@ -154,6 +154,51 @@ namespace GaussianSplatBoundsUtils
         }
     }
 
+    // Sigma = R S^2 R^T, so the covariance is just the sum of the outer products
+    // of the rotated axes weighted by their squared scales. Exact, and far
+    // cheaper than the reverse direction.
+    inline FGaussianCovariance3f MakeCovariance(const FQuat4f& Rotation, const FVector3f& LogScale)
+    {
+        const FVector3f Scale(
+            FMath::Exp(LogScale.X), FMath::Exp(LogScale.Y), FMath::Exp(LogScale.Z));
+        const FVector3f Axis[3] = {
+            Rotation.RotateVector(FVector3f(1.0f, 0.0f, 0.0f)),
+            Rotation.RotateVector(FVector3f(0.0f, 1.0f, 0.0f)),
+            Rotation.RotateVector(FVector3f(0.0f, 0.0f, 1.0f)) };
+
+        float M[3][3] = {};
+        for (int32 I = 0; I < 3; ++I)
+        {
+            const float W = Scale[I] * Scale[I];
+            for (int32 Row = 0; Row < 3; ++Row)
+            {
+                for (int32 Col = 0; Col < 3; ++Col)
+                {
+                    M[Row][Col] += W * Axis[I][Row] * Axis[I][Col];
+                }
+            }
+        }
+
+        return FGaussianCovariance3f(M[0][0], M[0][1], M[0][2], M[1][1], M[1][2], M[2][2]);
+    }
+
+    // The covariance overload below has to recover the principal axes with a
+    // Jacobi solve. Here they are the rotated unit axes scaled by S, so this is
+    // both exact and free.
+    inline FVector ComputeExtent(const FQuat4f& Rotation, const FVector3f& LogScale)
+    {
+        const FVector3f Scale(
+            FMath::Exp(LogScale.X), FMath::Exp(LogScale.Y), FMath::Exp(LogScale.Z));
+        const FVector3f Axis0 = Rotation.RotateVector(FVector3f(Scale.X, 0.0f, 0.0f));
+        const FVector3f Axis1 = Rotation.RotateVector(FVector3f(0.0f, Scale.Y, 0.0f));
+        const FVector3f Axis2 = Rotation.RotateVector(FVector3f(0.0f, 0.0f, Scale.Z));
+
+        return FVector(
+            FMath::Abs(Axis0.X) + FMath::Abs(Axis1.X) + FMath::Abs(Axis2.X),
+            FMath::Abs(Axis0.Y) + FMath::Abs(Axis1.Y) + FMath::Abs(Axis2.Y),
+            FMath::Abs(Axis0.Z) + FMath::Abs(Axis1.Z) + FMath::Abs(Axis2.Z));
+    }
+
     inline FVector ComputeExtent(const FGaussianCovariance3f& Covariance)
     {
         FMatrix44f Eigenvectors;

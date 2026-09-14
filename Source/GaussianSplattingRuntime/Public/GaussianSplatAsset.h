@@ -90,6 +90,7 @@ struct GAUSSIANSPLATTINGRUNTIME_API FGaussianSplatCustomVersion
     {
         BeforeCustomVersionWasAdded = 0,
         SpatialCells,
+        RotationAndScale,
 
         VersionPlusOne,
         LatestVersion = VersionPlusOne - 1
@@ -109,7 +110,17 @@ public:
     // from trying to build millions of editable array rows.
     TArray<FVector3f> Positions;
 
+    // Legacy: assets imported before rotation and scale were kept. Present only
+    // on those, and mutually exclusive with Rotations/LogScales below.
     TArray<FGaussianCovariance3f> Covariances;
+
+    // What the PLY actually stores, kept rather than baked into a covariance.
+    // Both quantize well -- a unit quaternion into 32 bits, a log scale into
+    // three fp16 -- where covariance entries are squared lengths spanning many
+    // orders of magnitude and do not.
+    TArray<FQuat4f> Rotations;
+
+    TArray<FVector3f> LogScales;
 
     TArray<FVector4f> ColorsOpacity;
 

@@ -37,6 +37,14 @@ void UGaussianSplatAsset::Serialize(FArchive& Ar)
     {
         Ar << Cells;
     }
+
+    // Assets imported before this carry Covariances instead, and keep rendering
+    // through the unquantized path.
+    if (Ar.CustomVer(FGaussianSplatCustomVersion::GUID) >= FGaussianSplatCustomVersion::RotationAndScale)
+    {
+        Ar << Rotations;
+        Ar << LogScales;
+    }
 }
 
 void UGaussianSplatAsset::PostLoad()
@@ -59,6 +67,8 @@ void UGaussianSplatAsset::GetResourceSizeEx(FResourceSizeEx& CumulativeResourceS
     Super::GetResourceSizeEx(CumulativeResourceSize);
     CumulativeResourceSize.AddDedicatedSystemMemoryBytes(Positions.GetAllocatedSize());
     CumulativeResourceSize.AddDedicatedSystemMemoryBytes(Covariances.GetAllocatedSize());
+    CumulativeResourceSize.AddDedicatedSystemMemoryBytes(Rotations.GetAllocatedSize());
+    CumulativeResourceSize.AddDedicatedSystemMemoryBytes(LogScales.GetAllocatedSize());
     CumulativeResourceSize.AddDedicatedSystemMemoryBytes(ColorsOpacity.GetAllocatedSize());
     CumulativeResourceSize.AddDedicatedSystemMemoryBytes(SHCoefficients.GetAllocatedSize());
 }
@@ -97,10 +107,11 @@ void UGaussianSplatAsset::RebuildBounds()
     for (int32 Index = 0; Index < Positions.Num(); ++Index)
     {
         const FVector3f P = Positions[Index];
-        const FGaussianCovariance3f Covariance = Covariances.IsValidIndex(Index)
-            ? Covariances[Index]
-            : GaussianSplatBoundsUtils::MakeIsotropic(0.02f);
-        const FVector Extent = GaussianSplatBoundsUtils::ComputeExtent(Covariance);
+        const FVector Extent = Rotations.IsValidIndex(Index) && LogScales.IsValidIndex(Index)
+            ? GaussianSplatBoundsUtils::ComputeExtent(Rotations[Index], LogScales[Index])
+            : GaussianSplatBoundsUtils::ComputeExtent(Covariances.IsValidIndex(Index)
+                ? Covariances[Index]
+                : GaussianSplatBoundsUtils::MakeIsotropic(0.02f));
 
         Box += FVector(P) - Extent;
         Box += FVector(P) + Extent;
@@ -120,6 +131,14 @@ namespace
     // The determinant is accumulated in double because the scales span
     // 0.0000-134 m on real captures, and its cube underflows float badly at the
     // small end.
+    // sqrt(det Sigma) is the product of the three axis scales, so with the
+    // scales in hand the weight needs no determinant at all -- and no double
+    // precision to survive cubing values as small as 1e-4.
+    FORCEINLINE float SplatImportance(const FVector3f& LogScale, float Opacity)
+    {
+        return Opacity * FMath::Exp(LogScale.X + LogScale.Y + LogScale.Z);
+    }
+
     FORCEINLINE float SplatImportance(const FGaussianCovariance3f& C, float Opacity)
     {
         const double Det =
@@ -269,11 +288,12 @@ bool UGaussianSplatAsset::BuildCells()
     Importance.SetNumUninitialized(SourceCount);
     ParallelFor(SourceCount, [this, &Importance](int32 Index)
     {
-        const FGaussianCovariance3f& C = Covariances.IsValidIndex(Index)
-            ? Covariances[Index]
-            : GaussianSplatBoundsUtils::MakeIsotropic(0.02f);
         const float Opacity = ColorsOpacity.IsValidIndex(Index) ? ColorsOpacity[Index].W : 1.0f;
-        Importance[Index] = SplatImportance(C, Opacity);
+        Importance[Index] = LogScales.IsValidIndex(Index)
+            ? SplatImportance(LogScales[Index], Opacity)
+            : SplatImportance(Covariances.IsValidIndex(Index)
+                ? Covariances[Index]
+                : GaussianSplatBoundsUtils::MakeIsotropic(0.02f), Opacity);
     });
 
     ParallelFor(Cells.Num(), [this, &Order, &Importance](int32 CellIndex)
@@ -292,6 +312,8 @@ bool UGaussianSplatAsset::BuildCells()
     // of the largest array rather than a full second copy of everything.
     ApplyPermutation(Positions, Order);
     ApplyPermutation(Covariances, Order);
+    ApplyPermutation(Rotations, Order);
+    ApplyPermutation(LogScales, Order);
     ApplyPermutation(ColorsOpacity, Order);
     if (!SHCoefficients.IsEmpty())
     {
@@ -447,6 +469,8 @@ void UGaussianSplatAsset::BuildRenderResources()
     RenderResources->BuildFromAssetData(
         Positions,
         Covariances,
+        Rotations,
+        LogScales,
         ColorsOpacity,
         SHCoefficients,
         Cells,

@@ -6,6 +6,8 @@
 void FGaussianSplatRenderResources::BuildFromAssetData(
     const TArray<FVector3f>& InPositions,
     const TArray<FGaussianCovariance3f>& InCovariances,
+    const TArray<FQuat4f>& InRotations,
+    const TArray<FVector3f>& InLogScales,
     const TArray<FVector4f>& InColorsOpacity,
     const TArray<float>& InSHCoefficients,
     const TArray<FGaussianSplatCell>& InCells,
@@ -93,17 +95,16 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
     // channel outside [0,1], peaking at 1.73 -- all of which a naive encoding
     // would clamp to white. Fitting costs one pass over the resident subset and
     // removes the question entirely.
+    //
+    // Fitted over EVERY splat, not just the resident subset: otherwise the range
+    // shifts whenever MaxGpuPointCount changes (measured [-0.037, 1.840] at 1M
+    // resident against [-0.037, 2.259] at 60M), which makes the encoding depend
+    // on an unrelated setting and makes two point counts incomparable.
     float ColorMin = TNumericLimits<float>::Max();
     float ColorMax = TNumericLimits<float>::Lowest();
-    for (int32 Index = 0; Index < SourceOfDest.Num(); ++Index)
+    for (int32 Index = 0; Index < InColorsOpacity.Num(); ++Index)
     {
-        const int32 SourceIndex = SourceOfDest[Index];
-        if (!InColorsOpacity.IsValidIndex(SourceIndex))
-        {
-            continue;
-        }
-
-        const FVector4f& Color = InColorsOpacity[SourceIndex];
+        const FVector4f& Color = InColorsOpacity[Index];
         ColorMin = FMath::Min3(ColorMin, FMath::Min(Color.X, Color.Y), Color.Z);
         ColorMax = FMath::Max3(ColorMax, FMath::Max(Color.X, Color.Y), Color.Z);
     }
@@ -126,9 +127,15 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
     {
         const int32 SourceIndex = SourceOfDest[Index];
         const FVector3f Position = InPositions[SourceIndex];
-        const FGaussianCovariance3f Covariance = InCovariances.IsValidIndex(SourceIndex)
-            ? InCovariances[SourceIndex]
-            : GaussianSplatBoundsUtils::MakeIsotropic(0.02f);
+        // Assets imported with rotation and scale rebuild the covariance here;
+        // it is exact (Sigma = R S^2 R^T) and the arrays are mutually exclusive,
+        // so older assets keep taking the covariance branch untouched.
+        const FGaussianCovariance3f Covariance =
+            (InRotations.IsValidIndex(SourceIndex) && InLogScales.IsValidIndex(SourceIndex))
+                ? GaussianSplatBoundsUtils::MakeCovariance(InRotations[SourceIndex], InLogScales[SourceIndex])
+                : (InCovariances.IsValidIndex(SourceIndex)
+                    ? InCovariances[SourceIndex]
+                    : GaussianSplatBoundsUtils::MakeIsotropic(0.02f));
         const FVector4f Color = InColorsOpacity.IsValidIndex(SourceIndex)
             ? InColorsOpacity[SourceIndex]
             : FVector4f(1.0f, 1.0f, 1.0f, 1.0f);

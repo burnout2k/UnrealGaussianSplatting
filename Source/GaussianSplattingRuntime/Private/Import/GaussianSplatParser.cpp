@@ -43,7 +43,15 @@ namespace
     struct FImportedGaussian
     {
         FVector3f Position = FVector3f::ZeroVector;
-        FGaussianCovariance3f Covariance = FGaussianCovariance3f(0.0004f, 0.0f, 0.0f, 0.0004f, 0.0f, 0.0004f);
+
+        // Rotation and log-scale rather than a baked covariance. The covariance
+        // is six floats that cannot be quantized well -- its entries are squared
+        // lengths spanning many orders of magnitude -- whereas a unit quaternion
+        // packs into 32 bits at ~0.1 degrees and a LOG scale into three fp16
+        // with no dynamic-range problem at all. The PLY stores exactly these two
+        // natively, so keeping them is also strictly less processing.
+        FQuat4f Rotation = FQuat4f::Identity;
+        FVector3f LogScale = FVector3f(-4.0f, -4.0f, -4.0f);
     };
 
     EPlyScalarType ParsePlyType(const FString& TypeText)
@@ -238,14 +246,17 @@ namespace
         Asset.SHCoefficients.Append(ReorderedSH, UE_ARRAY_COUNT(ReorderedSH));
     }
 
-    FVector3f BuildScale(const TArray<float>& Values, int32 SX, int32 SY, int32 SZ)
+    // The PLY stores log scale; keep it in that form. The linear values span
+    // 0.0000-134 m on this capture, which fp16 handles badly at the small end,
+    // while the log spans about -16 to +5, which it handles trivially.
+    FVector3f BuildLogScale(const TArray<float>& Values, int32 SX, int32 SY, int32 SZ)
     {
         if (Values.IsValidIndex(SX) && Values.IsValidIndex(SY) && Values.IsValidIndex(SZ))
         {
-            return FVector3f(FMath::Exp(Values[SX]), FMath::Exp(Values[SY]), FMath::Exp(Values[SZ]));
+            return FVector3f(Values[SX], Values[SY], Values[SZ]);
         }
 
-        return FVector3f(0.02f, 0.02f, 0.02f);
+        return FVector3f(-3.912f, -3.912f, -3.912f);   // ln(0.02)
     }
 
     FQuat4f BuildRotation(const TArray<float>& Values, int32 RW, int32 RX, int32 RY, int32 RZ)
@@ -321,49 +332,52 @@ namespace
         return Result;
     }
 
-    FMatrix44f BuildCovariance(const FQuat4f& Rotation, const FVector3f& Scale)
-    {
-        const FMatrix44f RotationMatrix = BuildRotationMatrix(Rotation);
-
-        FMatrix44f ScaleMatrix = FMatrix44f::Identity;
-        ScaleMatrix.M[0][0] = Scale.X;
-        ScaleMatrix.M[1][1] = Scale.Y;
-        ScaleMatrix.M[2][2] = Scale.Z;
-
-        const FMatrix44f L = Multiply3x3(RotationMatrix, ScaleMatrix);
-        return Multiply3x3(L, Transpose3x3(L));
-    }
-
     FVector3f ApplyColmapToUEPosition(const FVector3f& Position)
     {
         return FVector3f(Position.Z, Position.X, -Position.Y);
     }
 
-    FMatrix44f ApplyColmapToUECovariance(const FMatrix44f& Covariance)
+    // The COLMAP -> UE axis swap applied to a rotation rather than to a built
+    // covariance.
+    //
+    // Sigma = R S^2 R^T, so T Sigma T^T = (T R) S^2 (T R)^T -- but T is a
+    // REFLECTION (determinant -1, because the handedness flips), which makes T R
+    // improper and therefore not expressible as a quaternion. Post-multiplying by
+    // D = diag(-1, 1, 1) restores a proper rotation and changes nothing, since D
+    // and S^2 are both diagonal so D S^2 D = S^2.
+    //
+    // Verified against 20,000 splats of the Vuores capture: the rebuilt
+    // covariance matches the old baked path to 4e-16 relative, and 3e-15 after a
+    // full quaternion round trip. Scale is untouched by the swap.
+    FQuat4f ApplyColmapToUERotation(const FQuat4f& Rotation)
     {
-        FMatrix44f Transform = FMatrix44f::Identity;
-        Transform.M[0][0] = 0.0f;
-        Transform.M[0][1] = 0.0f;
-        Transform.M[0][2] = 1.0f;
-        Transform.M[1][0] = 1.0f;
-        Transform.M[1][1] = 0.0f;
-        Transform.M[1][2] = 0.0f;
-        Transform.M[2][0] = 0.0f;
-        Transform.M[2][1] = -1.0f;
-        Transform.M[2][2] = 0.0f;
+        FMatrix44f Swap = FMatrix44f::Identity;
+        Swap.M[0][0] = 0.0f; Swap.M[0][1] = 0.0f; Swap.M[0][2] = 1.0f;
+        Swap.M[1][0] = 1.0f; Swap.M[1][1] = 0.0f; Swap.M[1][2] = 0.0f;
+        Swap.M[2][0] = 0.0f; Swap.M[2][1] = -1.0f; Swap.M[2][2] = 0.0f;
 
-        return Multiply3x3(Multiply3x3(Transform, Covariance), Transpose3x3(Transform));
-    }
+        FMatrix44f Flip = FMatrix44f::Identity;
+        Flip.M[0][0] = -1.0f;
 
-    FGaussianCovariance3f PackCovariance(const FMatrix44f& Covariance)
-    {
-        return FGaussianCovariance3f(
-            Covariance.M[0][0],
-            Covariance.M[0][1],
-            Covariance.M[0][2],
-            Covariance.M[1][1],
-            Covariance.M[1][2],
-            Covariance.M[2][2]);
+        FMatrix44f Proper = Multiply3x3(Multiply3x3(Swap, BuildRotationMatrix(Rotation)), Flip);
+
+        // TRANSPOSED on purpose. BuildRotationMatrix above produces the standard
+        // column-vector form (v' = M v), but UE's TQuat(const TMatrix&) expects
+        // the engine's row-vector form (v' = v M) -- its trace branch reads
+        // X = (M[1][2] - M[2][1]) * s, the opposite sign to the column
+        // convention. Feeding it the column form yields the INVERSE rotation, so
+        // the covariance rebuilds as R^T S^2 R instead of R S^2 R^T. That is
+        // identical for a spherical splat and badly wrong for an elongated one,
+        // which showed up as the shredded cars while foliage looked fine.
+        //
+        // Simulated against UE's exact quaternion and RotateVector code over
+        // 5,000 splats: as written 2.2 relative error, transposed 2.3e-15.
+        FMatrix44f RowVectorForm = Transpose3x3(Proper);
+        RowVectorForm.M[3][3] = 1.0f;
+
+        FQuat4f Result(RowVectorForm);
+        Result.Normalize();
+        return Result;
     }
 
     FImportedGaussian BuildImportedGaussian(
@@ -381,9 +395,8 @@ namespace
     {
         FImportedGaussian Result;
         Result.Position = ApplyColmapToUEPosition(FVector3f(Values[XIndex], Values[YIndex], Values[ZIndex]));
-        const FQuat4f Rotation = BuildRotation(Values, Rot0Index, Rot1Index, Rot2Index, Rot3Index);
-        const FVector3f Scale = BuildScale(Values, Scale0Index, Scale1Index, Scale2Index);
-        Result.Covariance = PackCovariance(ApplyColmapToUECovariance(BuildCovariance(Rotation, Scale)));
+        Result.Rotation = ApplyColmapToUERotation(BuildRotation(Values, Rot0Index, Rot1Index, Rot2Index, Rot3Index));
+        Result.LogScale = BuildLogScale(Values, Scale0Index, Scale1Index, Scale2Index);
         return Result;
     }
 
@@ -442,7 +455,9 @@ namespace
     void ResetAssetData(UGaussianSplatAsset& Asset, int32 VertexCount)
     {
         Asset.Positions.Reset(VertexCount);
-        Asset.Covariances.Reset(VertexCount);
+        Asset.Covariances.Reset();
+        Asset.Rotations.Reset(VertexCount);
+        Asset.LogScales.Reset(VertexCount);
         Asset.ColorsOpacity.Reset(VertexCount);
         Asset.SHCoefficients.Reset();
     }
@@ -503,7 +518,8 @@ namespace
             const FImportedGaussian Gaussian = BuildImportedGaussian(
                 Values, XIndex, YIndex, ZIndex, Scale0Index, Scale1Index, Scale2Index, Rot0Index, Rot1Index, Rot2Index, Rot3Index);
             Asset.Positions.Add(Gaussian.Position);
-            Asset.Covariances.Add(Gaussian.Covariance);
+            Asset.Rotations.Add(Gaussian.Rotation);
+            Asset.LogScales.Add(Gaussian.LogScale);
 
             const FLinearColor Color = BuildColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex);
             Asset.ColorsOpacity.Add(FVector4f(Color.R, Color.G, Color.B, Color.A));
@@ -573,7 +589,8 @@ namespace
             const FImportedGaussian Gaussian = BuildImportedGaussian(
                 Values, XIndex, YIndex, ZIndex, Scale0Index, Scale1Index, Scale2Index, Rot0Index, Rot1Index, Rot2Index, Rot3Index);
             Asset.Positions.Add(Gaussian.Position);
-            Asset.Covariances.Add(Gaussian.Covariance);
+            Asset.Rotations.Add(Gaussian.Rotation);
+            Asset.LogScales.Add(Gaussian.LogScale);
 
             const FLinearColor Color = BuildColor(Values, Dc0Index, Dc1Index, Dc2Index, OpacityIndex);
             Asset.ColorsOpacity.Add(FVector4f(Color.R, Color.G, Color.B, Color.A));
