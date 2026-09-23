@@ -1062,7 +1062,8 @@ namespace GaussianSplatPasses
                 RasterParameters->PerPixelDepth = GaussianSplatProfiling::ShouldUsePerPixelDepth() ? 1u : 0u;
                 RasterParameters->HasSH = Resources->HasSH() ? 1u : 0u;
                 RasterParameters->MinScreenVariance = GaussianSplatProfiling::GetMinScreenVariance();
-                RasterParameters->SplatSHBuffer = Resources->GetSHSRV();
+                RasterParameters->SplatSHIndexBuffer = Resources->GetSHIndexSRV();
+                RasterParameters->SplatSHPaletteBuffer = Resources->GetSHPaletteSRV();
                 PassParameters->PS.AlphaCutoff = GaussianSplatProfiling::GetAlphaCutoff();
                 SetDepthTestParameters(PassParameters->PS.DepthTest);
                 PassParameters->IndirectArgsBuffer = IndirectArgsBuffer;

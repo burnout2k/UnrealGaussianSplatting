@@ -39,7 +39,16 @@ public:
     // -- over the whole capture the same 16 bits would be 40 mm, and over its
     // outlier-stretched bounding box, 217 mm.
     FShaderResourceViewRHIRef GetCellBoundsSRV() const { return CellBoundsSRV; }
-    FShaderResourceViewRHIRef GetSHSRV() const { return SHSRV; }
+
+    // SH as a palette: each DISTINCT set of 45 coefficients is stored once (45
+    // floats, no padding) and every splat holds a uint index into it. Bit-exact
+    // -- sets are matched by their bytes, never approximated. Captures converted
+    // from SOG already share their SH through per-chunk palettes: the 20.9M-splat
+    // Uno holds only 2,293,753 distinct sets, 474 MiB here vs 4,788 MiB as one
+    // padded float4 per coefficient. A capture with unique SH per splat pays
+    // 4 B/splat for the index and still saves the 60 B of padding.
+    FShaderResourceViewRHIRef GetSHIndexSRV() const { return SHIndexSRV; }
+    FShaderResourceViewRHIRef GetSHPaletteSRV() const { return SHPaletteSRV; }
 
     // (min, range) that RGB was quantized over, fitted to this capture. Opacity
     // is a sigmoid so it always occupies [0,1] and is not part of this.
@@ -54,11 +63,13 @@ public:
         return static_cast<uint64>(PackedAData.GetResourceDataSize())
             + static_cast<uint64>(PackedBData.GetResourceDataSize())
             + static_cast<uint64>(CellBoundsData.GetResourceDataSize())
-            + static_cast<uint64>(bHasSH ? SHData.GetResourceDataSize() : 0);
+            + static_cast<uint64>(bHasSH ? SHIndexData.GetResourceDataSize() : 0)
+            + static_cast<uint64>(bHasSH ? SHPaletteData.GetResourceDataSize() : 0);
     }
 
-    // False for captures exported at SH degree 0; the SH buffer is then a
-    // single dummy element and must not be sampled.
+    // False for captures exported at SH degree 0 (or whose palette would not fit
+    // one buffer); the SH buffers are then single dummy elements and must not be
+    // sampled.
     bool HasSH() const { return bHasSH; }
 
     // Cells in UPLOAD index space, not asset index space. Only a prefix of each
@@ -87,15 +98,18 @@ private:
     TResourceArray<FUintVector4, VERTEXBUFFER_ALIGNMENT> PackedAData;
     TResourceArray<uint32, VERTEXBUFFER_ALIGNMENT> PackedBData;
     TResourceArray<FVector4f, VERTEXBUFFER_ALIGNMENT> CellBoundsData;
-    TResourceArray<FVector4f, VERTEXBUFFER_ALIGNMENT> SHData;
+    TResourceArray<uint32, VERTEXBUFFER_ALIGNMENT> SHIndexData;
+    TResourceArray<float, VERTEXBUFFER_ALIGNMENT> SHPaletteData;
 
     FBufferRHIRef PackedABuffer;
     FBufferRHIRef PackedBBuffer;
     FBufferRHIRef CellBoundsBuffer;
-    FBufferRHIRef SHBuffer;
+    FBufferRHIRef SHIndexBuffer;
+    FBufferRHIRef SHPaletteBuffer;
 
     FShaderResourceViewRHIRef PackedASRV;
     FShaderResourceViewRHIRef PackedBSRV;
     FShaderResourceViewRHIRef CellBoundsSRV;
-    FShaderResourceViewRHIRef SHSRV;
+    FShaderResourceViewRHIRef SHIndexSRV;
+    FShaderResourceViewRHIRef SHPaletteSRV;
 };

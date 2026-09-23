@@ -307,6 +307,31 @@ No re-import is needed for an asset imported after the parser fix: the empty
 `SHCoefficients` array is already serialised, and `bHasSH` is derived from it
 at load.
 
+**Captures with SH over ~17.9M splats.** The GPU copy used to be 15 `float4`
+per splat -- 240 B, a quarter of it padding -- in one buffer. The RHI sizes a
+buffer as uint32, so past 17,895,697 splats `TResourceArray::GetResourceDataSize`
+hit a Fatal and took the editor down the moment `MaxGpuPointCount` was raised.
+
+SH is now a palette: each distinct set of 45 coefficients is uploaded once (45
+floats, no padding) and every splat carries a uint index into it. Sets are
+matched by their bytes -- a 64-bit hash, confirmed by a byte compare, so a
+collision costs a duplicate entry, never a wrong one -- which makes it
+bit-exact. Captures converted from SOG already share their SH through per-chunk
+palettes, and there the saving is large. Measured on "Uno" (20,920,240 splats,
+SH degree 3, SOG-derived):
+
+| | Before | After |
+|---|---|---|
+| distinct SH sets | -- | 2,293,747 |
+| SH on the GPU, all splats | 4,788 MiB (never fit) | 474 MiB |
+| whole asset on the GPU | Fatal above 17.9M | 873 MiB (43.7 B/splat) |
+
+A capture whose SH is unique per splat gains nothing from sharing but still
+drops the padding (240 -> 184 B/splat including the index). If a palette would
+still exceed one 4 GiB buffer, the upload drops SH with a warning instead of
+the Fatal -- every splat stays, only view-dependent colour is lost. The
+`SH palette:` log line reports the set count and size at each upload.
+
 ## Profiling
 
 The renderer declares its own GPU stats, so `stat GPU` breaks splat cost down by phase:
@@ -367,7 +392,8 @@ frame: ~512 K visible x 240 B is ~123 MB, roughly 0.4 ms of bandwidth, and even
 at 1.7 M visible it is only ~1.4 ms. **SH is a memory-footprint problem, not a
 bandwidth one.** Packing to half3 (932 MB -> ~350 MB) is still worth doing if
 VRAM is tight -- the renderer sits at ~6.7 GB of 8 GB -- but it will not buy
-frames.
+frames. (The footprint is now handled losslessly by the SH palette, see Large
+captures; half3 would be lossy and only matters for captures with unique SH.)
 
 **Alpha cutoff.** Raising the discard threshold from 1/255 to 0.02 and 0.05 to
 cut overdraw: 19.4 / 19.62 / 19.26 ms. Also noise.

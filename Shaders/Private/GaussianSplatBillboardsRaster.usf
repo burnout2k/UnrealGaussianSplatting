@@ -4,7 +4,9 @@
 #include "GaussianSplatCellLookup.ush"
 
 Buffer<uint> SplatOrderBuffer;
-StructuredBuffer<float4> SplatSHBuffer;
+// One index per splat into a palette of distinct 45-float coefficient sets.
+StructuredBuffer<uint> SplatSHIndexBuffer;
+StructuredBuffer<float> SplatSHPaletteBuffer;
 
 float2 ViewRectMin;
 float2 ViewSize;
@@ -35,9 +37,13 @@ static const float SH_C1 = 0.4886025;
 static const float SH_C2[5] = { 1.0925484, -1.0925484, 0.3153916, -1.0925484, 0.5462742 };
 static const float SH_C3[7] = { -0.5900436, 2.8906114, -0.4570458, 0.3731763, -0.4570458, 1.4453057, -0.5900436 };
 
-float3 LoadSHCoeff(uint InstanceID, uint CoeffIndex)
+float3 LoadSHCoeff(uint SHBase, uint CoeffIndex)
 {
-    return SplatSHBuffer[InstanceID * 15 + CoeffIndex].xyz;
+    const uint Offset = SHBase + CoeffIndex * 3;
+    return float3(
+        SplatSHPaletteBuffer[Offset + 0],
+        SplatSHPaletteBuffer[Offset + 1],
+        SplatSHPaletteBuffer[Offset + 2]);
 }
 
 float3 WorldDirToLocal(uint InstanceID, float3 WorldDir)
@@ -74,7 +80,8 @@ float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
         return max(Result, 0.0);
     }
 
-    Result += SH_C1 * (-LoadSHCoeff(InstanceID, 0) * Y + LoadSHCoeff(InstanceID, 1) * Z - LoadSHCoeff(InstanceID, 2) * X);
+    const uint SHBase = SplatSHIndexBuffer[InstanceID] * 45;
+    Result += SH_C1 * (-LoadSHCoeff(SHBase, 0) * Y + LoadSHCoeff(SHBase, 1) * Z - LoadSHCoeff(SHBase, 2) * X);
 
     float XX = X * X;
     float YY = Y * Y;
@@ -84,20 +91,20 @@ float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
     float XZ = X * Z;
 
     Result +=
-        (SH_C2[0] * XY) * LoadSHCoeff(InstanceID, 3) +
-        (SH_C2[1] * YZ) * LoadSHCoeff(InstanceID, 4) +
-        (SH_C2[2] * (2.0 * ZZ - XX - YY)) * LoadSHCoeff(InstanceID, 5) +
-        (SH_C2[3] * XZ) * LoadSHCoeff(InstanceID, 6) +
-        (SH_C2[4] * (XX - YY)) * LoadSHCoeff(InstanceID, 7);
+        (SH_C2[0] * XY) * LoadSHCoeff(SHBase, 3) +
+        (SH_C2[1] * YZ) * LoadSHCoeff(SHBase, 4) +
+        (SH_C2[2] * (2.0 * ZZ - XX - YY)) * LoadSHCoeff(SHBase, 5) +
+        (SH_C2[3] * XZ) * LoadSHCoeff(SHBase, 6) +
+        (SH_C2[4] * (XX - YY)) * LoadSHCoeff(SHBase, 7);
 
     Result +=
-        (SH_C3[0] * Y * (3.0 * XX - YY)) * LoadSHCoeff(InstanceID, 8) +
-        (SH_C3[1] * XY * Z) * LoadSHCoeff(InstanceID, 9) +
-        (SH_C3[2] * Y * (4.0 * ZZ - XX - YY)) * LoadSHCoeff(InstanceID, 10) +
-        (SH_C3[3] * Z * (2.0 * ZZ - 3.0 * XX - 3.0 * YY)) * LoadSHCoeff(InstanceID, 11) +
-        (SH_C3[4] * X * (4.0 * ZZ - XX - YY)) * LoadSHCoeff(InstanceID, 12) +
-        (SH_C3[5] * Z * (XX - YY)) * LoadSHCoeff(InstanceID, 13) +
-        (SH_C3[6] * X * (XX - 3.0 * YY)) * LoadSHCoeff(InstanceID, 14);
+        (SH_C3[0] * Y * (3.0 * XX - YY)) * LoadSHCoeff(SHBase, 8) +
+        (SH_C3[1] * XY * Z) * LoadSHCoeff(SHBase, 9) +
+        (SH_C3[2] * Y * (4.0 * ZZ - XX - YY)) * LoadSHCoeff(SHBase, 10) +
+        (SH_C3[3] * Z * (2.0 * ZZ - 3.0 * XX - 3.0 * YY)) * LoadSHCoeff(SHBase, 11) +
+        (SH_C3[4] * X * (4.0 * ZZ - XX - YY)) * LoadSHCoeff(SHBase, 12) +
+        (SH_C3[5] * Z * (XX - YY)) * LoadSHCoeff(SHBase, 13) +
+        (SH_C3[6] * X * (XX - 3.0 * YY)) * LoadSHCoeff(SHBase, 14);
 
     return max(Result, 0.0);
 }

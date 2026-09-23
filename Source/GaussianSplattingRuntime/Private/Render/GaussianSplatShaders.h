@@ -149,7 +149,8 @@ public:
         SHADER_PARAMETER(uint32, HasSH)
         SHADER_PARAMETER(float, MinScreenVariance)
         SHADER_PARAMETER(uint32, PerPixelDepth)
-        SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatSHBuffer)
+        SHADER_PARAMETER_SRV(StructuredBuffer<uint>, SplatSHIndexBuffer)
+        SHADER_PARAMETER_SRV(StructuredBuffer<float>, SplatSHPaletteBuffer)
     END_SHADER_PARAMETER_STRUCT()
 };
 

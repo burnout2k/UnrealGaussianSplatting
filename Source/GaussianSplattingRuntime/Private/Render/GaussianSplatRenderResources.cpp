@@ -1,6 +1,7 @@
 #include "Render/GaussianSplatRenderResources.h"
 
 #include "GaussianSplatBoundsUtils.h"
+#include "Hash/CityHash.h"
 #include "Math/Float16.h"
 #include "RHICommandList.h"
 
@@ -214,11 +215,22 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
     // A degenerate range (every splat one colour) would divide by zero.
     ColorEncoding = FVector2f(ColorMin, FMath::Max(ColorMax - ColorMin, KINDA_SMALL_NUMBER));
 
-    // A capture exported at SH degree 0 has no f_rest_* data, so every one of the
-    // 15 float4 per splat would be zero: read every frame and multiplied by
-    // nothing. Skip the buffer entirely and let the shader branch past it.
+    // A capture exported at SH degree 0 has no f_rest_* data, so every
+    // coefficient would be zero: read every frame and multiplied by nothing.
+    // Skip the buffers entirely and let the shader branch past them.
+    //
+    // Otherwise SH is deduplicated into a palette (see the header). Sets are
+    // keyed by a 64-bit hash of their bytes, and a hit is only taken after a
+    // byte compare, so a hash collision costs a duplicate entry, never a wrong
+    // one.
     bHasSH = !InSHCoefficients.IsEmpty();
-    SHData.Empty(bHasSH ? PointCount * 15 : 1);
+    SHIndexData.Empty(bHasSH ? PointCount : 1);
+    SHPaletteData.Reset();
+    TMap<uint64, int32> SHEntryOfHash;
+    constexpr int32 SHFloatsPerSet = 45;
+    // The RHI takes a buffer's size as uint32; a palette past 4 GiB would hit
+    // a Fatal in TResourceArray::GetResourceDataSize and take the editor down.
+    constexpr int64 MaxSHPaletteSets = MAX_uint32 / (SHFloatsPerSet * sizeof(float));
 
     for (const FGaussianSplatCell& Cell : Cells)
     {
@@ -267,24 +279,68 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
                 continue;
             }
 
-            const int32 SHBase = SourceIndex * 45;
-            for (int32 CoeffIndex = 0; CoeffIndex < 15; ++CoeffIndex)
+            const int32 SHBase = SourceIndex * SHFloatsPerSet;
+            float Coeffs[SHFloatsPerSet];
+            for (int32 CoeffIndex = 0; CoeffIndex < SHFloatsPerSet; ++CoeffIndex)
             {
-                const int32 CoeffBase = SHBase + CoeffIndex * 3;
-                SHData.Add(FVector4f(
-                    InSHCoefficients.IsValidIndex(CoeffBase + 0) ? InSHCoefficients[CoeffBase + 0] : 0.0f,
-                    InSHCoefficients.IsValidIndex(CoeffBase + 1) ? InSHCoefficients[CoeffBase + 1] : 0.0f,
-                    InSHCoefficients.IsValidIndex(CoeffBase + 2) ? InSHCoefficients[CoeffBase + 2] : 0.0f,
-                    0.0f));
+                Coeffs[CoeffIndex] = InSHCoefficients.IsValidIndex(SHBase + CoeffIndex)
+                    ? InSHCoefficients[SHBase + CoeffIndex]
+                    : 0.0f;
             }
+
+            const uint64 Hash = CityHash64(reinterpret_cast<const char*>(Coeffs), sizeof(Coeffs));
+            const int32* Existing = SHEntryOfHash.Find(Hash);
+            if (Existing
+                && FMemory::Memcmp(&SHPaletteData[*Existing * SHFloatsPerSet], Coeffs, sizeof(Coeffs)) == 0)
+            {
+                SHIndexData.Add(static_cast<uint32>(*Existing));
+                continue;
+            }
+
+            const int32 Entry = SHPaletteData.Num() / SHFloatsPerSet;
+            if (Entry >= MaxSHPaletteSets)
+            {
+                // Dropping SH keeps every splat and only loses view-dependent
+                // colour; the alternative is the Fatal.
+                UE_LOG(
+                    LogGaussianSplatResources,
+                    Warning,
+                    TEXT("SH palette exceeds one 4 GiB GPU buffer (more than %lld distinct ")
+                    TEXT("coefficient sets); uploading %u splats WITHOUT spherical harmonics. ")
+                    TEXT("Lower MaxGpuPointCount to keep them."),
+                    MaxSHPaletteSets,
+                    PointCount);
+                bHasSH = false;
+                continue;
+            }
+            if (!Existing)
+            {
+                SHEntryOfHash.Add(Hash, Entry);
+            }
+            SHPaletteData.Append(Coeffs, SHFloatsPerSet);
+            SHIndexData.Add(static_cast<uint32>(Entry));
         }
     }
 
-    // One dummy element keeps each SRV valid to bind; a null SRV is not allowed,
-    // and the shader never reads these when the counts are zero.
-    if (!bHasSH)
+    if (bHasSH && !SHIndexData.IsEmpty())
     {
-        SHData.Add(FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+        UE_LOG(
+            LogGaussianSplatResources,
+            Display,
+            TEXT("SH palette: %d distinct coefficient sets for %d splats, %.0f MiB"),
+            SHPaletteData.Num() / SHFloatsPerSet,
+            SHIndexData.Num(),
+            (SHPaletteData.Num() * sizeof(float) + SHIndexData.Num() * sizeof(uint32)) / (1024.0 * 1024.0));
+    }
+    else
+    {
+        // One dummy element keeps each SRV valid to bind; a null SRV is not
+        // allowed, and the shader never reads these when HasSH is 0.
+        bHasSH = false;
+        SHIndexData.Empty(1);
+        SHPaletteData.Empty(1);
+        SHIndexData.Add(0u);
+        SHPaletteData.Add(0.0f);
     }
     if (CellBoundsData.IsEmpty())
     {
@@ -321,7 +377,8 @@ void FGaussianSplatRenderResources::InitRHI(FRHICommandListBase& RHICmdList)
     InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.PackedA"), PackedAData, PackedABuffer, PackedASRV);
     InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.PackedB"), PackedBData, PackedBBuffer, PackedBSRV);
     InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.CellBounds"), CellBoundsData, CellBoundsBuffer, CellBoundsSRV);
-    InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.AssetSH"), SHData, SHBuffer, SHSRV);
+    InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.SHIndex"), SHIndexData, SHIndexBuffer, SHIndexSRV);
+    InitStructuredBuffer(RHICmdList, TEXT("GaussianSplat.SHPalette"), SHPaletteData, SHPaletteBuffer, SHPaletteSRV);
 }
 
 void FGaussianSplatRenderResources::ReleaseRHI()
@@ -329,10 +386,12 @@ void FGaussianSplatRenderResources::ReleaseRHI()
     PackedASRV.SafeRelease();
     PackedBSRV.SafeRelease();
     CellBoundsSRV.SafeRelease();
-    SHSRV.SafeRelease();
+    SHIndexSRV.SafeRelease();
+    SHPaletteSRV.SafeRelease();
 
     PackedABuffer.SafeRelease();
     PackedBBuffer.SafeRelease();
     CellBoundsBuffer.SafeRelease();
-    SHBuffer.SafeRelease();
+    SHIndexBuffer.SafeRelease();
+    SHPaletteBuffer.SafeRelease();
 }
