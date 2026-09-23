@@ -24,7 +24,10 @@
  *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  *  SOFTWARE.
  ******************************************************************************/
-#include "SortCommon.hlsl"
+// GS-PORT: Modified for UnrealGaussianSplatting (burnout2k fork, r.GaussianSplat.SortMode 2).
+// GS-PORT: Every change is marked "GS-PORT"; README.md explains how to diff against the verbatim copy.
+// GS-PORT: renamed for UE shader virtual paths.
+#include "SortCommon.ush"
 
 #define US_DIM          128U        //The number of threads in a Upsweep threadblock
 #define SCAN_DIM        128U        //The number of threads in a Scan threadblock
@@ -52,8 +55,8 @@ void InitDeviceRadixSort(int3 id : SV_DispatchThreadID)
 inline void HistogramDigitCounts(uint gtid, uint gid)
 {
     const uint histOffset = gtid / 64 * RADIX;
-    const uint partitionEnd = gid == e_threadBlocks - 1 ?
-        e_numKeys : (gid + 1) * PART_SIZE;
+    // GS-PORT: bound by the (GPU-side) key count, so partitions past it run zero iterations and write zeros.
+    const uint partitionEnd = min((gid + 1) * PART_SIZE, e_numKeys);
     for (uint i = gtid + gid * PART_SIZE; i < partitionEnd; i += US_DIM)
     {
 #if defined(KEY_UINT)
@@ -163,6 +166,9 @@ inline void GlobalHistExclusiveScanWLT16(uint gtid, uint waveSize)
 [numthreads(US_DIM, 1, 1)]
 void Upsweep(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
+    // GS-PORT: load the key count once per kernel.
+    GS_LOAD_NUM_KEYS();
+
     //get the wave size
     const uint waveSize = getWaveSize();
     
@@ -451,6 +457,13 @@ inline void LoadThreadBlockReductions(uint gtid, uint gid, uint exclusiveHistRed
 [numthreads(D_DIM, 1, 1)]
 void Downsweep(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
+    // GS-PORT: load the key count once; partitions past it exit before any barrier (the condition is
+    // GS-PORT: uniform per group). The last real partition is full only at an exact multiple of PART_SIZE.
+    GS_LOAD_NUM_KEYS();
+    if (gid.x * PART_SIZE >= e_numKeys)
+        return;
+    const bool bFull = (gid.x + 1) * PART_SIZE <= e_numKeys;
+
     KeyStruct keys;
     OffsetStruct offsets;
     const uint waveSize = getWaveSize();
@@ -458,7 +471,8 @@ void Downsweep(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
     ClearWaveHists(gtid.x, waveSize);
     GroupMemoryBarrierWithGroupSync();
     
-    if (gid.x < e_threadBlocks - 1)
+    // GS-PORT: full/partial chosen by bFull, not by the last dispatched group.
+    if (bFull)
     {
         if (waveSize >= 16)
             keys = LoadKeysWGE16(gtid.x, waveSize, gid.x);
@@ -467,7 +481,7 @@ void Downsweep(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
             keys = LoadKeysWLT16(gtid.x, waveSize, gid.x, SerialIterations(waveSize));
     }
         
-    if (gid.x == e_threadBlocks - 1)
+    else
     {
         if (waveSize >= 16)
             keys = LoadKeysPartialWGE16(gtid.x, waveSize, gid.x);
@@ -480,6 +494,11 @@ void Downsweep(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
     
     if (waveSize >= 16)
     {
+#if !GS_RADIX_SAFE_BARRIERS
+        // GS-PORT: upstream b0nes164's barrier between the lane-divergent partial load and the first ballot;
+        // GS-PORT: the fast permutation drops the per-bit barrier in SortCommon, so it needs this one.
+        GroupMemoryBarrierWithGroupSync();
+#endif
         offsets = RankKeysWGE16(waveSize, getWaveIndex(gtid.x, waveSize) * RADIX, keys);
         GroupMemoryBarrierWithGroupSync();
         
@@ -523,9 +542,9 @@ void Downsweep(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
     LoadThreadBlockReductions(gtid.x, gid.x, exclusiveHistReduction);
     GroupMemoryBarrierWithGroupSync();
     
-    if (gid.x < e_threadBlocks - 1)
+    // GS-PORT: same bFull choice as the loads.
+    if (bFull)
         ScatterDevice(gtid.x, waveSize, gid.x, offsets);
-        
-    if (gid.x == e_threadBlocks - 1)
+    else
         ScatterDevicePartial(gtid.x, waveSize, gid.x, offsets);
 }

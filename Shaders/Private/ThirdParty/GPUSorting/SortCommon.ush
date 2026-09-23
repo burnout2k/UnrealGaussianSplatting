@@ -24,6 +24,8 @@
  *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  *  SOFTWARE.
  ******************************************************************************/
+// GS-PORT: Modified for UnrealGaussianSplatting (burnout2k fork, r.GaussianSplat.SortMode 2).
+// GS-PORT: Every change is marked "GS-PORT"; README.md explains how to diff against the verbatim copy.
 #define KEYS_PER_THREAD     15U 
 #define D_DIM               256U
 #define PART_SIZE           3840U
@@ -36,17 +38,13 @@
 #define RADIX_LOG           8U      //log2(RADIX)
 #define RADIX_PASSES        4U      //(Key width) / RADIX_LOG
 
-cbuffer cbGpuSorting : register(b0)
-{
-    uint e_numKeys;
-    uint e_radixShift;
-    uint e_threadBlocks;
-    uint padding;
-};
+// GS-PORT: cbGpuSorting removed. e_radixShift and e_threadBlocks are loose uniforms declared by
+// GS-PORT: GaussianSplatDeviceRadixSort.usf, and e_numKeys is its macro over a count loaded once per kernel.
 
 #if defined(KEY_UINT)
-RWStructuredBuffer<uint> b_sort;
-RWStructuredBuffer<uint> b_alt;
+// GS-PORT: typed buffers, matching the plugin's key/order buffers (b_sort is only ever read).
+Buffer<uint> b_sort;
+RWBuffer<uint> b_alt;
 #elif defined(KEY_INT)
 RWStructuredBuffer<int> b_sort;
 RWStructuredBuffer<int> b_alt;
@@ -56,8 +54,9 @@ RWStructuredBuffer<float> b_alt;
 #endif
 
 #if defined(PAYLOAD_UINT)
-RWStructuredBuffer<uint> b_sortPayload;
-RWStructuredBuffer<uint> b_altPayload;
+// GS-PORT: typed buffers, matching the plugin's key/order buffers (b_sortPayload is only ever read).
+Buffer<uint> b_sortPayload;
+RWBuffer<uint> b_altPayload;
 #elif defined(PAYLOAD_INT)
 RWStructuredBuffer<int> b_sortPayload;
 RWStructuredBuffer<int> b_altPayload;
@@ -97,7 +96,8 @@ struct DigitStruct
 //Due to a bug with SPIRV pre 1.6, we cannot use WaveGetLaneCount() to get the currently active wavesize 
 inline uint getWaveSize()
 {
-#if defined(VULKAN)
+// GS-PORT: UE defines COMPILER_VULKAN, never VULKAN; without this the WaveGetLaneCount() branch is taken.
+#if COMPILER_VULKAN
     GroupMemoryBarrierWithGroupSync(); //Make absolutely sure the wave is not diverged here
     return dot(countbits(WaveActiveBallot(true)), uint4(1, 1, 1, 1));
 #else
@@ -321,7 +321,11 @@ inline void WarpLevelMultiSplitWGE16(uint key, inout uint4 waveFlags)
     {
         const uint currentBit = 1 << k + e_radixShift;
         const bool t = (key & currentBit) != 0;
+// GS-PORT: per-bit barrier kept only in the default permutation; GS_RADIX_SAFE_BARRIERS=0 uses upstream's
+// GS-PORT: single barrier before RankKeysWGE16 instead (see Downsweep in DeviceRadixSort.ush).
+#if GS_RADIX_SAFE_BARRIERS
         GroupMemoryBarrierWithGroupSync();  //Play on the safe side, throw in a barrier for convergence
+#endif
         const uint4 ballot = WaveActiveBallot(t);
         if(t)
             waveFlags &= ballot;
