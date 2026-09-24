@@ -21,5 +21,9 @@ public class GaussianSplattingRuntime : ModuleRules
 			"RHICore",
 			"Renderer"
 		});
+
+		// MIT requires the GPUSorting notice in every copy, and packages ship the compiled sort
+		// shaders without their sources.
+		RuntimeDependencies.Add("$(PluginDir)/ThirdPartyNotices.txt");
 	}
 }

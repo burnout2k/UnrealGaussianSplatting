@@ -198,38 +198,45 @@ intersection, so boundaries against hard geometry stay soft.
 ## Depth sorting
 
 Splats are semi-transparent, so they must be drawn in depth order every frame.
-Two implementations, selected by `r.GaussianSplat.SortMode`:
+Three implementations, selected by `r.GaussianSplat.SortMode`:
 
-| Mode | Sort | Dispatches at 3.9M splats |
+| Mode | Sort | Passes at the default 20-bit key |
 |---|---|---|
-| `0` | bitonic network | 253 |
-| `1` (default) | UE GPU radix sort (`SortGPUBuffers`) | 8 |
+| `0` | bitonic network | 253 dispatches at 3.9M splats |
+| `1` (default) | UE GPU radix sort (`SortGPUBuffers`), 4 bits per pass | 6 |
+| `2` | plugin DeviceRadixSort, 8 bits per pass | 3 |
 
 Bitonic needs `½·log₂N·(log₂N+1)` stages, each a separate dispatch with a full
-pipeline drain between them, and pads the array to a power of two. Radix sorts
-4 bits per pass, so a 32-bit key takes 8 passes regardless of element count, and
-needs no padding.
+pipeline drain between them, and pads the array to a power of two. The radix
+sorts need no padding. Mode 2 is described below; it becomes the default once it
+has been validated on the CARLA deployment.
 
 ### Key width
 
 `EncodeDepthKey()` is `asuint()` of the view-space depth. That is monotonic for
 positive floats, so the key can be shifted right to drop low mantissa bits
-without breaking ordering -- and fewer significant bits means fewer radix
-passes. `r.GaussianSplat.SortKeyBits` controls this (one pass per 4 bits):
+without breaking ordering -- and fewer significant bits can mean fewer radix
+passes. `r.GaussianSplat.SortKeyBits` controls this:
 
-| Bits | Passes | tartu_demo |
-|---|---|---|
-| 32 | 8 | 30.8 ms |
-| **20 (default)** | **5** | **27.9 ms** -- no visible difference from 32 |
-| 16 | 4 | visibly wrong; do not use |
+| Bits | Mode 1 passes | Mode 2 passes | Depth step at 10 m / 100 m |
+|---|---|---|---|
+| 32 | 8 | 4 | exact |
+| 24 | 6 | 3 | 0.16 mm / 2.5 mm |
+| **20 (default)** | **6** | **3** | 2.5 mm / 4 cm -- no visible difference from 32 on tartu_demo |
+| 16 | 4 | 2 | 4 cm / 64 cm -- visibly wrong; do not use |
 
-Ties are drawn in cull order rather than true depth order. Radix is stable, so
-the error is consistent frame to frame rather than flickering, which makes it
-easy to miss on a still image -- move the camera when evaluating a new value.
+Mode 1 rounds an odd pass count up to even (see the notes below), so 20 bits
+costs it the same 6 passes as 24.
 
-### Measurements
+Ties are drawn in cull order rather than true depth order. Both radix sorts are
+stable, so the error is consistent frame to frame rather than flickering, which
+makes it easy to miss on a still image -- move the camera when evaluating a new
+value.
 
-On tartu_demo (3,885,113 splats, 8 GB GPU, one viewport):
+### Measurements (mode 1)
+
+On tartu_demo (3,885,113 splats, 8 GB GPU, one viewport), measured before the
+even-pass rule, when 20 bits still took 5 passes:
 
 | | Frame |
 |---|---|
@@ -241,21 +248,95 @@ On tartu_demo (3,885,113 splats, 8 GB GPU, one viewport):
 So the sort went from ~32 ms to ~5 ms. It does not reach the ~3 ms the pass
 count suggests, most likely because `GPUSort.cpp` caps itself at
 `MAX_GROUP_COUNT 64` (8,192 threads in flight) -- tuned for particle counts, not
-millions of splats. Raising it further means porting a modern high-occupancy
-`DeviceRadixSort` into the plugin rather than editing engine source.
+millions of splats. The cost grows with the key count: about 32 ms at 20.8M
+keys. Mode 2 is the fix.
 
-All three knobs are plain CVars -- console for the session,
-`[SystemSettings]` in `Config/DefaultEngine.ini` to persist (works in packaged
-builds, which have no console), or `-ExecCmds=` on the command line.
+### DeviceRadixSort (mode 2)
+
+Mode 2 is Thomas Smith's DeviceRadixSort
+([GPUSorting](https://github.com/b0nes164/GPUSorting), MIT), vendored from
+aras-p's UnityGaussianSplatting into `Shaders/Private/ThirdParty/GPUSorting/`
+and ported to Unreal (each change is marked `GS-PORT`). Compared with mode 1 it:
+
+- sorts 8 bits per pass, so 20- and 24-bit keys take 3 passes instead of 6;
+- dispatches enough thread groups to fill the GPU (about 5,400 per pass at 20M
+  keys, against `SortGPUBuffers`' cap of 64);
+- sorts exactly the visible splats: the key count comes from the cull's visible
+  counter on the GPU, not a CPU-side prediction, and the draw uses the same count.
+
+For the same input it produces the same stable ascending order as mode 1.
+
+**Where it runs.** Mode 2 needs Vulkan with wave operations, and by default runs
+only on NVIDIA GPUs with wave size 32, the only hardware it has been validated
+on. Anywhere else, or if its shaders are missing, the plugin falls back to mode 1
+and logs the reason once; the profile line shows the effective mode.
+`r.GaussianSplat.RadixAllowAnyVendor 1` lifts the vendor restriction for testing.
+Non-cell assets always use mode 1.
+
+| CVar | Default | Effect |
+|---|---|---|
+| `r.GaussianSplat.SortGpuCount` | 1 | 1 = sort the GPU visible count; 0 = sort the CPU-known selected count |
+| `r.GaussianSplat.RadixSafeBarriers` | 1 | 1 = aras-p's barrier layout; 0 = upstream's (one barrier before ranking instead of one per bit) |
+| `r.GaussianSplat.SortRepeat` | 1 | Re-sort N times (modes 1 and 2), for timing |
+| `r.GaussianSplat.RadixForceUnsupported` | 0 | Force the fallback, to test it |
+| `r.GaussianSplat.RadixAllowAnyVendor` | 0 | Allow mode 2 on non-NVIDIA or non-wave-32 GPUs |
+
+**Validation.** `r.GaussianSplat.SortValidate N` sorts every Nth frame with both
+modes and compares the results element by element on the GPU; any difference is
+logged at Error level, with running totals of validated frames and failures.
+`SortValidateView`, `SortValidateBatch`, `SortValidateCount` and
+`SortValidateGpuCap` pick the view, the splat actor and boundary cases.
+`r.GaussianSplat.SortSelfCheck N` checks without a reference that whatever sort
+ran left the drawn keys non-decreasing; it works in every mode, including the
+fallback. Neither is meant to stay on.
+
+### Measurements (mode 2)
+
+On "Uno" (20,920,240 splats, all resident), RTX 3070 8 GB, Vulkan on Linux, an
+empty level with one viewport, `PointSize` 3. Frame time is the median of three
+rounds of 10 s each:
+
+| View | No sort | Mode 1 | Mode 2 |
+|---|---|---|---|
+| whole capture, ~20.8M visible | 32.9 ms | 58.5 ms (17 fps) | 44.8 ms (22 fps) |
+| street level | 32.3 ms | 55.3 ms (18 fps) | 39.7 ms (25 fps) |
+
+The sort alone, from `SortRepeat 5` against 1: about 17.6 ms in mode 1 and 4.3 ms
+in mode 2. The rest of the gap to "no sort" (about 7.6 ms) is not sorting:
+drawing in depth order is slower than drawing in cull order. Mode 2 uses no more
+VRAM than mode 1. `SortGpuCount 0` is 0.6-1.6 ms slower than 1.
+`RadixSafeBarriers 0` measured 0.66 ms faster, but it has not had the longer
+validation run it would need, so the default stays 1.
+
+Validation on the same GPU: 5,999 frames compared against mode 1 with no
+difference, covering key widths 8-32 (1-4 passes), repeats 1/2/5, 17 boundary
+counts from 1 to 495,360 keys, zero keys, `Lod 0` and a second splat actor. The
+forced fallback, mode 1 and mode 0 passed `SortSelfCheck` (307 frames).
+Screenshots of mode 2 differ from mode 1 no more than mode 1 differs from itself.
+
+### Setting these
+
+All of these are plain CVars: the console for the session, or
+`[ConsoleVariables]` (what the CARLA project uses) or `[SystemSettings]` in
+`Config/DefaultEngine.ini` to persist. Both sections apply at the same priority
+and work in packaged builds, which have no console. `-ExecCmds=` on the command
+line works only in non-Shipping builds. `carla-DefaultEngine.ini.snippet` in this
+repository is the reference copy of the CARLA project's sort settings.
 
 Notes for anyone changing this:
 - The key/value buffers are typed (`PF_R32_UINT`, `Buffer<uint>`), not
-  structured, because that is what the radix shaders bind.
-- The rasterizer is bound at record time, so which ping-pong buffer holds the
-  result is *predicted* on the CPU from the pass count. `GetGPUSortPassCount()`
-  is not `ENGINE_API`, so that logic is mirrored locally and cross-checked
-  against the sort's actual return value at runtime -- a mismatch logs an error
-  under `LogGaussianSplatProfile`.
+  structured, because that is what `SortGPUBuffers` binds. Mode 2 uses the same
+  buffers, so switching modes reuses them.
+- Mode 1: the rasterizer is bound at record time, so which ping-pong buffer holds
+  the result is *predicted* on the CPU from the pass count. `GetGPUSortPassCount()`
+  is not `ENGINE_API`, so that logic is mirrored locally and cross-checked against
+  the sort's actual return value at runtime -- a mismatch logs an error under
+  `LogGaussianSplatProfile`. The pass count is forced even, so the result lands in
+  the buffer the cull filled.
+- Mode 2: its passes are ordinary RDG passes and the host swaps the buffers
+  itself, so the result buffer is known, not predicted. RDG does **not** reject a
+  buffer bound as SRV and UAV in the same pass (it silently merges the states to
+  UAV), so the host asserts after every swap that source and destination differ.
 
 ## Large captures
 
@@ -339,22 +420,23 @@ The renderer declares its own GPU stats, so `stat GPU` breaks splat cost down by
 | Stat | Covers |
 |---|---|
 | `GaussianSplat/Cull` | frustum rejection + visible-list compaction |
-| `GaussianSplat/Sort` | the bitonic depth sort |
+| `GaussianSplat/Sort` | the depth sort, whichever mode runs |
 | `GaussianSplat/Raster` | billboard/point rasterization |
 | `GaussianSplat/Composite` | blending the splat layer back onto scene colour |
 
-Without these the cost is attributed to whatever engine bucket happens to be open
-(it appeared under `SortLights`), which makes the profile misleading.
+Before these scopes existed, the cost was attributed to whatever engine bucket
+happened to be open (it appeared under `SortLights`), which made the profile misleading.
 
 The cull pass also reports how many splats survived rejection. Watch the log
-category `LogGaussianSplatProfile` (printed once per 60 frames):
+category `LogGaussianSplatProfile`, printed once per 60 renders of each view for
+the first splat actor. It shows the LOD selection, the visible count and the
+effective sort mode. Modes 0 and 1 sort the whole LOD selection; mode 2 sorts only
+the visible splats.
 
-```
-visible=1043xxx of 3885113 drawn (26.9%) | sort runs over 4194304 padded
-```
-
-Note the sort is sized from the **padded** count, not the visible count, so it
-currently costs the same regardless of where the camera looks.
+Frame time from the log: the timestamp difference between two consecutive lines
+of the same view divided by the difference of the engine frame numbers in
+brackets. Use only line pairs exactly 60 frames apart, and measure with
+`r.VSync 0` (the editor otherwise caps at 16.7 ms).
 
 ## Dense-capture levers
 
@@ -416,3 +498,10 @@ a tile-based rasterizer with early alpha termination.
 - Runtime experience is still basic
   - no full loader actor workflow
   - no streaming / LOD solution yet
+
+## Third-party notices
+
+`Shaders/Private/ThirdParty/GPUSorting/` holds MIT-licensed code by Thomas
+Smith, taken from aras-p's UnityGaussianSplatting. That licence covers only those
+files. `ThirdPartyNotices.txt` states the terms of each part of this plugin;
+packaged builds stage it.

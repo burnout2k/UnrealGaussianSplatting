@@ -1,5 +1,6 @@
 #pragma once
 
+#include "DataDrivenShaderPlatformInfo.h"
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
 
@@ -181,4 +182,159 @@ public:
         SHADER_PARAMETER_SAMPLER(SamplerState, SplatSampler)
         RENDER_TARGET_BINDING_SLOTS()
     END_SHADER_PARAMETER_STRUCT()
+};
+
+// ---------------------------------------------------------------------------------------------
+// r.GaussianSplat.SortMode 2: DeviceRadixSort (GaussianSplatDeviceRadixSort.usf, which includes the
+// vendored ThirdParty/GPUSorting shaders).
+
+// Keys per partition (one Upsweep/Downsweep thread group). Must equal PART_SIZE in the vendored
+// SortCommon.ush; the wrapper checks it with a _Static_assert.
+inline constexpr uint32 GSRadixPartSize = 3840;
+
+// One struct for all four kernels; each binds only what it reads. RadixSetup gets the UAV view of
+// the indirect args and Upsweep/Downsweep the SRV view: kept apart by design, since RDG would not
+// reject both in one pass but silently merge them to UAV access.
+BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatRadixSortParameters, )
+    SHADER_PARAMETER(uint32, e_radixShift)
+    SHADER_PARAMETER(uint32, e_threadBlocks)
+    SHADER_PARAMETER(uint32, e_maxKeys)
+    SHADER_PARAMETER(uint32, e_useGpuCount)
+    SHADER_PARAMETER(uint32, e_gpuCap)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, b_sortCount)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, b_sort)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, b_sortPayload)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, b_sortCountUAV)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, b_alt)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, b_altPayload)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, b_globalHist)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, b_passHist)
+END_SHADER_PARAMETER_STRUCT()
+
+// Vulkan only in this phase: that is the only platform the port has been validated on, so a D3D12
+// cook never compiles untested code. At runtime the plugin also checks the device (NVIDIA, wave 32)
+// and that every permutation exists before using any of these.
+class FGaussianSplatRadixSortCS : public FGlobalShader
+{
+public:
+    FGaussianSplatRadixSortCS() = default;
+    FGaussianSplatRadixSortCS(const ShaderMetaType::CompiledShaderInitializerType& Initializer)
+        : FGlobalShader(Initializer)
+    {
+    }
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsVulkanPlatform(Parameters.Platform)
+            && IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5)
+            && RHISupportsWaveOperations(Parameters.Platform);
+    }
+
+    static void ModifyCompilationEnvironment(
+        const FGlobalShaderPermutationParameters& Parameters,
+        FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+        // A no-op on the Vulkan shader format (SM 6.6 is its baseline); kept for D3D12.
+        OutEnvironment.CompilerFlags.Add(CFLAG_WaveOperations);
+        OutEnvironment.SetDefine(TEXT("GS_RADIX_PART_SIZE"), GSRadixPartSize);
+    }
+};
+
+class FGaussianSplatRadixSetupCS final : public FGaussianSplatRadixSortCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatRadixSetupCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatRadixSetupCS, FGaussianSplatRadixSortCS);
+    using FParameters = FGaussianSplatRadixSortParameters;
+};
+
+class FGaussianSplatRadixUpsweepCS final : public FGaussianSplatRadixSortCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatRadixUpsweepCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatRadixUpsweepCS, FGaussianSplatRadixSortCS);
+    using FParameters = FGaussianSplatRadixSortParameters;
+};
+
+class FGaussianSplatRadixScanCS final : public FGaussianSplatRadixSortCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatRadixScanCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatRadixScanCS, FGaussianSplatRadixSortCS);
+    using FParameters = FGaussianSplatRadixSortParameters;
+};
+
+class FGaussianSplatRadixDownsweepCS final : public FGaussianSplatRadixSortCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatRadixDownsweepCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatRadixDownsweepCS, FGaussianSplatRadixSortCS);
+    using FParameters = FGaussianSplatRadixSortParameters;
+
+    // 1 = aras-p's barrier layout (a barrier per bit in the multisplit), 0 = upstream b0nes164's
+    // (one barrier before ranking). r.GaussianSplat.RadixSafeBarriers picks one.
+    class FSafeBarriersDim : SHADER_PERMUTATION_BOOL("GS_RADIX_SAFE_BARRIERS");
+    using FPermutationDomain = TShaderPermutationDomain<FSafeBarriersDim>;
+};
+
+// Debug-only sort validation (GaussianSplatSortValidate.usf). Gated separately from the sort:
+// production mode 2 never depends on these compiling.
+BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatSortValidateParameters, )
+    SHADER_PARAMETER(uint32, MaxKeys)
+    SHADER_PARAMETER(uint32, GpuCap)
+    SHADER_PARAMETER(uint32, OrderBound)
+    SHADER_PARAMETER(uint32, TailCheck)
+    SHADER_PARAMETER(uint32, SelfCheckCount)
+    SHADER_PARAMETER(uint32, GridStride)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SortCount)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SrcKeys)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SrcOrder)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, TmpKeys)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, TmpOrder)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, CheckKeys)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, CheckOrder)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RefKeys)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, RefOrder)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, Stats)
+END_SHADER_PARAMETER_STRUCT()
+
+class FGaussianSplatSortValidateCS : public FGlobalShader
+{
+public:
+    FGaussianSplatSortValidateCS() = default;
+    FGaussianSplatSortValidateCS(const ShaderMetaType::CompiledShaderInitializerType& Initializer)
+        : FGlobalShader(Initializer)
+    {
+    }
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsVulkanPlatform(Parameters.Platform)
+            && IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+};
+
+class FGaussianSplatSortPrepareCS final : public FGaussianSplatSortValidateCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatSortPrepareCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatSortPrepareCS, FGaussianSplatSortValidateCS);
+    using FParameters = FGaussianSplatSortValidateParameters;
+};
+
+class FGaussianSplatSortCompareCS final : public FGaussianSplatSortValidateCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatSortCompareCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatSortCompareCS, FGaussianSplatSortValidateCS);
+    using FParameters = FGaussianSplatSortValidateParameters;
+};
+
+class FGaussianSplatSortSelfCheckCS final : public FGaussianSplatSortValidateCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatSortSelfCheckCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatSortSelfCheckCS, FGaussianSplatSortValidateCS);
+    using FParameters = FGaussianSplatSortValidateParameters;
 };

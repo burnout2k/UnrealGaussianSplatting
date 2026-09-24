@@ -1,0 +1,22 @@
+; Reference copy of the UnrealGaussianSplatting sort settings for the CARLA project's
+; Unreal/CarlaUnreal/Config/DefaultEngine.ini, section [ConsoleVariables].
+;
+; The CARLA checkout is an upstream clone that is never committed to, so this file is the
+; versioned copy: apply it by hand on every machine that builds or packages the project, and
+; update it whenever the settings change. It lives outside the plugin's Config/ directory, so
+; the engine never loads it as a config layer.
+;
+; Packages stage the project's DefaultEngine.ini, so these lines ship with every CARLA package.
+; The same ini also holds per-machine splat lines (r.GaussianSplat.MaxGpuPointCountCeiling and
+; ...CeilingGame); those depend on the GPU and are deliberately NOT part of this snippet.
+
+[ConsoleVariables]
+; Gaussian splat depth sort (UnrealGaussianSplatting plugin, burnout2k fork).
+; SortMode: 0 = bitonic network (slow, reference only), 1 = UE GPU radix sort (SortGPUBuffers,
+; 4 bits per pass), 2 = plugin DeviceRadixSort (8 bits per pass). Mode 2 runs only on NVIDIA
+; GPUs with wave size 32; anywhere else it falls back to 1 automatically.
+; SortKeyBits = significant bits of the depth key. Mode 1 costs one pass per 4 bits and rounds odd
+; pass counts up to even (20 and 24 bits both take 6 passes); mode 2 costs one pass per 8 bits
+; (20 and 24 bits both take 3). 16 is visibly wrong; do not go below 20.
+r.GaussianSplat.SortKeyBits=20
+r.GaussianSplat.SortMode=1

@@ -1,0 +1,221 @@
+// Debug-only sort validation. Never needed by production rendering: the plugin gates these shaders
+// separately from the sort, and a failure to compile them only disables the checks.
+//
+// PrepareCS   copies the cull's unsorted (key, order) prefix into a scratch pair, sentinel-padded,
+//             as the input for a mode-1 reference sort of the same frame.
+// CompareCS   compares the buffers the rasterizer actually binds (mode 2's result) with that
+//             reference, element by element (r.GaussianSplat.SortValidate).
+// SelfCheckCS reference-free: are the bound keys non-decreasing and the order values in range?
+//             Works for every sort mode, including the fallback (r.GaussianSplat.SortSelfCheck).
+//
+// Stats layout, CompareCS:
+//   [0] order mismatches            [1] ~(first mismatch index); 0 when there is none
+//   [2] unsorted neighbours, mode 2 [3] unsorted neighbours, mode 1 (reference)
+//   [4] key mismatches              [5] order values >= OrderBound
+//   [6] M, the count compared       [7] non-sentinel keys in the window past M (TailCheck frames)
+// Stats layout, SelfCheckCS: [0] decreasing neighbours, [1] order values >= OrderBound, [6] count.
+//
+// Each group reduces in shared memory first, then issues at most one atomic per counter.
+// Declare every bound parameter on its own line (see GaussianSplatDeviceRadixSort.usf).
+
+#include "/Engine/Public/Platform.ush"
+
+#define GS_VALIDATE_THREADS 256
+#define GS_SORT_SENTINEL 0xFFFFFFFFu
+// Matches PART_SIZE: over-writes past the sorted range would come from one partition's scatter.
+#define GS_TAIL_WINDOW 3840u
+
+uint MaxKeys;
+uint GpuCap;
+uint OrderBound;
+uint TailCheck;
+uint SelfCheckCount;
+uint GridStride;
+Buffer<uint> SortCount;
+Buffer<uint> SrcKeys;
+Buffer<uint> SrcOrder;
+RWBuffer<uint> TmpKeys;
+RWBuffer<uint> TmpOrder;
+Buffer<uint> CheckKeys;
+Buffer<uint> CheckOrder;
+Buffer<uint> RefKeys;
+Buffer<uint> RefOrder;
+RWStructuredBuffer<uint> Stats;
+
+groupshared uint GS_Counters[8];
+
+// The count mode 2 actually sorts, reproduced exactly as RadixSetup clamps it.
+uint ClampedSortCount()
+{
+    uint Count = min(SortCount[1], MaxKeys);
+    if (GpuCap != 0)
+    {
+        Count = min(Count, GpuCap);
+    }
+    return Count;
+}
+
+void ResetGroupCounters(uint GroupIndex)
+{
+    if (GroupIndex < 8)
+    {
+        // Slot 1 holds a minimum index, so it starts at the maximum.
+        GS_Counters[GroupIndex] = (GroupIndex == 1) ? GS_SORT_SENTINEL : 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+
+[numthreads(GS_VALIDATE_THREADS, 1, 1)]
+void PrepareCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    // Runs before the mode-2 sort, whose second pass overwrites the originals. Must copy exactly
+    // what mode 2 will sort (same clamp, including the GPU cap) or the reference differs by design.
+    const uint M = ClampedSortCount();
+    for (uint i = DispatchThreadId.x; i < MaxKeys; i += GridStride)
+    {
+        if (i < M)
+        {
+            TmpKeys[i] = SrcKeys[i];
+            TmpOrder[i] = SrcOrder[i];
+        }
+        else
+        {
+            // All-ones keys sort last under every key width, so mode 1's first M outputs are the
+            // stable sort of the real keys.
+            TmpKeys[i] = GS_SORT_SENTINEL;
+            TmpOrder[i] = 0;
+        }
+    }
+}
+
+[numthreads(GS_VALIDATE_THREADS, 1, 1)]
+void CompareCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint GroupIndex : SV_GroupIndex)
+{
+    ResetGroupCounters(GroupIndex);
+
+    // SortCount[1] has already been clamped by RadixSetup; clamping again keeps this kernel
+    // correct on its own.
+    const uint M = ClampedSortCount();
+    uint OrderMismatches = 0;
+    uint FirstMismatch = GS_SORT_SENTINEL;
+    uint UnsortedMode2 = 0;
+    uint UnsortedMode1 = 0;
+    uint KeyMismatches = 0;
+    uint BadOrder = 0;
+    uint TailKeys = 0;
+
+    for (uint i = DispatchThreadId.x; i < M; i += GridStride)
+    {
+        const uint Key2 = CheckKeys[i];
+        const uint Key1 = RefKeys[i];
+        const uint Order2 = CheckOrder[i];
+        if (Order2 != RefOrder[i])
+        {
+            ++OrderMismatches;
+            FirstMismatch = min(FirstMismatch, i);
+        }
+        if (Key2 != Key1)
+        {
+            ++KeyMismatches;
+        }
+        // Order values are cull thread indices, bounded by what the cull dispatched, not by how
+        // many keys were sorted.
+        if (Order2 >= OrderBound)
+        {
+            ++BadOrder;
+        }
+        if (i + 1 < M)
+        {
+            if (Key2 > CheckKeys[i + 1])
+            {
+                ++UnsortedMode2;
+            }
+            if (Key1 > RefKeys[i + 1])
+            {
+                ++UnsortedMode1;
+            }
+        }
+    }
+
+    if (TailCheck != 0)
+    {
+        // Only meaningful when mode 2 sorted MaxKeys with the sort buffers cleared (SortGpuCount 0):
+        // everything past M must still be a sentinel. Writes past the buffer end are discarded by
+        // robust buffer access and cannot be seen.
+        const uint TailEnd = min(M + GS_TAIL_WINDOW, MaxKeys);
+        for (uint t = M + DispatchThreadId.x; t < TailEnd; t += GridStride)
+        {
+            if (CheckKeys[t] != GS_SORT_SENTINEL)
+            {
+                ++TailKeys;
+            }
+        }
+    }
+
+    InterlockedAdd(GS_Counters[0], OrderMismatches);
+    InterlockedMin(GS_Counters[1], FirstMismatch);
+    InterlockedAdd(GS_Counters[2], UnsortedMode2);
+    InterlockedAdd(GS_Counters[3], UnsortedMode1);
+    InterlockedAdd(GS_Counters[4], KeyMismatches);
+    InterlockedAdd(GS_Counters[5], BadOrder);
+    InterlockedAdd(GS_Counters[7], TailKeys);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (GroupIndex == 0)
+    {
+        if (GS_Counters[0] != 0)
+        {
+            InterlockedAdd(Stats[0], GS_Counters[0]);
+            // Max of the complements is the complement of the global minimum, and a clear-to-zero
+            // buffer needs no special initial value for this slot.
+            InterlockedMax(Stats[1], ~GS_Counters[1]);
+        }
+        InterlockedAdd(Stats[2], GS_Counters[2]);
+        InterlockedAdd(Stats[3], GS_Counters[3]);
+        InterlockedAdd(Stats[4], GS_Counters[4]);
+        InterlockedAdd(Stats[5], GS_Counters[5]);
+        InterlockedAdd(Stats[7], GS_Counters[7]);
+        if (DispatchThreadId.x == 0)
+        {
+            InterlockedMax(Stats[6], M);
+        }
+    }
+}
+
+[numthreads(GS_VALIDATE_THREADS, 1, 1)]
+void SelfCheckCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint GroupIndex : SV_GroupIndex)
+{
+    ResetGroupCounters(GroupIndex);
+
+    // SelfCheckCount is the budget; the drawn count is the visible count, whatever sort ran.
+    const uint Count = min(SortCount[1], SelfCheckCount);
+    uint Decreasing = 0;
+    uint BadOrder = 0;
+
+    for (uint i = DispatchThreadId.x; i < Count; i += GridStride)
+    {
+        if (i + 1 < Count && CheckKeys[i] > CheckKeys[i + 1])
+        {
+            ++Decreasing;
+        }
+        if (CheckOrder[i] >= OrderBound)
+        {
+            ++BadOrder;
+        }
+    }
+
+    // Slot 1 starts at the maximum (it is CompareCS's minimum index), so count in slot 5 here.
+    InterlockedAdd(GS_Counters[0], Decreasing);
+    InterlockedAdd(GS_Counters[5], BadOrder);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (GroupIndex == 0)
+    {
+        InterlockedAdd(Stats[0], GS_Counters[0]);
+        InterlockedAdd(Stats[1], GS_Counters[5]);
+        if (DispatchThreadId.x == 0)
+        {
+            InterlockedMax(Stats[6], Count);
+        }
+    }
+}

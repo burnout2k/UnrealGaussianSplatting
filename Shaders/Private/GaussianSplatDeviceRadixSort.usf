@@ -1,0 +1,72 @@
+// DeviceRadixSort for r.GaussianSplat.SortMode 2: Thomas Smith's 8-bit LSD radix sort of key/value
+// pairs (ThirdParty/GPUSorting, MIT), sorting the cull pass's depth keys and splat indices.
+//
+// Entry points: RadixSetup (clamp the count, zero the global histogram), then per 8-bit digit
+// Upsweep -> Scan -> Downsweep. The host swaps the key/value pairs between passes, so the buffer
+// holding the result is known when the rasterizer is bound; nothing is predicted.
+//
+// The key count comes from the GPU (IndirectArgs[1], the visible count the cull appended) unless
+// e_useGpuCount is 0, in which case the CPU-known e_maxKeys is sorted. The dispatch grid is sized
+// from e_maxKeys on the CPU; partitions past the GPU count do no work.
+//
+// Declare every bound parameter on its own line: UE's shader parameter parser abandons a
+// declaration at a comma, which for a loose uniform ends in a checkf that takes the editor down.
+
+#include "/Engine/Public/Platform.ush"
+
+#define KEY_UINT 1
+#define PAYLOAD_UINT 1
+#define SORT_PAIRS 1
+#define SHOULD_ASCEND 1
+
+// Only the Downsweep has this permutation, but the #if lands in the shared SortCommon.ush.
+#ifndef GS_RADIX_SAFE_BARRIERS
+#define GS_RADIX_SAFE_BARRIERS 1
+#endif
+
+uint e_radixShift;
+uint e_threadBlocks;
+uint e_maxKeys;
+uint e_useGpuCount;
+uint e_gpuCap;
+Buffer<uint> b_sortCount;
+RWBuffer<uint> b_sortCountUAV;
+
+// Loaded once at the top of Upsweep and Downsweep (GS-PORT edits in DeviceRadixSort.ush) rather than
+// re-fetched at each of the ~36 places the vendored code reads e_numKeys.
+static uint GS_NumKeys;
+#define e_numKeys GS_NumKeys
+#define GS_LOAD_NUM_KEYS() GS_NumKeys = (e_useGpuCount != 0) ? b_sortCount[1] : e_maxKeys
+
+#include "ThirdParty/GPUSorting/DeviceRadixSort.ush"
+
+// The C++ side sizes the grid with GSRadixPartSize; it must agree with the vendored PART_SIZE, which
+// a retune (plan phase P2a) would change. The #if keeps a literal check because the stb preprocessor
+// cannot evaluate the vendored "3840U" inside #if.
+_Static_assert(PART_SIZE == GS_RADIX_PART_SIZE, "GS_RADIX_PART_SIZE (C++) must match PART_SIZE in SortCommon.ush");
+#if GS_RADIX_PART_SIZE != 3840
+#error "GS_RADIX_PART_SIZE must be 3840 in phase 1"
+#endif
+
+// Runs at the start of every repeat of the sort: each pass adds into its own 256-entry region of
+// the global histogram, so a second repeat without re-zeroing would double the offsets.
+[numthreads(256, 1, 1)]
+void RadixSetup(uint gtid : SV_GroupThreadID)
+{
+    if (gtid == 0)
+    {
+        // A no-op in production (the cull appends at most min(DispatchCount, budget) keys). It
+        // matters under r.GaussianSplat.SortValidateCount and SortValidateGpuCap, and it makes the
+        // draw's instance count the sorted count by construction.
+        uint Count = min(b_sortCountUAV[1], e_maxKeys);
+        if (e_gpuCap != 0)
+        {
+            Count = min(Count, e_gpuCap);
+        }
+        b_sortCountUAV[1] = Count;
+    }
+    for (uint i = gtid; i < 1024; i += 256)
+    {
+        b_globalHist[i] = 0;
+    }
+}

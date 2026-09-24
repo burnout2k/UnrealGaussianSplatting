@@ -1,0 +1,79 @@
+Notices for the UnrealGaussianSplatting plugin (burnout2k fork)
+===============================================================
+
+This plugin combines code under three different terms. Read each part for the
+files it covers; no single licence applies to the whole plugin.
+
+--------------------------------------------------------------------------------
+Part 1. The upstream plugin
+--------------------------------------------------------------------------------
+
+Source: https://github.com/laiwei0304/UnrealGaussianSplatting
+
+Its author publishes no licence file, so no licence is granted for the upstream
+code by this repository either. It is included here as found in the upstream
+repository.
+
+--------------------------------------------------------------------------------
+Part 2. Changes made in the burnout2k fork
+--------------------------------------------------------------------------------
+
+Source: https://github.com/burnout2k/UnrealGaussianSplatting (branch carla-ue5)
+
+The licensing of these changes has not been decided yet.
+
+--------------------------------------------------------------------------------
+Part 3. Shaders/Private/ThirdParty/GPUSorting/
+--------------------------------------------------------------------------------
+
+SortCommon.ush and DeviceRadixSort.ush are Thomas Smith's GPUSorting
+(https://github.com/b0nes164/GPUSorting), taken from aras-p's
+UnityGaussianSplatting (https://github.com/aras-p/UnityGaussianSplatting,
+revision 2c6fed37), with later changes there by Thomas Smith and the author
+"Constantin" (commit d508f39), and modified for this plugin (each change marked
+"GS-PORT"). They are under the MIT licence; both notices below apply, and are
+also kept next to the files in Shaders/Private/ThirdParty/GPUSorting/LICENSE.txt.
+
+SPDX-License-Identifier: MIT
+Copyright Thomas Smith 5/17/2024
+https://github.com/b0nes164/GPUSorting
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+MIT License
+
+Copyright (c) 2023 Aras Pranckevičius
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
