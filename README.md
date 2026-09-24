@@ -338,6 +338,10 @@ Notes for anyone changing this:
   itself, so the result buffer is known, not predicted. RDG does **not** reject a
   buffer bound as SRV and UAV in the same pass (it silently merges the states to
   UAV), so the host asserts after every swap that source and destination differ.
+- Under `-rdgdebug`, a one-pass mode-2 sort (`SortKeyBits 8`) logs that
+  `GaussianSplat.KeyBufferAlt` is produced but never used: the last pass writes
+  keys that only the validator reads. Expected and harmless; with two or more
+  passes every key buffer is read, so the default 24 bits never logs it.
 
 ## Large captures
 
@@ -504,5 +508,6 @@ a tile-based rasterizer with early alpha termination.
 
 `Shaders/Private/ThirdParty/GPUSorting/` holds MIT-licensed code by Thomas
 Smith, taken from aras-p's UnityGaussianSplatting. That licence covers only those
-files. `ThirdPartyNotices.txt` states the terms of each part of this plugin;
-packaged builds stage it.
+files. The changes made in this fork are MIT-licensed as well; the upstream
+plugin publishes no licence. `ThirdPartyNotices.txt` states the terms of each
+part of this plugin; packaged builds stage it.
