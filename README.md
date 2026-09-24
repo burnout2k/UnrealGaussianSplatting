@@ -200,16 +200,16 @@ intersection, so boundaries against hard geometry stay soft.
 Splats are semi-transparent, so they must be drawn in depth order every frame.
 Three implementations, selected by `r.GaussianSplat.SortMode`:
 
-| Mode | Sort | Passes at the default 20-bit key |
+| Mode | Sort | Passes at the default 24-bit key |
 |---|---|---|
 | `0` | bitonic network | 253 dispatches at 3.9M splats |
-| `1` (default) | UE GPU radix sort (`SortGPUBuffers`), 4 bits per pass | 6 |
-| `2` | plugin DeviceRadixSort, 8 bits per pass | 3 |
+| `1` | UE GPU radix sort (`SortGPUBuffers`), 4 bits per pass | 6 |
+| `2` (default) | plugin DeviceRadixSort, 8 bits per pass | 3 |
 
 Bitonic needs `½·log₂N·(log₂N+1)` stages, each a separate dispatch with a full
 pipeline drain between them, and pads the array to a power of two. The radix
-sorts need no padding. Mode 2 is described below; it becomes the default once it
-has been validated on the CARLA deployment.
+sorts need no padding. Mode 2, the default, is described below; where it cannot
+run, the plugin falls back to mode 1.
 
 ### Key width
 
@@ -221,12 +221,13 @@ passes. `r.GaussianSplat.SortKeyBits` controls this:
 | Bits | Mode 1 passes | Mode 2 passes | Depth step at 10 m / 100 m |
 |---|---|---|---|
 | 32 | 8 | 4 | exact |
-| 24 | 6 | 3 | 0.16 mm / 2.5 mm |
-| **20 (default)** | **6** | **3** | 2.5 mm / 4 cm -- no visible difference from 32 on tartu_demo |
+| **24 (default)** | **6** | **3** | 0.16 mm / 2.5 mm |
+| 20 | 6 | 3 | 2.5 mm / 4 cm -- no visible difference from 32 on tartu_demo |
 | 16 | 4 | 2 | 4 cm / 64 cm -- visibly wrong; do not use |
 
 Mode 1 rounds an odd pass count up to even (see the notes below), so 20 bits
-costs it the same 6 passes as 24.
+costs it the same 6 passes as 24. Both modes therefore get 24 bits for the price
+of 20, with 16 times finer depth steps, which is why 24 is the default.
 
 Ties are drawn in cull order rather than true depth order. Both radix sorts are
 stable, so the error is consistent frame to frame rather than flickering, which

@@ -17,6 +17,7 @@
 ; GPUs with wave size 32; anywhere else it falls back to 1 automatically.
 ; SortKeyBits = significant bits of the depth key. Mode 1 costs one pass per 4 bits and rounds odd
 ; pass counts up to even (20 and 24 bits both take 6 passes); mode 2 costs one pass per 8 bits
-; (20 and 24 bits both take 3). 16 is visibly wrong; do not go below 20.
-r.GaussianSplat.SortKeyBits=20
-r.GaussianSplat.SortMode=1
+; (20 and 24 bits both take 3), so 24 costs no more than 20. 16 is visibly wrong; do not go below 20.
+; These match the plugin's defaults; SortMode=1 goes back to UE's sort.
+r.GaussianSplat.SortKeyBits=24
+r.GaussianSplat.SortMode=2

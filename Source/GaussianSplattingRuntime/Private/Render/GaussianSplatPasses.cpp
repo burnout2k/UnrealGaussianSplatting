@@ -218,11 +218,11 @@ namespace GaussianSplatProfiling
 
     static TAutoConsoleVariable<int32> CVarSortMode(
         TEXT("r.GaussianSplat.SortMode"),
-        1,
+        2,
         TEXT("0 = bitonic network, 1 = UE GPU radix sort (SortGPUBuffers, 4 bits per pass), ")
-        TEXT("2 = plugin DeviceRadixSort (8 bits per pass). Mode 2 runs only on NVIDIA GPUs ")
-        TEXT("with wave size 32 unless r.GaussianSplat.RadixAllowAnyVendor is set, and falls ")
-        TEXT("back to 1 anywhere else. Values above 2 mean bitonic."),
+        TEXT("2 = plugin DeviceRadixSort (8 bits per pass, the default). Mode 2 runs only on ")
+        TEXT("NVIDIA GPUs with wave size 32 unless r.GaussianSplat.RadixAllowAnyVendor is set, ")
+        TEXT("and falls back to 1 anywhere else. Values above 2 mean bitonic."),
         ECVF_RenderThreadSafe);
 
     int32 GetSortMode()
@@ -232,11 +232,12 @@ namespace GaussianSplatProfiling
 
     static TAutoConsoleVariable<int32> CVarSortKeyBits(
         TEXT("r.GaussianSplat.SortKeyBits"),
-        20,
+        24,
         TEXT("Significant bits of the depth key (8-32). Mode 1 spends one pass per 4 bits ")
         TEXT("and rounds an odd count up to even (20 and 24 bits both take 6); mode 2 spends ")
-        TEXT("one pass per 8 bits (20 and 24 both take 3). Fewer bits means more ties: 20 was ")
-        TEXT("indistinguishable from 32 on tartu_demo, 16 was visibly wrong."),
+        TEXT("one pass per 8 bits (20 and 24 both take 3), so 24 costs no more than 20 and has ")
+        TEXT("16x finer depth steps. Fewer bits means more ties: 20 was indistinguishable from 32 ")
+        TEXT("on tartu_demo, 16 was visibly wrong."),
         ECVF_RenderThreadSafe);
 
     uint32 GetSortKeyBits()
