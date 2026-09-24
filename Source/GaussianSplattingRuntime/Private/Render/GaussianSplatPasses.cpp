@@ -1292,6 +1292,32 @@ namespace GaussianSplatLod
     }
 }
 
+// The passes bind their shaders through unconditional TShaderMapRefs, and a missing shader asserts in
+// GetShader and takes the editor down. After a compile error in one of them, draw no splats and log one
+// Error line instead (the details are under LogShaders).
+static bool HasGaussianSplatShaders()
+{
+    const FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+    const bool bHasAll = ShaderMap != nullptr
+        && ShaderMap->HasShader(&FGaussianSplatPointsCullCS::GetStaticType(), 0)
+        && ShaderMap->HasShader(&FGaussianSplatBillboardsCullCS::GetStaticType(), 0)
+        && ShaderMap->HasShader(&FGaussianSplatPointsRasterVS::GetStaticType(), 0)
+        && ShaderMap->HasShader(&FGaussianSplatPointsRasterPS::GetStaticType(), 0)
+        && ShaderMap->HasShader(&FGaussianSplatBillboardsRasterVS::GetStaticType(), 0)
+        && ShaderMap->HasShader(&FGaussianSplatBillboardsRasterPS::GetStaticType(), 0)
+        && ShaderMap->HasShader(&FGaussianSplatCompositePS::GetStaticType(), 0);
+    static bool bLoggedMissing = false;
+    if (!bHasAll && !bLoggedMissing)
+    {
+        UE_LOG(
+            LogGaussianSplatProfile,
+            Error,
+            TEXT("A Gaussian splat shader is missing (compile errors are logged under LogShaders); drawing no splats."));
+        bLoggedMissing = true;
+    }
+    return bHasAll;
+}
+
 namespace GaussianSplatPasses
 {
     FScreenPassTexture AddPostProcessPass(
@@ -1308,6 +1334,10 @@ namespace GaussianSplatPasses
         }
 
         GaussianSplatSortCheck::PollReadback();
+        if (!HasGaussianSplatShaders())
+        {
+            return SceneColor;
+        }
 
         const FIntRect ViewRect = SceneColor.ViewRect;
         const FMatrix ViewMatrixD = View.ViewMatrices.GetViewMatrix();
@@ -1980,6 +2010,16 @@ namespace GaussianSplatPasses
             }
 
             bFirstBatch = false;
+        }
+
+        // No batch drew (every cell outside the frustum, or no usable resources), so nothing wrote
+        // SplatTexture: every batch that gets past its early-outs adds a raster pass and clears
+        // bFirstBatch. The composite would then read undefined memory -- an RDG validation ensure in the
+        // editor ("... has a read dependency on GaussianSplat.SplatTexture, but it was never written
+        // to"), and whatever the transient allocator left there (typically a stale frame) without it.
+        if (bFirstBatch)
+        {
+            AddClearRenderTargetPass(GraphBuilder, SplatTexture, FLinearColor::Transparent);
         }
 
         FGaussianSplatCompositePS::FParameters* CompositeParameters = GraphBuilder.AllocParameters<FGaussianSplatCompositePS::FParameters>();
