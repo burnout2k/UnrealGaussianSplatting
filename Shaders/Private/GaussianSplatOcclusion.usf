@@ -1,0 +1,395 @@
+#include "/Engine/Public/Platform.ush"
+#include "GaussianSplatCommon.ush"
+#include "GaussianSplatCellLookup.ush"
+#include "GaussianSplatOccBox.ush"
+
+// Hidden-splat cull (r.GaussianSplat.OccPhases), drawn in phases.
+//
+// Splats blend front to back ("under"), so after any prefix of the sorted draw the target's alpha is 1 - T. The
+// draw is split into phases over the sorted list. After each phase: reduce the alpha to one "unsaturated" flag per
+// tile, build a summed-area table over the tile grid, and drop every later splat whose full-quad box covers only
+// saturated tiles (T <= 1/256 < 1/255 at every pixel it can touch). A later phase is composited behind everything
+// already drawn, so a dropped splat could have moved a pixel by at most T times its colour. The survivors are
+// compacted in order (flag bits, then a scan, then a scatter; an atomic append would break the depth order) and
+// drawn from their own order buffer.
+
+#ifndef OCC_RECOMPUTE
+#define OCC_RECOMPUTE 0
+#endif
+
+#define OCC_GROUP_SIZE 256
+#define OCC_WORDS_PER_GROUP 8
+#define OCC_SCAN_THREADS 1024
+
+// fp16 alpha at or above this is saturated: 1 - 1/256, the fp16 value just above 254/255, so T <= 1/256 < 1/255.
+static const float OCC_SATURATED_ALPHA = 0.99609375;
+
+uint OccPhaseIndex;
+uint OccPhaseCount;
+// Where phases 1..3 start, in 20ths of the visible count (2 phases: 5; 4 phases: 2, 5, 10).
+uint4 OccPhaseSplit;
+int2 OccViewRectMin;
+int2 OccViewSize;
+uint OccTileShift;
+uint OccTilesX;
+uint OccTilesY;
+uint OccNumElements;
+float OccBoxPad;
+
+// The cull's IndirectArgs; [1] is the visible count, after the sort's own clamp (what the single draw would draw).
+Buffer<uint> OccSortCount;
+Buffer<uint> OccSortedOrder;
+Texture2D<float4> OccSplatTexture;
+Buffer<uint> OccTileUnsat;
+Buffer<uint> OccTileSat;
+Buffer<uint> OccBox;
+Buffer<uint> OccCullBits;
+Buffer<uint> OccFlagWords;
+Buffer<uint> OccGroupCounts;
+Buffer<uint> OccGroupOffsets;
+RWBuffer<uint> OccDrawArgsUAV;
+RWBuffer<uint> OccDispatchArgsUAV;
+RWBuffer<uint> OccTileUnsatUAV;
+// Threads of OccSatCS read each other's rows after a barrier, so no cache may hold a stale copy.
+globallycoherent RWBuffer<uint> OccTileSatUAV;
+RWBuffer<uint> OccCullBitsUAV;
+RWBuffer<uint> OccFlagWordsUAV;
+RWBuffer<uint> OccGroupCountsUAV;
+RWBuffer<uint> OccGroupOffsetsUAV;
+RWBuffer<uint> OccCompactedUAV;
+
+uint OccPhaseStart(uint Phase, uint Visible)
+{
+    if (Phase == 0)
+    {
+        return 0;
+    }
+    if (Phase >= OccPhaseCount)
+    {
+        return Visible;
+    }
+    return (Visible * OccPhaseSplit[Phase - 1]) / 20u;
+}
+
+// One thread. Phase 0 draws the first R1 sorted instances; the later phases' draw counts are written by OccScanCS.
+// IndirectArgs[1] itself is left alone, so the profile line and the sort checks still see the visible count.
+[numthreads(1, 1, 1)]
+void OccArgsCS()
+{
+    const uint Visible = OccSortCount[1];
+    for (uint Phase = 0; Phase < 4; ++Phase)
+    {
+        const uint Start = OccPhaseStart(Phase, Visible);
+        const uint End = OccPhaseStart(Phase + 1, Visible);
+        OccDrawArgsUAV[Phase * 4 + 0] = 4;
+        OccDrawArgsUAV[Phase * 4 + 1] = (Phase == 0) ? End : 0;
+        OccDrawArgsUAV[Phase * 4 + 2] = 0;
+        OccDrawArgsUAV[Phase * 4 + 3] = 0;
+        if (Phase > 0)
+        {
+            // 16 bytes per dispatch so no argument set crosses a 64-byte boundary on any platform.
+            OccDispatchArgsUAV[(Phase - 1) * 4 + 0] = (End - Start + OCC_GROUP_SIZE - 1) / OCC_GROUP_SIZE;
+            OccDispatchArgsUAV[(Phase - 1) * 4 + 1] = 1;
+            OccDispatchArgsUAV[(Phase - 1) * 4 + 2] = 1;
+            OccDispatchArgsUAV[(Phase - 1) * 4 + 3] = 0;
+        }
+    }
+}
+
+groupshared uint GOccUnsat;
+
+// One group per tile. Pixels outside the view never receive a fragment (and every box is clipped to the view), so
+// they do not count either way; NaN counts as unsaturated.
+[numthreads(8, 8, 1)]
+void OccReduceCS(uint3 GroupId : SV_GroupID, uint3 ThreadId : SV_GroupThreadID, uint GroupIndex : SV_GroupIndex)
+{
+    if (GroupIndex == 0)
+    {
+        GOccUnsat = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint TileSize = 1u << OccTileShift;
+    uint Unsat = 0;
+    for (uint Y = ThreadId.y; Y < TileSize; Y += 8)
+    {
+        for (uint X = ThreadId.x; X < TileSize; X += 8)
+        {
+            const int2 InView = int2(GroupId.xy * TileSize + uint2(X, Y));
+            if (InView.x < OccViewSize.x && InView.y < OccViewSize.y)
+            {
+                const float Alpha = OccSplatTexture.Load(int3(OccViewRectMin + InView, 0)).a;
+                Unsat |= (Alpha >= OCC_SATURATED_ALPHA) ? 0u : 1u;
+            }
+        }
+    }
+    if (Unsat != 0)
+    {
+        InterlockedOr(GOccUnsat, 1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (GroupIndex == 0)
+    {
+        OccTileUnsatUAV[GroupId.y * OccTilesX + GroupId.x] = GOccUnsat;
+    }
+}
+
+// One group. Summed-area table of the unsaturated flags, (TilesX + 1) x (TilesY + 1) with a zero first row and
+// column: rows first, one thread per row, then columns in place, one thread per column.
+[numthreads(OCC_GROUP_SIZE, 1, 1)]
+void OccSatCS(uint GroupIndex : SV_GroupIndex)
+{
+    const uint SatStride = OccTilesX + 1;
+    for (uint ZeroColumn = GroupIndex; ZeroColumn < SatStride; ZeroColumn += OCC_GROUP_SIZE)
+    {
+        OccTileSatUAV[ZeroColumn] = 0;
+    }
+    for (uint Row = GroupIndex; Row < OccTilesY; Row += OCC_GROUP_SIZE)
+    {
+        uint RowSum = 0;
+        OccTileSatUAV[(Row + 1) * SatStride] = 0;
+        for (uint X = 0; X < OccTilesX; ++X)
+        {
+            RowSum += OccTileUnsat[Row * OccTilesX + X];
+            OccTileSatUAV[(Row + 1) * SatStride + X + 1] = RowSum;
+        }
+    }
+    DeviceMemoryBarrierWithGroupSync();
+
+    for (uint Column = GroupIndex; Column < SatStride; Column += OCC_GROUP_SIZE)
+    {
+        uint ColumnSum = 0;
+        for (uint SatRow = 1; SatRow <= OccTilesY; ++SatRow)
+        {
+            ColumnSum += OccTileSatUAV[SatRow * SatStride + Column];
+            OccTileSatUAV[SatRow * SatStride + Column] = ColumnSum;
+        }
+    }
+}
+
+// True when every tile under the box is saturated, or the box covers no pixel centre (the splat draws nothing).
+// The clamps are no-ops for real boxes; they keep the stale boxes of never-visible dispatch indices in range.
+bool IsOccTileBoxHidden(uint Box)
+{
+    const uint MinX = Box & 0xFF;
+    const uint MinY = (Box >> 8) & 0xFF;
+    const uint MaxX = min((Box >> 16) & 0xFF, OccTilesX - 1);
+    const uint MaxY = min(Box >> 24, OccTilesY - 1);
+    if (MinX > MaxX || MinY > MaxY)
+    {
+        return true;
+    }
+
+    const uint SatStride = OccTilesX + 1;
+    const uint Unsat = OccTileSat[(MaxY + 1) * SatStride + MaxX + 1]
+        - OccTileSat[MinY * SatStride + MaxX + 1]
+        - OccTileSat[(MaxY + 1) * SatStride + MinX]
+        + OccTileSat[MinY * SatStride + MinX];
+    return Unsat == 0;
+}
+
+groupshared uint GOccBits[OCC_WORDS_PER_GROUP];
+
+// Box path: one thread per dispatch index d, reading the box the cull stored at d (sequential) and writing one cull
+// bit at d. Only the d the order buffer holds are ever looked up, so the stale boxes of never-visible d do not matter.
+[numthreads(OCC_GROUP_SIZE, 1, 1)]
+void OccTestCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+    if (GroupIndex < OCC_WORDS_PER_GROUP)
+    {
+        GOccBits[GroupIndex] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint Index = GroupId.x * OCC_GROUP_SIZE + GroupIndex;
+    if (Index < OccNumElements && IsOccTileBoxHidden(OccBox[Index]))
+    {
+        InterlockedOr(GOccBits[GroupIndex >> 5], 1u << (GroupIndex & 31));
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (GroupIndex < OCC_WORDS_PER_GROUP)
+    {
+        OccCullBitsUAV[GroupId.x * OCC_WORDS_PER_GROUP + GroupIndex] = GOccBits[GroupIndex];
+    }
+}
+
+#if OCC_RECOMPUTE
+// Recompute path: the cull's inputs, to rebuild a tested splat's box exactly as IsSplatVisible does.
+uint Stride;
+float2 ViewRectMin;
+float2 ViewSize;
+float PointSize;
+float MinScreenVariance;
+float4x4 ViewMatrix;
+float4x4 ProjectionMatrix;
+float4x4 ViewProjectionMatrix;
+float4x4 LocalToWorldMatrix;
+
+// BillboardsCull.usf's ProjectToPixel, unchanged.
+float2 OccProjectToPixel(float3 WorldPos, out float SafeClipW)
+{
+    float4 Clip = mul(float4(WorldPos, 1.0), ViewProjectionMatrix);
+    SafeClipW = max(abs(Clip.w), 1e-4);
+
+    float2 Ndc = Clip.xy / SafeClipW;
+    return float2(
+        ViewRectMin.x + (Ndc.x * 0.5 + 0.5) * ViewSize.x,
+        ViewRectMin.y + (0.5 - Ndc.y * 0.5) * ViewSize.y);
+}
+
+bool IsRecomputedBoxHidden(uint DispatchIndex)
+{
+    const FSplatRef Splat = ResolveSplat(DispatchIndex, Stride);
+    const float3 CenterWS = mul(float4(DecodeSplatPosition(Splat.Index, Splat.Cell), 1.0), LocalToWorldMatrix).xyz;
+    float SafeClipW = 0.0;
+    const float2 CenterPx = OccProjectToPixel(CenterWS, SafeClipW);
+
+    float3 Cov3D0;
+    float3 Cov3D1;
+    DecodeSplatCovariance(Splat.Index, PointSize * 0.35, Cov3D0, Cov3D1);
+    float3 Cov2D = CalcCovariance2D(
+        CenterWS,
+        Cov3D0,
+        Cov3D1,
+        LocalToWorldMatrix,
+        ViewMatrix,
+        ProjectionMatrix,
+        ViewSize);
+    Cov2D.x = max(Cov2D.x, MinScreenVariance);
+    Cov2D.z = max(Cov2D.z, MinScreenVariance);
+
+    float2 Axis0;
+    float2 Axis1;
+    BuildEllipseAxes(Cov2D, Axis0, Axis1);
+    return IsOccTileBoxHidden(PackOccTileBox(CenterPx, Axis0, Axis1, ViewRectMin, ViewSize, OccTileShift, OccBoxPad));
+}
+#endif
+
+groupshared uint GOccKeep[OCC_WORDS_PER_GROUP];
+
+// One thread per sorted slot of this phase (indirect). Writes a keep bit per slot, in slot order, and the number
+// kept per group of 256 slots.
+[numthreads(OCC_GROUP_SIZE, 1, 1)]
+void OccFlagCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+    if (GroupIndex < OCC_WORDS_PER_GROUP)
+    {
+        GOccKeep[GroupIndex] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint Visible = OccSortCount[1];
+    const uint Start = OccPhaseStart(OccPhaseIndex, Visible);
+    const uint End = OccPhaseStart(OccPhaseIndex + 1, Visible);
+    const uint Slot = Start + GroupId.x * OCC_GROUP_SIZE + GroupIndex;
+    if (Slot < End)
+    {
+        const uint DispatchIndex = OccSortedOrder[Slot];
+#if OCC_RECOMPUTE
+        const bool bHidden = IsRecomputedBoxHidden(DispatchIndex);
+#else
+        const bool bHidden = ((OccCullBits[DispatchIndex >> 5] >> (DispatchIndex & 31)) & 1u) != 0;
+#endif
+        if (!bHidden)
+        {
+            InterlockedOr(GOccKeep[GroupIndex >> 5], 1u << (GroupIndex & 31));
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (GroupIndex < OCC_WORDS_PER_GROUP)
+    {
+        OccFlagWordsUAV[GroupId.x * OCC_WORDS_PER_GROUP + GroupIndex] = GOccKeep[GroupIndex];
+    }
+    if (GroupIndex == 0)
+    {
+        uint Count = 0;
+        for (uint KeepWord = 0; KeepWord < OCC_WORDS_PER_GROUP; ++KeepWord)
+        {
+            Count += countbits(GOccKeep[KeepWord]);
+        }
+        OccGroupCountsUAV[GroupId.x] = Count;
+    }
+}
+
+groupshared uint GOccScan[OCC_SCAN_THREADS];
+
+// One group. Exclusive scan of the per-group kept counts (each thread takes a contiguous run of groups), and this
+// phase's draw count.
+[numthreads(OCC_SCAN_THREADS, 1, 1)]
+void OccScanCS(uint GroupIndex : SV_GroupIndex)
+{
+    const uint Visible = OccSortCount[1];
+    const uint Start = OccPhaseStart(OccPhaseIndex, Visible);
+    const uint End = OccPhaseStart(OccPhaseIndex + 1, Visible);
+    const uint NumGroups = (End - Start + OCC_GROUP_SIZE - 1) / OCC_GROUP_SIZE;
+    const uint PerThread = (NumGroups + OCC_SCAN_THREADS - 1) / OCC_SCAN_THREADS;
+    const uint First = GroupIndex * PerThread;
+    const uint Last = min(First + PerThread, NumGroups);
+
+    uint Sum = 0;
+    for (uint SumGroup = First; SumGroup < Last; ++SumGroup)
+    {
+        Sum += OccGroupCounts[SumGroup];
+    }
+    GOccScan[GroupIndex] = Sum;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint Offset = 1; Offset < OCC_SCAN_THREADS; Offset <<= 1)
+    {
+        const uint Add = (GroupIndex >= Offset) ? GOccScan[GroupIndex - Offset] : 0;
+        GroupMemoryBarrierWithGroupSync();
+        GOccScan[GroupIndex] += Add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    uint Running = GOccScan[GroupIndex] - Sum;
+    for (uint Group = First; Group < Last; ++Group)
+    {
+        OccGroupOffsetsUAV[Group] = Running;
+        Running += OccGroupCounts[Group];
+    }
+    if (GroupIndex == OCC_SCAN_THREADS - 1)
+    {
+        OccDrawArgsUAV[OccPhaseIndex * 4 + 1] = GOccScan[GroupIndex];
+    }
+}
+
+groupshared uint GOccWordPrefix[OCC_WORDS_PER_GROUP];
+
+// One thread per sorted slot of this phase (indirect): each kept slot copies its dispatch index to its rank among
+// the kept ones, so the compacted list keeps the depth order.
+[numthreads(OCC_GROUP_SIZE, 1, 1)]
+void OccScatterCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+    if (GroupIndex == 0)
+    {
+        uint Running = 0;
+        for (uint PrefixWord = 0; PrefixWord < OCC_WORDS_PER_GROUP; ++PrefixWord)
+        {
+            GOccWordPrefix[PrefixWord] = Running;
+            Running += countbits(OccFlagWords[GroupId.x * OCC_WORDS_PER_GROUP + PrefixWord]);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint Visible = OccSortCount[1];
+    const uint Start = OccPhaseStart(OccPhaseIndex, Visible);
+    const uint End = OccPhaseStart(OccPhaseIndex + 1, Visible);
+    const uint Slot = Start + GroupId.x * OCC_GROUP_SIZE + GroupIndex;
+    if (Slot >= End)
+    {
+        return;
+    }
+
+    const uint Word = OccFlagWords[GroupId.x * OCC_WORDS_PER_GROUP + (GroupIndex >> 5)];
+    const uint Bit = 1u << (GroupIndex & 31);
+    if ((Word & Bit) == 0)
+    {
+        return;
+    }
+    const uint Dest = OccGroupOffsets[GroupId.x] + GOccWordPrefix[GroupIndex >> 5] + countbits(Word & (Bit - 1u));
+    OccCompactedUAV[Dest] = OccSortedOrder[Slot];
+}

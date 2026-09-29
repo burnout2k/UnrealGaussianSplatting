@@ -82,7 +82,22 @@ public:
         SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, SplatOrderBufferUAV)
         SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, SplatKeyBufferUAV)
         SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, SplatIndirectArgsUAV)
+        // OCC_BOX permutation only (the hidden-splat cull's box path).
+        SHADER_PARAMETER(uint32, OccTileShift)
+        SHADER_PARAMETER(float, OccBoxPad)
+        SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OccBoxUAV)
     END_SHADER_PARAMETER_STRUCT()
+
+    // 1 = also store each visible splat's full-quad tile box for the hidden-splat cull's box path. Permutation 0 is the
+    // plain cull, and the only one the bitonic passes use. Vulkan only, like the hidden-splat cull.
+    class FOccBoxDim : SHADER_PERMUTATION_BOOL("OCC_BOX");
+    using FPermutationDomain = TShaderPermutationDomain<FOccBoxDim>;
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        const FPermutationDomain PermutationVector(Parameters.PermutationId);
+        return !PermutationVector.Get<FOccBoxDim>() || IsVulkanPlatform(Parameters.Platform);
+    }
 };
 
 class FGaussianSplatPointsRasterVS final : public FGlobalShader
@@ -337,4 +352,135 @@ public:
     DECLARE_GLOBAL_SHADER(FGaussianSplatSortSelfCheckCS);
     SHADER_USE_PARAMETER_STRUCT(FGaussianSplatSortSelfCheckCS, FGaussianSplatSortValidateCS);
     using FParameters = FGaussianSplatSortValidateParameters;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Hidden-splat cull (r.GaussianSplat.OccPhases, GaussianSplatOcclusion.usf).
+
+// One struct for every occlusion kernel; each pass binds only what its kernel reads. Buffers are typed
+// (PF_R32_UINT) like the sort's.
+BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatOcclusionParameters, )
+    SHADER_PARAMETER(uint32, OccPhaseIndex)
+    SHADER_PARAMETER(uint32, OccPhaseCount)
+    SHADER_PARAMETER(FUintVector4, OccPhaseSplit)
+    SHADER_PARAMETER(FIntPoint, OccViewRectMin)
+    SHADER_PARAMETER(FIntPoint, OccViewSize)
+    SHADER_PARAMETER(uint32, OccTileShift)
+    SHADER_PARAMETER(uint32, OccTilesX)
+    SHADER_PARAMETER(uint32, OccTilesY)
+    SHADER_PARAMETER(uint32, OccNumElements)
+    SHADER_PARAMETER(float, OccBoxPad)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, OccSortCount)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, OccSortedOrder)
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, OccSplatTexture)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, OccTileUnsat)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, OccTileSat)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, OccBox)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, OccCullBits)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, OccFlagWords)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, OccGroupCounts)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, OccGroupOffsets)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OccDrawArgsUAV)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OccDispatchArgsUAV)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OccTileUnsatUAV)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OccTileSatUAV)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OccCullBitsUAV)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OccFlagWordsUAV)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OccGroupCountsUAV)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OccGroupOffsetsUAV)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OccCompactedUAV)
+    RDG_BUFFER_ACCESS(OccIndirectArgs, ERHIAccess::IndirectArgs)
+    // Recompute path only (OccFlagCS with OCC_RECOMPUTE): the cull's inputs, to rebuild each tested splat's box.
+    SHADER_PARAMETER(uint32, Stride)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, SplatCellRanges)
+    SHADER_PARAMETER(uint32, SplatCellCount)
+    SHADER_PARAMETER_SRV(StructuredBuffer<uint4>, SplatPackedA)
+    SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatCellBounds)
+    SHADER_PARAMETER(FVector2f, ViewRectMin)
+    SHADER_PARAMETER(FVector2f, ViewSize)
+    SHADER_PARAMETER(float, PointSize)
+    SHADER_PARAMETER(float, MinScreenVariance)
+    SHADER_PARAMETER(FMatrix44f, ViewMatrix)
+    SHADER_PARAMETER(FMatrix44f, ProjectionMatrix)
+    SHADER_PARAMETER(FMatrix44f, ViewProjectionMatrix)
+    SHADER_PARAMETER(FMatrix44f, LocalToWorldMatrix)
+END_SHADER_PARAMETER_STRUCT()
+
+// Vulkan only, like mode 2: the only platform the hidden-splat cull is validated on. The passes check that every
+// kernel exists before using any of them and otherwise draw in one pass, as with OccPhases 0.
+class FGaussianSplatOcclusionCS : public FGlobalShader
+{
+public:
+    FGaussianSplatOcclusionCS() = default;
+    FGaussianSplatOcclusionCS(const ShaderMetaType::CompiledShaderInitializerType& Initializer)
+        : FGlobalShader(Initializer)
+    {
+    }
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsVulkanPlatform(Parameters.Platform)
+            && IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+};
+
+class FGaussianSplatOccArgsCS final : public FGaussianSplatOcclusionCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatOccArgsCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatOccArgsCS, FGaussianSplatOcclusionCS);
+    using FParameters = FGaussianSplatOcclusionParameters;
+};
+
+class FGaussianSplatOccReduceCS final : public FGaussianSplatOcclusionCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatOccReduceCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatOccReduceCS, FGaussianSplatOcclusionCS);
+    using FParameters = FGaussianSplatOcclusionParameters;
+};
+
+class FGaussianSplatOccSatCS final : public FGaussianSplatOcclusionCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatOccSatCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatOccSatCS, FGaussianSplatOcclusionCS);
+    using FParameters = FGaussianSplatOcclusionParameters;
+};
+
+class FGaussianSplatOccTestCS final : public FGaussianSplatOcclusionCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatOccTestCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatOccTestCS, FGaussianSplatOcclusionCS);
+    using FParameters = FGaussianSplatOcclusionParameters;
+};
+
+class FGaussianSplatOccFlagCS final : public FGaussianSplatOcclusionCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatOccFlagCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatOccFlagCS, FGaussianSplatOcclusionCS);
+    using FParameters = FGaussianSplatOcclusionParameters;
+
+    // 0 = the box path (read the cull bit the test wrote at the dispatch index), 1 = the recompute path
+    // (rebuild the splat's box from its data). r.GaussianSplat.OccTestPath picks one.
+    class FRecomputeDim : SHADER_PERMUTATION_BOOL("OCC_RECOMPUTE");
+    using FPermutationDomain = TShaderPermutationDomain<FRecomputeDim>;
+};
+
+class FGaussianSplatOccScanCS final : public FGaussianSplatOcclusionCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatOccScanCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatOccScanCS, FGaussianSplatOcclusionCS);
+    using FParameters = FGaussianSplatOcclusionParameters;
+};
+
+class FGaussianSplatOccScatterCS final : public FGaussianSplatOcclusionCS
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatOccScatterCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatOccScatterCS, FGaussianSplatOcclusionCS);
+    using FParameters = FGaussianSplatOcclusionParameters;
 };

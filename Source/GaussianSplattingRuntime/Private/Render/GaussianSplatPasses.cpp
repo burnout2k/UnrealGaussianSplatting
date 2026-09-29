@@ -28,6 +28,7 @@ DECLARE_GPU_STAT_NAMED(GaussianSplatCull, TEXT("GaussianSplat/Cull"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatSort, TEXT("GaussianSplat/Sort"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatRaster, TEXT("GaussianSplat/Raster"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatComposite, TEXT("GaussianSplat/Composite"));
+DECLARE_GPU_STAT_NAMED(GaussianSplatOcc, TEXT("GaussianSplat/Occ"));
 
 
 namespace GaussianSplatProfiling
@@ -38,11 +39,41 @@ namespace GaussianSplatProfiling
     // is actually on screen. Copy that counter to the CPU a few frames late.
     static constexpr int32 NumReadbackSlots = 4;
 
+    // The hidden-splat cull's per-phase draw arguments: four phases of four uints (the instance count is the second).
+    static constexpr uint32 OccMaxPhases = 4;
+    static constexpr uint32 OccDrawArgsCount = OccMaxPhases * 4;
+
+    // What the profile line reports about the LOD selection. Mode 1's fields stay 0 in mode 0.
+    struct FLodStats
+    {
+        int32 Mode = 0;
+        float K = 0.0f;
+        double Multiplier = 1.0;
+        double FocalPx = 0.0;
+        double FullDistance = 0.0;
+        double SelectMicros = 0.0;
+    };
+
+    // The hidden-splat cull on the batch whose visible count the readback carries: its phase draw arguments, copied
+    // along.
+    struct FOccReadback
+    {
+        FRDGBufferRef DrawArgs = nullptr;
+        int32 Phases = 0;
+        bool bBoxPath = false;
+    };
+
     struct FVisibleCountState
     {
         TUniquePtr<FRHIGPUBufferReadback> Slots[NumReadbackSlots];
+        TUniquePtr<FRHIGPUBufferReadback> OccSlots[NumReadbackSlots];
+        int32 OccPhasesInSlot[NumReadbackSlots] = {};
+        bool OccBoxPathInSlot[NumReadbackSlots] = {};
         int32 WriteSlot = 0;
         uint32 LastVisibleCount = 0;
+        int32 LastOccPhases = 0;
+        bool bLastOccBoxPath = false;
+        uint32 LastOccKept[OccMaxPhases] = {};
         uint32 FrameCounter = 0;
 
         // Budget feedback (Cesium's trick): the multiplier applied to every
@@ -73,20 +104,42 @@ namespace GaussianSplatProfiling
         uint32 SelectedCells,
         uint32 ViewKey,
         const TCHAR* SortModeLabel,
-        int32 BatchIndex)
+        int32 BatchIndex,
+        const FIntRect& ViewRect,
+        const FLodStats& LodStats,
+        const FOccReadback& Occ)
     {
         FVisibleCountState& State = GetViewState(ViewKey);
         const uint32 IndirectArgsBytes = 4 * sizeof(uint32);
+        const uint32 OccDrawArgsBytes = OccDrawArgsCount * sizeof(uint32);
 
-        // Drain the oldest slot before reusing it, so this never stalls the GPU.
+        // Drain the oldest slot before reusing it, so this never stalls the GPU. The cull's copy is enqueued in the
+        // same frame, so both are read together or not at all.
         const int32 ReadSlot = (State.WriteSlot + 1) % NumReadbackSlots;
-        if (State.Slots[ReadSlot].IsValid() && State.Slots[ReadSlot]->IsReady())
+        const bool bOccInSlot = State.OccPhasesInSlot[ReadSlot] > 0 && State.OccSlots[ReadSlot].IsValid();
+        if (State.Slots[ReadSlot].IsValid() && State.Slots[ReadSlot]->IsReady()
+            && (!bOccInSlot || State.OccSlots[ReadSlot]->IsReady()))
         {
             if (const uint32* Data = static_cast<const uint32*>(State.Slots[ReadSlot]->Lock(IndirectArgsBytes)))
             {
                 State.LastVisibleCount = Data[1];
             }
             State.Slots[ReadSlot]->Unlock();
+
+            State.LastOccPhases = 0;
+            if (bOccInSlot)
+            {
+                if (const uint32* Data = static_cast<const uint32*>(State.OccSlots[ReadSlot]->Lock(OccDrawArgsBytes)))
+                {
+                    for (uint32 Phase = 0; Phase < OccMaxPhases; ++Phase)
+                    {
+                        State.LastOccKept[Phase] = Data[Phase * 4 + 1];
+                    }
+                    State.LastOccPhases = State.OccPhasesInSlot[ReadSlot];
+                    State.bLastOccBoxPath = State.OccBoxPathInSlot[ReadSlot];
+                }
+                State.OccSlots[ReadSlot]->Unlock();
+            }
         }
 
         if (!State.Slots[State.WriteSlot].IsValid())
@@ -94,17 +147,56 @@ namespace GaussianSplatProfiling
             State.Slots[State.WriteSlot] = MakeUnique<FRHIGPUBufferReadback>(TEXT("GaussianSplat.VisibleCount"));
         }
         AddEnqueueCopyPass(GraphBuilder, State.Slots[State.WriteSlot].Get(), IndirectArgsBuffer, IndirectArgsBytes);
+        State.OccPhasesInSlot[State.WriteSlot] = 0;
+        if (Occ.DrawArgs != nullptr && Occ.Phases > 0)
+        {
+            if (!State.OccSlots[State.WriteSlot].IsValid())
+            {
+                State.OccSlots[State.WriteSlot] = MakeUnique<FRHIGPUBufferReadback>(TEXT("GaussianSplat.OccDrawArgs"));
+            }
+            AddEnqueueCopyPass(GraphBuilder, State.OccSlots[State.WriteSlot].Get(), Occ.DrawArgs, OccDrawArgsBytes);
+            State.OccPhasesInSlot[State.WriteSlot] = Occ.Phases;
+            State.OccBoxPathInSlot[State.WriteSlot] = Occ.bBoxPath;
+        }
         State.WriteSlot = (State.WriteSlot + 1) % NumReadbackSlots;
 
         if ((State.FrameCounter++ % 60) == 0 && State.LastVisibleCount > 0)
         {
             const float VisiblePercent = 100.0f * static_cast<float>(State.LastVisibleCount) /
                 static_cast<float>(FMath::Max(1u, SelectedCount));
+            // Appended fields only, so parsers of the older line keep working. rect is the view's pixel size; the occ
+            // counts are the instances each phase drew, from the same frame as visible.
+            const FString LodText = LodStats.Mode == 1
+                ? FString::Printf(TEXT(" k %.3f m %.4f focal %.1f d_full %.0f"),
+                    LodStats.K, LodStats.Multiplier, LodStats.FocalPx, LodStats.FullDistance)
+                : FString();
+            FString OccText;
+            if (State.LastOccPhases > 0)
+            {
+                uint64 Kept = 0;
+                for (int32 Phase = 0; Phase < State.LastOccPhases; ++Phase)
+                {
+                    Kept += State.LastOccKept[Phase];
+                }
+                const uint64 Culled = State.LastVisibleCount > Kept ? State.LastVisibleCount - Kept : 0;
+                OccText = FString::Printf(
+                    TEXT(" | occ %d phases %s path kept %u+%u+%u+%u of %u culled %llu (%.1f%%)"),
+                    State.LastOccPhases,
+                    State.bLastOccBoxPath ? TEXT("box") : TEXT("recompute"),
+                    State.LastOccKept[0],
+                    State.LastOccKept[1],
+                    State.LastOccKept[2],
+                    State.LastOccKept[3],
+                    State.LastVisibleCount,
+                    Culled,
+                    100.0 * static_cast<double>(Culled) / static_cast<double>(FMath::Max(1u, State.LastVisibleCount)));
+            }
             UE_LOG(
                 LogGaussianSplatProfile,
                 Display,
                 TEXT("view %u: lod selected %u of %u budget (%.0f MiB sort scratch) ")
-                TEXT("across %u cells | visible=%u (%.1f%% of selected) | sort mode %s | batch %d"),
+                TEXT("across %u cells | visible=%u (%.1f%% of selected) | sort mode %s | batch %d")
+                TEXT(" | rect %dx%d | lod mode %d%s | select %.0f us%s"),
                 ViewKey,
                 SelectedCount,
                 RenderPointCount,
@@ -116,7 +208,13 @@ namespace GaussianSplatProfiling
                 State.LastVisibleCount,
                 VisiblePercent,
                 SortModeLabel,
-                BatchIndex);
+                BatchIndex,
+                ViewRect.Width(),
+                ViewRect.Height(),
+                LodStats.Mode,
+                *LodText,
+                LodStats.SelectMicros,
+                *OccText);
         }
     }
 
@@ -200,6 +298,109 @@ namespace GaussianSplatProfiling
         TEXT("1 = per-cell frustum culling and distance LOD, 0 = draw every ")
         TEXT("resident splat (the pre-cell behaviour, for A/B)."),
         ECVF_RenderThreadSafe);
+
+    // Screen-space LOD: the full-detail distance from each view's own resolution instead of one world distance.
+    // Mode 0 is the distance LOD from LodFullDistance, unchanged.
+    static TAutoConsoleVariable<int32> CVarLodMode(
+        TEXT("r.GaussianSplat.LodMode"),
+        0,
+        TEXT("0 = distance LOD from LodFullDistance with a budget-feedback bias. 1 = screen-space: every ")
+        TEXT("visible cell keeps all its splats out to d_full = LodScreenK x focal (px) x 0.35 x PointSize x s_ref x ")
+        TEXT("actor scale (at least LodMinFullDistance) and (d_full / d)^2 of them beyond, with no feedback state; a ")
+        TEXT("binding MaxRenderPoints thins the far cells first. Other values mean 0."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<float> CVarLodScreenK(
+        TEXT("r.GaussianSplat.LodScreenK"),
+        2.6f,
+        TEXT("LodMode 1: 1 = full detail ends where the median splat's largest axis (s_ref, logged at upload) projects ")
+        TEXT("to one pixel; 2 = twice as far. 2.6 matches LodFullDistance 1400 on a 1625 px wide, 90 degree view of a ")
+        TEXT("capture whose median splat is 12.6 mm across (full detail to 28 m)."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<float> CVarLodMinFullDistance(
+        TEXT("r.GaussianSplat.LodMinFullDistance"),
+        2000.0f,
+        TEXT("LodMode 1: floor on d_full in world units, so every cell within it stays whole for any camera, including ")
+        TEXT("low-resolution sensors. 2000 = 20 m."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<float> CVarLodCullMargin(
+        TEXT("r.GaussianSplat.LodCullMargin"),
+        3.0f,
+        TEXT("LodMode 1: the cell frustum test grows each cell box by this many sigma of the 99th-percentile splat ")
+        TEXT("(0.35 x PointSize x s_p99), so splats centred just outside the view still draw. The distance still uses ")
+        TEXT("the plain box. 0 = centre-only boxes, as mode 0."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<float> CVarLodDebugHalfFullDistance(
+        TEXT("r.GaussianSplat.LodDebugHalfFullDistance"),
+        0.0f,
+        TEXT("Debug, LodMode 1: > 0 uses this (world units) in place of d_full / 2, so with LodMinFullDistance 0 and ")
+        TEXT("LodCullMargin 0 mode 1 selects exactly what LodFullDistance of the same value selects once the bias has ")
+        TEXT("saturated, for checking mode 1 against mode 0. 0 = off."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<int32> CVarLodLogNext(
+        TEXT("r.GaussianSplat.LodLogNext"),
+        0,
+        TEXT("Debug, LodMode 1: N > 0 logs the next N selections of every view and batch (focal, d_full, budget ")
+        TEXT("multiplier, counts, time). Set 0 and then N again to re-arm."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<int32> CVarLodDumpCells(
+        TEXT("r.GaussianSplat.LodDumpCells"),
+        0,
+        TEXT("Debug, LodMode 1: when set to a new value > 0, logs every selected cell's distance, fraction and take ")
+        TEXT("for one frame, in every view and batch."),
+        ECVF_RenderThreadSafe);
+
+    int32 GetLodMode()
+    {
+        return CVarLodMode.GetValueOnRenderThread() == 1 ? 1 : 0;
+    }
+
+    // Hidden-splat cull: skip splats drawn behind pixels that earlier splats already made opaque.
+    static TAutoConsoleVariable<int32> CVarOccPhases(
+        TEXT("r.GaussianSplat.OccPhases"),
+        0,
+        TEXT("Hidden-splat cull, billboards only. 0 = one draw. 2 = draw the nearest 25% of the ")
+        TEXT("sorted splats, then drop every later splat whose quad covers only tiles already opaque (T <= 1/256) and ")
+        TEXT("draw the rest. 4 = phases at 10/25/50%. Other values mean 0. Vulkan only; it keeps the single draw ")
+        TEXT("wherever its shaders are missing."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<int32> CVarOccTestPath(
+        TEXT("r.GaussianSplat.OccTestPath"),
+        1,
+        TEXT("Hidden-splat cull: 1 = the box path (the cull stores each visible splat's tile box, 4 B per budget ")
+        TEXT("splat per view and batch, and a sequential pass tests it); 0 = the recompute path (the test rebuilds ")
+        TEXT("each box from the splat in sorted order, no extra buffer)."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<float> CVarOccBoxPad(
+        TEXT("r.GaussianSplat.OccBoxPad"),
+        1.0f,
+        TEXT("Debug, hidden-splat cull: pixels added to every side of each tested box, to absorb float and ")
+        TEXT("vertex-snapping differences between the test and the vertex shader. Larger only culls less; at least ")
+        TEXT("0.05, which covers the vertex snapping and the NDC round trip."),
+        ECVF_RenderThreadSafe);
+
+    int32 GetOccPhases()
+    {
+        const int32 Phases = CVarOccPhases.GetValueOnRenderThread();
+        return (Phases == 2 || Phases == 4) ? Phases : 0;
+    }
+
+    bool ShouldUseOccBoxPath()
+    {
+        return CVarOccTestPath.GetValueOnRenderThread() != 0;
+    }
+
+    float GetOccBoxPad()
+    {
+        return FMath::Clamp(CVarOccBoxPad.GetValueOnRenderThread(), 0.05f, 64.0f);
+    }
 
     // A/B measurement switch. The bitonic sort records 253 dispatches per frame
     // at full density, and per-pass barriers are suspected to dominate over the
@@ -1283,11 +1484,329 @@ namespace GaussianSplatLod
         Out.TotalCount = Prefix;
 
         // Cesium's feedback loop. Tighten immediately when over budget, relax
-        // slowly when under, so it settles rather than oscillating.
+        // slowly when under, so it settles rather than oscillating. The bias
+        // never tightens while the selection fits: it grows 5% a frame up to 4,
+        // which is why a settled view keeps everything out to 2 x LodFullDistance.
         if (Out.TotalCount > 0)
         {
             const float Desired = static_cast<float>(Budget) / static_cast<float>(Out.TotalCount);
             InOutBias = FMath::Clamp(Bias * FMath::Min(Desired, 1.05f), 0.001f, 4.0f);
+        }
+    }
+
+    // r.GaussianSplat.LodMode 1's per-view inputs.
+    struct FScreenLodInputs
+    {
+        // P[0][0] x ViewRect width / 2; 0 for an orthographic view.
+        double FocalPx = 0.0;
+        double ActorScale = 1.0;
+        float PointSize = 1.0f;
+        float SizeRef = 0.0f;
+        float SizeP99 = 0.0f;
+        // Points mode and orthographic views keep whole cells; only the budget clamp applies.
+        bool bFullCells = false;
+        uint32 ViewKey = 0;
+        int32 BatchIndex = 0;
+        FIntRect ViewRect;
+    };
+
+    // Screen-space per-cell keep, without feedback state. Each visible cell keeps
+    // clamp(min(1, (d_full / d)^2), LodMinFraction, 1) of its importance-ordered prefix, with d_full from the view's
+    // own focal length and the asset's median splat size, so a 800 px sensor stops full detail at half the distance
+    // of a 1600 px one. d is measured to the plain cell box, as mode 0 does; only the frustum test uses the box grown
+    // by LodCullMargin.
+    //
+    // The take is mode 0's expression with its types and multiplication order: Bias 4 (mode 0's saturated value)
+    // times the double falloff (F'/max(d, F'))^2, cast to float, with F' = d_full / 2. So LodDebugHalfFullDistance
+    // F selects exactly what LodFullDistance F selects after the bias has settled. Over budget, a bisection
+    // lowers one multiplier m on d_full, which thins the far cells first; mode 0's uniform clamp stays behind it as
+    // the last safety net, and drops the one-splat floor when there are more visible cells than budget (the sort
+    // buffers hold only the budget, and the cull does not check).
+    void SelectCellsScreen(
+        const TArray<FGaussianSplatCell>& Cells,
+        const FMatrix44f& LocalToWorld,
+        const FSceneView& View,
+        uint32 Budget,
+        const FScreenLodInputs& In,
+        FSelection& Out,
+        GaussianSplatProfiling::FLodStats& Stats)
+    {
+        Out.Ranges.Reset();
+        Out.Ranges.SetNumZeroed(FMath::Max(1, Cells.Num()));
+        Out.CellCount = 0;
+        Out.TotalCount = 0;
+        Stats.Mode = 1;
+
+        if (Cells.IsEmpty() || Budget == 0)
+        {
+            return;
+        }
+
+        const FMatrix ToWorld(LocalToWorld);
+        const FVector ViewOrigin = View.ViewMatrices.GetViewOrigin();
+        const FVector ViewForward = View.GetViewDirection();
+        // As mode 0: r.GaussianSplat.Lod 0 keeps every visible cell whole.
+        const float MinFraction =
+            (GaussianSplatProfiling::CVarLodEnabled.GetValueOnRenderThread() != 0)
+                ? FMath::Clamp(GaussianSplatProfiling::CVarLodMinFraction.GetValueOnRenderThread(), 0.0f, 1.0f)
+                : 1.0f;
+        const float K = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodScreenK.GetValueOnRenderThread());
+        const float MinFull = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodMinFullDistance.GetValueOnRenderThread());
+        const float DebugHalf = GaussianSplatProfiling::CVarLodDebugHalfFullDistance.GetValueOnRenderThread();
+        // Local (asset) units, like the cell bounds it grows.
+        const double Margin = static_cast<double>(FMath::Max(0.0f, GaussianSplatProfiling::CVarLodCullMargin.GetValueOnRenderThread()))
+            * 0.35 * static_cast<double>(In.PointSize) * static_cast<double>(In.SizeP99);
+
+        // F' = d_full / 2 at m = 1. The debug value goes through the same float Max and widening as mode 0's
+        // FullDistance, so the two modes compare identical doubles.
+        double HalfFull = DebugHalf > 0.0f
+            ? static_cast<double>(FMath::Max(1.0f, DebugHalf))
+            : 0.5 * (static_cast<double>(K) * In.FocalPx * 0.35 * static_cast<double>(In.PointSize)
+                * static_cast<double>(In.SizeRef) * In.ActorScale);
+        HalfFull = FMath::Max(HalfFull, 0.5 * static_cast<double>(MinFull));
+        HalfFull = FMath::Max(HalfFull, 1.0);
+
+        struct FCandidate
+        {
+            int32 CellIndex = 0;
+            double Distance = 0.0;
+        };
+        TArray<FCandidate> Candidates;
+        Candidates.Reserve(Cells.Num());
+        for (int32 CellIndex = 0; CellIndex < Cells.Num(); ++CellIndex)
+        {
+            const FGaussianSplatCell& Cell = Cells[CellIndex];
+            if (Cell.Count <= 0)
+            {
+                continue;
+            }
+
+            const FBox LocalBox(FVector(Cell.BoundsMin), FVector(Cell.BoundsMax));
+            const FBox WorldBox = LocalBox.TransformBy(ToWorld);
+            const FBox CullBox = Margin > 0.0 ? LocalBox.ExpandBy(Margin).TransformBy(ToWorld) : WorldBox;
+            if (!View.ViewFrustum.IntersectBox(CullBox.GetCenter(), CullBox.GetExtent()))
+            {
+                continue;
+            }
+            // The grown box would also reach back through the frustum's near plane, which sits at the camera, and
+            // take whole cells behind it: the cull rejects every splat at depth <= 0, so a cell whose plain box lies
+            // entirely behind the camera draws nothing (at street, one 1.49M-splat cell for 2,949 visible splats).
+            if (Margin > 0.0
+                && FVector::DotProduct(WorldBox.GetCenter() - ViewOrigin, ViewForward)
+                    + FVector::DotProduct(WorldBox.GetExtent(), ViewForward.GetAbs()) <= 0.0)
+            {
+                continue;
+            }
+            Candidates.Add({CellIndex,
+                FMath::Sqrt(ComputeSquaredDistanceFromBoxToPoint(WorldBox.Min, WorldBox.Max, ViewOrigin))});
+        }
+
+        const float Bias = 4.0f;
+        const auto TakeAt = [&Cells, &In, MinFraction, Bias](const FCandidate& Candidate, double FullDistance) -> uint32
+        {
+            const FGaussianSplatCell& Cell = Cells[Candidate.CellIndex];
+            if (In.bFullCells)
+            {
+                return static_cast<uint32>(Cell.Count);
+            }
+            const double Distance = FMath::Max(Candidate.Distance, FullDistance);
+            const double Falloff = (FullDistance / Distance) * (FullDistance / Distance);
+            const float Fraction = FMath::Clamp(static_cast<float>(Bias * Falloff), MinFraction, 1.0f);
+            return static_cast<uint32>(
+                FMath::Clamp(FMath::RoundToInt(Cell.Count * Fraction), 1, Cell.Count));
+        };
+        const auto TotalAt = [&Candidates, &TakeAt](double FullDistance) -> uint64
+        {
+            uint64 Sum = 0;
+            for (const FCandidate& Candidate : Candidates)
+            {
+                Sum += TakeAt(Candidate, FullDistance);
+            }
+            return Sum;
+        };
+
+        // Budget: the largest m (to 2^-20 in 20 halvings) whose selection fits.
+        double Multiplier = 1.0;
+        if (!In.bFullCells && TotalAt(HalfFull) > Budget)
+        {
+            constexpr double MinMultiplier = 1.0 / 1048576.0;
+            if (TotalAt(HalfFull * MinMultiplier) > Budget)
+            {
+                Multiplier = MinMultiplier;
+            }
+            else
+            {
+                double Fits = MinMultiplier;
+                double Over = 1.0;
+                for (int32 Pass = 0; Pass < 20; ++Pass)
+                {
+                    const double Mid = 0.5 * (Fits + Over);
+                    if (TotalAt(HalfFull * Mid) <= Budget)
+                    {
+                        Fits = Mid;
+                    }
+                    else
+                    {
+                        Over = Mid;
+                    }
+                }
+                Multiplier = Fits;
+            }
+        }
+
+        TArray<uint32> Takes;
+        Takes.Reserve(Candidates.Num());
+        uint64 Total = 0;
+        for (const FCandidate& Candidate : Candidates)
+        {
+            Takes.Add(TakeAt(Candidate, HalfFull * Multiplier));
+            Total += Takes.Last();
+        }
+
+        // Mode 0's clamp, the last safety net. Only a selection that still overflows at the smallest m, or whole
+        // cells, gets here.
+        if (Total > Budget && static_cast<uint64>(Takes.Num()) <= Budget)
+        {
+            const double Scale = static_cast<double>(Budget) / static_cast<double>(Total);
+            Total = 0;
+            for (uint32& Take : Takes)
+            {
+                Take = static_cast<uint32>(FMath::Max<int64>(1, FMath::RoundToInt(Take * Scale)));
+                Total += Take;
+            }
+            for (int32 Index = Takes.Num() - 1; Index >= 0 && Total > Budget; --Index)
+            {
+                const uint32 Drop = static_cast<uint32>(FMath::Min<uint64>(Takes[Index] - 1, Total - Budget));
+                Takes[Index] -= Drop;
+                Total -= Drop;
+            }
+        }
+        else if (Total > Budget)
+        {
+            // More visible cells than budget, so the one-splat floor cannot hold (the sort buffers hold only the
+            // budget and the cull does not check). A uniform scale would round every take to 0 and draw nothing, so
+            // the budget goes to the nearest cells instead, each up to its take.
+            TArray<int32> ByDistance;
+            ByDistance.Reserve(Candidates.Num());
+            for (int32 Index = 0; Index < Candidates.Num(); ++Index)
+            {
+                ByDistance.Add(Index);
+            }
+            ByDistance.Sort([&Candidates](int32 A, int32 B)
+            {
+                return Candidates[A].Distance != Candidates[B].Distance
+                    ? Candidates[A].Distance < Candidates[B].Distance
+                    : A < B;
+            });
+            uint64 Left = Budget;
+            for (const int32 Index : ByDistance)
+            {
+                const uint32 Give = static_cast<uint32>(FMath::Min<uint64>(Takes[Index], Left));
+                Takes[Index] = Give;
+                Left -= Give;
+            }
+            Total = static_cast<uint64>(Budget) - Left;
+        }
+
+        uint32 Prefix = 0;
+        for (int32 Index = 0; Index < Takes.Num(); ++Index)
+        {
+            if (Takes[Index] == 0)
+            {
+                continue;
+            }
+            const FGaussianSplatCell& Cell = Cells[Candidates[Index].CellIndex];
+            Out.Ranges[Out.CellCount++] = FUintVector4(
+                static_cast<uint32>(Cell.FirstIndex), Prefix, static_cast<uint32>(Candidates[Index].CellIndex), 0u);
+            Prefix += Takes[Index];
+        }
+        Out.TotalCount = Prefix;
+
+        Stats.K = K;
+        Stats.Multiplier = Multiplier;
+        Stats.FocalPx = In.FocalPx;
+        Stats.FullDistance = 2.0 * HalfFull * Multiplier;
+
+        // Debug logging. Render thread only, like the rest of this file's static state.
+        static int32 LogNextValue = 0;
+        static TMap<uint64, int32> LogNextLeft;
+        const int32 LogNext = GaussianSplatProfiling::CVarLodLogNext.GetValueOnRenderThread();
+        if (LogNext != LogNextValue)
+        {
+            LogNextValue = LogNext;
+            LogNextLeft.Reset();
+        }
+        const uint64 LogKey = (static_cast<uint64>(In.ViewKey) << 32) | static_cast<uint32>(In.BatchIndex);
+        if (LogNext > 0)
+        {
+            int32& Left = LogNextLeft.FindOrAdd(LogKey, LogNext);
+            if (Left > 0)
+            {
+                --Left;
+                UE_LOG(
+                    LogGaussianSplatProfile,
+                    Display,
+                    TEXT("LodSelect view %u batch %d rect %dx%d: k %.4f focal %.3f PointSize %.3f actor scale %.4f ")
+                    TEXT("s_ref %.6f s_p99 %.6f d_full %.2f (min %.0f) m %.6f margin %.2f | selected %u of %u budget ")
+                    TEXT("across %u of %d cells%s"),
+                    In.ViewKey,
+                    In.BatchIndex,
+                    In.ViewRect.Width(),
+                    In.ViewRect.Height(),
+                    K,
+                    In.FocalPx,
+                    In.PointSize,
+                    In.ActorScale,
+                    In.SizeRef,
+                    In.SizeP99,
+                    Stats.FullDistance,
+                    MinFull,
+                    Multiplier,
+                    Margin,
+                    Out.TotalCount,
+                    Budget,
+                    Out.CellCount,
+                    Candidates.Num(),
+                    In.bFullCells ? TEXT(" (whole cells)") : (DebugHalf > 0.0f ? TEXT(" (debug d_full)") : TEXT("")));
+            }
+        }
+
+        static int32 DumpValue = 0;
+        static uint32 DumpFrame = MAX_uint32;
+        const int32 Dump = GaussianSplatProfiling::CVarLodDumpCells.GetValueOnRenderThread();
+        if (Dump != DumpValue)
+        {
+            DumpValue = Dump;
+            DumpFrame = Dump > 0 ? GFrameNumberRenderThread : MAX_uint32;
+        }
+        if (DumpFrame == GFrameNumberRenderThread)
+        {
+            UE_LOG(
+                LogGaussianSplatProfile,
+                Display,
+                TEXT("LodDumpCells view %u batch %d: d_full %.2f m %.6f, %d cells in the frustum, %u selected"),
+                In.ViewKey,
+                In.BatchIndex,
+                Stats.FullDistance,
+                Multiplier,
+                Candidates.Num(),
+                Out.TotalCount);
+            for (int32 Index = 0; Index < Candidates.Num(); ++Index)
+            {
+                const FGaussianSplatCell& Cell = Cells[Candidates[Index].CellIndex];
+                UE_LOG(
+                    LogGaussianSplatProfile,
+                    Display,
+                    TEXT("LodDumpCells view %u batch %d cell %d: count %d dist %.1f fraction %.6f take %u%s"),
+                    In.ViewKey,
+                    In.BatchIndex,
+                    Candidates[Index].CellIndex,
+                    Cell.Count,
+                    Candidates[Index].Distance,
+                    static_cast<double>(Takes[Index]) / static_cast<double>(FMath::Max(1, Cell.Count)),
+                    Takes[Index],
+                    Takes[Index] == static_cast<uint32>(Cell.Count) ? TEXT(" whole") : TEXT(""));
+            }
         }
     }
 }
@@ -1314,6 +1833,40 @@ static bool HasGaussianSplatShaders()
             Error,
             TEXT("A Gaussian splat shader is missing (compile errors are logged under LogShaders); drawing no splats."));
         bLoggedMissing = true;
+    }
+    return bHasAll;
+}
+
+// The hidden-splat cull needs its kernels and, for the box path, the cull's OCC_BOX permutation (Vulkan only).
+// Only the chosen test path's shaders are required, so one failed permutation leaves the other path usable.
+// Without them the batch keeps its single draw, as with OccPhases 0, and one Warning per path says why.
+static bool HasOcclusionShaders(bool bBoxPath)
+{
+    const FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+    FGaussianSplatBillboardsCullCS::FPermutationDomain CullBox;
+    CullBox.Set<FGaussianSplatBillboardsCullCS::FOccBoxDim>(true);
+    FGaussianSplatOccFlagCS::FPermutationDomain Flag;
+    Flag.Set<FGaussianSplatOccFlagCS::FRecomputeDim>(!bBoxPath);
+    const bool bHasAll = ShaderMap != nullptr
+        && ShaderMap->HasShader(&FGaussianSplatOccArgsCS::GetStaticType(), 0)
+        && ShaderMap->HasShader(&FGaussianSplatOccReduceCS::GetStaticType(), 0)
+        && ShaderMap->HasShader(&FGaussianSplatOccSatCS::GetStaticType(), 0)
+        && ShaderMap->HasShader(&FGaussianSplatOccFlagCS::GetStaticType(), Flag.ToDimensionValueId())
+        && ShaderMap->HasShader(&FGaussianSplatOccScanCS::GetStaticType(), 0)
+        && ShaderMap->HasShader(&FGaussianSplatOccScatterCS::GetStaticType(), 0)
+        && (!bBoxPath
+            || (ShaderMap->HasShader(&FGaussianSplatBillboardsCullCS::GetStaticType(), CullBox.ToDimensionValueId())
+                && ShaderMap->HasShader(&FGaussianSplatOccTestCS::GetStaticType(), 0)));
+    static bool bLoggedMissing[2] = {false, false};
+    if (!bHasAll && !bLoggedMissing[bBoxPath ? 1 : 0])
+    {
+        UE_LOG(
+            LogGaussianSplatProfile,
+            Warning,
+            TEXT("r.GaussianSplat.OccPhases is set but a hidden-splat cull shader of the %s path is missing ")
+            TEXT("(Vulkan only; compile errors are logged under LogShaders); drawing in one pass."),
+            bBoxPath ? TEXT("box") : TEXT("recompute"));
+        bLoggedMissing[bBoxPath ? 1 : 0] = true;
     }
     return bHasAll;
 }
@@ -1389,7 +1942,9 @@ namespace GaussianSplatPasses
             static_cast<float>(FMath::Max(1, SceneColorExtent.Y)));
 
         TShaderMapRef<FGaussianSplatPointsCullCS> PointsCullCS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-        TShaderMapRef<FGaussianSplatBillboardsCullCS> BillboardsCullCS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+        // Permutation 0 (no tile box): the bitonic passes, and the cull whenever the box path is off.
+        const FGaussianSplatBillboardsCullCS::FPermutationDomain CullWithoutBox;
+        TShaderMapRef<FGaussianSplatBillboardsCullCS> BillboardsCullCS(GetGlobalShaderMap(GMaxRHIFeatureLevel), CullWithoutBox);
         TShaderMapRef<FGaussianSplatPointsRasterVS> PointsRasterVS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
         TShaderMapRef<FGaussianSplatPointsRasterPS> PointsRasterPS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
         TShaderMapRef<FGaussianSplatBillboardsRasterVS> BillboardsRasterVS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
@@ -1437,16 +1992,47 @@ namespace GaussianSplatPasses
             // an allocation. Sizing a pooled buffer from a per-frame count is
             // what exhausted VRAM and stuttered when it was tried before.
             GaussianSplatLod::FSelection Selection;
+            GaussianSplatProfiling::FLodStats LodStats;
             uint32 DispatchCount = RenderPointCount;
             if (bUseCells)
             {
-                GaussianSplatLod::SelectCells(
-                    Resources->GetCells(),
-                    Batch.LocalToWorld,
-                    View,
-                    RenderPointCount,
-                    GaussianSplatProfiling::GetViewState(View.GetViewKey()).LodBias,
-                    Selection);
+                const uint64 SelectStart = FPlatformTime::Cycles64();
+                if (GaussianSplatProfiling::GetLodMode() == 1)
+                {
+                    GaussianSplatLod::FScreenLodInputs LodInputs;
+                    // focal = P[0][0] x width / 2 (PerspectiveMatrix.h); an orthographic view keeps whole cells.
+                    const bool bPerspective = View.ViewMatrices.IsPerspectiveProjection();
+                    LodInputs.FocalPx = bPerspective
+                        ? ProjectionMatrixNoAAD.M[0][0] * 0.5 * static_cast<double>(ViewRect.Width())
+                        : 0.0;
+                    LodInputs.ActorScale = static_cast<double>(Batch.LocalToWorld.GetMaximumAxisScale());
+                    LodInputs.PointSize = Batch.PointSize;
+                    LodInputs.SizeRef = Resources->GetSizeRef();
+                    LodInputs.SizeP99 = Resources->GetSizeP99();
+                    LodInputs.bFullCells = !bPerspective || Batch.RenderMode == EGaussianSplatRenderMode::Points;
+                    LodInputs.ViewKey = View.GetViewKey();
+                    LodInputs.BatchIndex = BatchIndex;
+                    LodInputs.ViewRect = ViewRect;
+                    GaussianSplatLod::SelectCellsScreen(
+                        Resources->GetCells(),
+                        Batch.LocalToWorld,
+                        View,
+                        RenderPointCount,
+                        LodInputs,
+                        Selection,
+                        LodStats);
+                }
+                else
+                {
+                    GaussianSplatLod::SelectCells(
+                        Resources->GetCells(),
+                        Batch.LocalToWorld,
+                        View,
+                        RenderPointCount,
+                        GaussianSplatProfiling::GetViewState(View.GetViewKey()).LodBias,
+                        Selection);
+                }
+                LodStats.SelectMicros = FPlatformTime::ToMilliseconds64(FPlatformTime::Cycles64() - SelectStart) * 1000.0;
                 DispatchCount = Selection.TotalCount;
                 if (DispatchCount == 0)
                 {
@@ -1699,6 +2285,7 @@ namespace GaussianSplatPasses
 
             const FVector3f ViewOrigin = static_cast<FVector3f>(View.ViewMatrices.GetViewOrigin());
             const FVector3f Forward = static_cast<FVector3f>(View.GetViewDirection());
+            GaussianSplatProfiling::FOccReadback OccReadback;
 
             if (Batch.RenderMode == EGaussianSplatRenderMode::Points)
             {
@@ -1839,6 +2426,42 @@ namespace GaussianSplatPasses
             }
             else
             {
+                // Hidden-splat cull. Tiles are the smallest power of two >= 8 px with at most 256 per axis, so a
+                // box packs into four bytes (8 px up to 2048 px wide, 16 px up to 4096); bigger tiles only cull less.
+                const bool bOccBoxWanted = GaussianSplatProfiling::ShouldUseOccBoxPath();
+                const int32 OccPhases = (GaussianSplatProfiling::GetOccPhases() > 0 && HasOcclusionShaders(bOccBoxWanted))
+                    ? GaussianSplatProfiling::GetOccPhases()
+                    : 0;
+                const uint32 ViewWidth = static_cast<uint32>(FMath::Max(0, ViewRect.Width()));
+                const uint32 ViewHeight = static_cast<uint32>(FMath::Max(0, ViewRect.Height()));
+                uint32 OccTileShift = 3;
+                while (OccTileShift < 8
+                    && (FMath::DivideAndRoundUp(ViewWidth, 1u << OccTileShift) > 256u
+                        || FMath::DivideAndRoundUp(ViewHeight, 1u << OccTileShift) > 256u))
+                {
+                    ++OccTileShift;
+                }
+                const uint32 OccTilesX = FMath::DivideAndRoundUp(ViewWidth, 1u << OccTileShift);
+                const uint32 OccTilesY = FMath::DivideAndRoundUp(ViewHeight, 1u << OccTileShift);
+                // The per-splat passes run one 256-thread group per 256 slots, as one-dimensional dispatches. Mode 0 can
+                // select more than the budget (one splat per visible cell, more cells than budget); its cull already
+                // overruns the sort buffers then, and the cull's budget-sized buffers would too, so it stays off.
+                const bool bOcc = OccPhases > 0
+                    && OccTilesX > 0 && OccTilesY > 0 && OccTilesX <= 256u && OccTilesY <= 256u
+                    && DispatchCount <= PaddedPointCount
+                    && FMath::DivideAndRoundUp(PaddedPointCount, 256u)
+                        <= static_cast<uint32>(GRHIMaxDispatchThreadGroupsPerDimension.X);
+                const bool bOccBox = bOcc && bOccBoxWanted;
+                const float OccBoxPad = GaussianSplatProfiling::GetOccBoxPad();
+                FRDGBufferRef OccBoxBuffer = nullptr;
+                if (bOccBox)
+                {
+                    // Written by the cull, before the sort, so it cannot live in the sort's pairs. Budget-sized and
+                    // pooled like them: 4 B per budget splat per view and batch, 84 MB at Uno's 20.92M.
+                    OccBoxBuffer = CreateSortBuffer(PaddedPointCount, TEXT("GaussianSplat.OccBox"));
+                    GraphBuilder.ConvertToExternalBuffer(OccBoxBuffer);
+                }
+
                 FGaussianSplatBillboardsCullCS::FParameters* InitSortParameters = GraphBuilder.AllocParameters<FGaussianSplatBillboardsCullCS::FParameters>();
                 InitSortParameters->NumElements = DispatchCount;
                 InitSortParameters->PaddedNumElements = PaddedPointCount;
@@ -1869,13 +2492,23 @@ namespace GaussianSplatPasses
                 InitSortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                 InitSortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
                 InitSortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
+                InitSortParameters->OccTileShift = OccTileShift;
+                InitSortParameters->OccBoxPad = OccBoxPad;
+                InitSortParameters->OccBoxUAV = bOccBox
+                    ? GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OccBoxBuffer, PF_R32_UINT))
+                    : nullptr;
+
+                // Permutation 0 (no box) is the plain cull.
+                FGaussianSplatBillboardsCullCS::FPermutationDomain CullPermutation;
+                CullPermutation.Set<FGaussianSplatBillboardsCullCS::FOccBoxDim>(bOccBox);
+                TShaderMapRef<FGaussianSplatBillboardsCullCS> InitCullCS(GetGlobalShaderMap(GMaxRHIFeatureLevel), CullPermutation);
 
                 {
                     RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatCull);
                     FComputeShaderUtils::AddPass(
                         GraphBuilder,
                         RDG_EVENT_NAME("GaussianSplatBillboardsSort.Init"),
-                        BillboardsCullCS,
+                        InitCullCS,
                         InitSortParameters,
                         FComputeShaderUtils::GetGroupCount(DispatchCount, 64));
                 }
@@ -1926,74 +2559,258 @@ namespace GaussianSplatPasses
 
                 AddSortSelfCheck(SortedOrderBuffer, SortedKeyBuffer);
 
-                FGaussianSplatBillboardsRasterPassParameters* PassParameters = GraphBuilder.AllocParameters<FGaussianSplatBillboardsRasterPassParameters>();
-                FGaussianSplatBillboardsRasterVS::FParameters* RasterParameters = &PassParameters->VS;
-                RasterParameters->ViewRectMin = FVector2f(static_cast<float>(ViewRect.Min.X), static_cast<float>(ViewRect.Min.Y));
-                RasterParameters->ViewSize = FVector2f(static_cast<float>(ViewRect.Width()), static_cast<float>(ViewRect.Height()));
-                RasterParameters->ViewWorldOrigin = FVector4f(ViewOrigin.X, ViewOrigin.Y, ViewOrigin.Z, 0.0f);
-                RasterParameters->PointSize = Batch.PointSize;
-                RasterParameters->OpacityScale = Batch.OpacityScale;
-                RasterParameters->Stride = Stride;
-                RasterParameters->SplatCellRanges = CellRangeSRV;
-                RasterParameters->SplatCellCount = Selection.CellCount;
-                RasterParameters->ViewMatrix = ViewMatrix;
-                RasterParameters->LocalToWorldMatrix = Batch.LocalToWorld;
-                RasterParameters->ProjectionMatrix = ProjectionMatrix;
-                RasterParameters->ViewProjectionMatrix = ViewProjection;
-                RasterParameters->WorldToLocalRow0 = Batch.WorldToLocalRow0;
-                RasterParameters->WorldToLocalRow1 = Batch.WorldToLocalRow1;
-                RasterParameters->WorldToLocalRow2 = Batch.WorldToLocalRow2;
-                RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedOrderBuffer, PF_R32_UINT));
-                RasterParameters->SplatPackedA = Resources->GetPackedASRV();
-                RasterParameters->SplatPackedB = Resources->GetPackedBSRV();
-                RasterParameters->SplatCellBounds = Resources->GetCellBoundsSRV();
-                RasterParameters->SplatColorEncoding = Resources->GetColorEncoding();
-                RasterParameters->PerPixelDepth = GaussianSplatProfiling::ShouldUsePerPixelDepth() ? 1u : 0u;
-                RasterParameters->HasSH = Resources->HasSH() ? 1u : 0u;
-                RasterParameters->MinScreenVariance = GaussianSplatProfiling::GetMinScreenVariance();
-                RasterParameters->SplatSHIndexBuffer = Resources->GetSHIndexSRV();
-                RasterParameters->SplatSHPaletteBuffer = Resources->GetSHPaletteSRV();
-                PassParameters->PS.AlphaCutoff = GaussianSplatProfiling::GetAlphaCutoff();
-                SetDepthTestParameters(PassParameters->PS.DepthTest);
-                PassParameters->IndirectArgsBuffer = IndirectArgsBuffer;
-                PassParameters->RenderTargets[0] = FRenderTargetBinding(
-                    SplatOutput.Texture,
-                    bFirstBatch ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad);
+                // One billboard draw of DrawArgs' instances at DrawArgsOffset, reading splats through DrawOrder.
+                // Without the hidden-splat cull this is the single draw (Phase -1 keeps its event name).
+                const auto AddBillboardsRaster = [&](
+                    FRDGBufferRef DrawOrder,
+                    FRDGBufferRef DrawArgs,
+                    uint32 DrawArgsOffset,
+                    ERenderTargetLoadAction LoadAction,
+                    int32 Phase)
+                {
+                    FGaussianSplatBillboardsRasterPassParameters* PassParameters = GraphBuilder.AllocParameters<FGaussianSplatBillboardsRasterPassParameters>();
+                    FGaussianSplatBillboardsRasterVS::FParameters* RasterParameters = &PassParameters->VS;
+                    RasterParameters->ViewRectMin = FVector2f(static_cast<float>(ViewRect.Min.X), static_cast<float>(ViewRect.Min.Y));
+                    RasterParameters->ViewSize = FVector2f(static_cast<float>(ViewRect.Width()), static_cast<float>(ViewRect.Height()));
+                    RasterParameters->ViewWorldOrigin = FVector4f(ViewOrigin.X, ViewOrigin.Y, ViewOrigin.Z, 0.0f);
+                    RasterParameters->PointSize = Batch.PointSize;
+                    RasterParameters->OpacityScale = Batch.OpacityScale;
+                    RasterParameters->Stride = Stride;
+                    RasterParameters->SplatCellRanges = CellRangeSRV;
+                    RasterParameters->SplatCellCount = Selection.CellCount;
+                    RasterParameters->ViewMatrix = ViewMatrix;
+                    RasterParameters->LocalToWorldMatrix = Batch.LocalToWorld;
+                    RasterParameters->ProjectionMatrix = ProjectionMatrix;
+                    RasterParameters->ViewProjectionMatrix = ViewProjection;
+                    RasterParameters->WorldToLocalRow0 = Batch.WorldToLocalRow0;
+                    RasterParameters->WorldToLocalRow1 = Batch.WorldToLocalRow1;
+                    RasterParameters->WorldToLocalRow2 = Batch.WorldToLocalRow2;
+                    RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(DrawOrder, PF_R32_UINT));
+                    RasterParameters->SplatPackedA = Resources->GetPackedASRV();
+                    RasterParameters->SplatPackedB = Resources->GetPackedBSRV();
+                    RasterParameters->SplatCellBounds = Resources->GetCellBoundsSRV();
+                    RasterParameters->SplatColorEncoding = Resources->GetColorEncoding();
+                    RasterParameters->PerPixelDepth = GaussianSplatProfiling::ShouldUsePerPixelDepth() ? 1u : 0u;
+                    RasterParameters->HasSH = Resources->HasSH() ? 1u : 0u;
+                    RasterParameters->MinScreenVariance = GaussianSplatProfiling::GetMinScreenVariance();
+                    RasterParameters->SplatSHIndexBuffer = Resources->GetSHIndexSRV();
+                    RasterParameters->SplatSHPaletteBuffer = Resources->GetSHPaletteSRV();
+                    PassParameters->PS.AlphaCutoff = GaussianSplatProfiling::GetAlphaCutoff();
+                    SetDepthTestParameters(PassParameters->PS.DepthTest);
+                    PassParameters->IndirectArgsBuffer = DrawArgs;
+                    PassParameters->RenderTargets[0] = FRenderTargetBinding(SplatOutput.Texture, LoadAction);
 
-                // Lasts to the end of this branch, which is this pass alone.
-                RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatRaster);
-                GraphBuilder.AddPass(
-                    RDG_EVENT_NAME("GaussianSplatBillboardsRaster.DrawInstanced"),
-                    PassParameters,
-                    ERDGPassFlags::Raster,
-                    [PassParameters, BillboardsRasterVS, BillboardsRasterPS, ViewRect, IndirectArgsBuffer](FRHICommandList& RHICmdList)
+                    // Lasts to the end of this lambda, which is this pass alone.
+                    RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatRaster);
+                    GraphBuilder.AddPass(
+                        Phase < 0
+                            ? RDG_EVENT_NAME("GaussianSplatBillboardsRaster.DrawInstanced")
+                            : RDG_EVENT_NAME("GaussianSplatBillboardsRaster.DrawInstanced (occ phase %d)", Phase),
+                        PassParameters,
+                        ERDGPassFlags::Raster,
+                        [PassParameters, BillboardsRasterVS, BillboardsRasterPS, ViewRect, DrawArgs, DrawArgsOffset](FRHICommandList& RHICmdList)
+                        {
+                            RHICmdList.SetViewport(
+                                static_cast<float>(ViewRect.Min.X),
+                                static_cast<float>(ViewRect.Min.Y),
+                                0.0f,
+                                static_cast<float>(ViewRect.Max.X),
+                                static_cast<float>(ViewRect.Max.Y),
+                                1.0f);
+
+                            FGraphicsPipelineStateInitializer GraphicsPSOInit;
+                            RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
+                            GraphicsPSOInit.BlendState = TStaticBlendState<
+                                CW_RGBA,
+                                BO_Add, BF_InverseDestAlpha, BF_One,
+                                BO_Add, BF_InverseDestAlpha, BF_One>::GetRHI();
+                            GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+                            GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
+                            GraphicsPSOInit.PrimitiveType = PT_TriangleStrip;
+                            GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+                            GraphicsPSOInit.BoundShaderState.VertexShaderRHI = BillboardsRasterVS.GetVertexShader();
+                            GraphicsPSOInit.BoundShaderState.PixelShaderRHI = BillboardsRasterPS.GetPixelShader();
+
+                            SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
+                            SetShaderParameters(RHICmdList, BillboardsRasterVS, BillboardsRasterVS.GetVertexShader(), PassParameters->VS);
+                            SetShaderParameters(RHICmdList, BillboardsRasterPS, BillboardsRasterPS.GetPixelShader(), PassParameters->PS);
+                            RHICmdList.DrawPrimitiveIndirect(DrawArgs->GetIndirectRHICallBuffer(), DrawArgsOffset);
+                        });
+                };
+
+                const ERenderTargetLoadAction FirstLoad = bFirstBatch ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad;
+                if (!bOcc)
+                {
+                    AddBillboardsRaster(SortedOrderBuffer, IndirectArgsBuffer, 0, FirstLoad, -1);
+                }
+                else
+                {
+                    RDG_EVENT_SCOPE(GraphBuilder, "GaussianSplat.Occlusion (%d phases, %s path)",
+                        OccPhases, bOccBox ? TEXT("box") : TEXT("recompute"));
+                    FGlobalShaderMap* OccShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+                    TShaderMapRef<FGaussianSplatOccArgsCS> OccArgsCS(OccShaderMap);
+                    TShaderMapRef<FGaussianSplatOccReduceCS> OccReduceCS(OccShaderMap);
+                    TShaderMapRef<FGaussianSplatOccSatCS> OccSatCS(OccShaderMap);
+                    TShaderMapRef<FGaussianSplatOccTestCS> OccTestCS(OccShaderMap);
+                    FGaussianSplatOccFlagCS::FPermutationDomain FlagPermutation;
+                    FlagPermutation.Set<FGaussianSplatOccFlagCS::FRecomputeDim>(!bOccBox);
+                    TShaderMapRef<FGaussianSplatOccFlagCS> OccFlagCS(OccShaderMap, FlagPermutation);
+                    TShaderMapRef<FGaussianSplatOccScanCS> OccScanCS(OccShaderMap);
+                    TShaderMapRef<FGaussianSplatOccScatterCS> OccScatterCS(OccShaderMap);
+
+                    // Phase draw arguments in their own buffer: IndirectArgs[1] stays the visible count, so the
+                    // profile line, the LOD and the sort checks are untouched. Every other buffer is
+                    // transient and sized from the budget or the view, never from a per-frame count.
+                    FRDGBufferDesc OccDrawArgsDesc = FRDGBufferDesc::CreateIndirectDesc(GaussianSplatProfiling::OccDrawArgsCount);
+                    OccDrawArgsDesc.Usage |= BUF_SourceCopy;
+                    FRDGBufferRef OccDrawArgs = GraphBuilder.CreateBuffer(OccDrawArgsDesc, TEXT("GaussianSplat.OccDrawArgs"));
+                    FRDGBufferRef OccDispatchArgs = GraphBuilder.CreateBuffer(
+                        FRDGBufferDesc::CreateIndirectDesc((GaussianSplatProfiling::OccMaxPhases - 1) * 4),
+                        TEXT("GaussianSplat.OccDispatchArgs"));
+                    const uint32 OccGroups = FMath::DivideAndRoundUp(PaddedPointCount, 256u);
+                    FRDGBufferRef TileUnsat = CreateSortBuffer(OccTilesX * OccTilesY, TEXT("GaussianSplat.OccTileUnsat"));
+                    FRDGBufferRef TileSat = CreateSortBuffer((OccTilesX + 1) * (OccTilesY + 1), TEXT("GaussianSplat.OccTileSat"));
+                    FRDGBufferRef CullBits = bOccBox ? CreateSortBuffer(OccGroups * 8, TEXT("GaussianSplat.OccCullBits")) : nullptr;
+                    FRDGBufferRef FlagWords = CreateSortBuffer(OccGroups * 8, TEXT("GaussianSplat.OccFlagWords"));
+                    FRDGBufferRef GroupCounts = CreateSortBuffer(OccGroups, TEXT("GaussianSplat.OccGroupCounts"));
+                    FRDGBufferRef GroupOffsets = CreateSortBuffer(OccGroups, TEXT("GaussianSplat.OccGroupOffsets"));
+
+                    // Where each later phase's compacted order goes. The sort's result keys are dead once
+                    // the sort is done, since the raster reads only the order; but SortValidate and SortSelfCheck read
+                    // them, mode 1 moves its pair with raw RHI barriers RDG does not track, and SkipSort has no result.
+                    // So only mode 2 on a batch where neither check runs writes into them; every other case uses a
+                    // transient buffer of the budget's size, that frame only.
+                    const bool bCompactIntoKeys = bUseDRS && !bSkipSort && !bValidateBatch && !bSelfCheckBatch;
+                    FRDGBufferRef Compacted = bCompactIntoKeys
+                        ? SortedKeyBuffer
+                        : CreateSortBuffer(PaddedPointCount, TEXT("GaussianSplat.OccCompacted"));
+                    check(Compacted != SortedOrderBuffer);
+
+                    const FUintVector4 OccSplit = OccPhases == 4 ? FUintVector4(2, 5, 10, 20) : FUintVector4(5, 20, 20, 20);
+                    const FRDGBufferSRVRef SortCountSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(IndirectArgsBuffer, PF_R32_UINT));
+                    const FRDGBufferSRVRef SortedOrderSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedOrderBuffer, PF_R32_UINT));
+                    const auto AllocOcc = [&](uint32 Phase)
                     {
-                        RHICmdList.SetViewport(
-                            static_cast<float>(ViewRect.Min.X),
-                            static_cast<float>(ViewRect.Min.Y),
-                            0.0f,
-                            static_cast<float>(ViewRect.Max.X),
-                            static_cast<float>(ViewRect.Max.Y),
-                            1.0f);
+                        FGaussianSplatOcclusionParameters* Parameters = GraphBuilder.AllocParameters<FGaussianSplatOcclusionParameters>();
+                        Parameters->OccPhaseIndex = Phase;
+                        Parameters->OccPhaseCount = static_cast<uint32>(OccPhases);
+                        Parameters->OccPhaseSplit = OccSplit;
+                        Parameters->OccViewRectMin = ViewRect.Min;
+                        Parameters->OccViewSize = ViewRect.Size();
+                        Parameters->OccTileShift = OccTileShift;
+                        Parameters->OccTilesX = OccTilesX;
+                        Parameters->OccTilesY = OccTilesY;
+                        Parameters->OccNumElements = DispatchCount;
+                        Parameters->OccBoxPad = OccBoxPad;
+                        return Parameters;
+                    };
 
-                        FGraphicsPipelineStateInitializer GraphicsPSOInit;
-                        RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
-                        GraphicsPSOInit.BlendState = TStaticBlendState<
-                            CW_RGBA,
-                            BO_Add, BF_InverseDestAlpha, BF_One,
-                            BO_Add, BF_InverseDestAlpha, BF_One>::GetRHI();
-                        GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
-                        GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
-                        GraphicsPSOInit.PrimitiveType = PT_TriangleStrip;
-                        GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
-                        GraphicsPSOInit.BoundShaderState.VertexShaderRHI = BillboardsRasterVS.GetVertexShader();
-                        GraphicsPSOInit.BoundShaderState.PixelShaderRHI = BillboardsRasterPS.GetPixelShader();
+                    {
+                        RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatOcc);
+                        FGaussianSplatOcclusionParameters* ArgsParameters = AllocOcc(0);
+                        ArgsParameters->OccSortCount = SortCountSRV;
+                        ArgsParameters->OccDrawArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OccDrawArgs, PF_R32_UINT));
+                        ArgsParameters->OccDispatchArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OccDispatchArgs, PF_R32_UINT));
+                        FComputeShaderUtils::AddPass(
+                            GraphBuilder, RDG_EVENT_NAME("GaussianSplatOcc.Args"), OccArgsCS, ArgsParameters, FIntVector(1, 1, 1));
+                    }
+                    AddBillboardsRaster(SortedOrderBuffer, OccDrawArgs, 0, FirstLoad, 0);
 
-                        SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
-                        SetShaderParameters(RHICmdList, BillboardsRasterVS, BillboardsRasterVS.GetVertexShader(), PassParameters->VS);
-                        SetShaderParameters(RHICmdList, BillboardsRasterPS, BillboardsRasterPS.GetPixelShader(), PassParameters->PS);
-                        RHICmdList.DrawPrimitiveIndirect(IndirectArgsBuffer->GetIndirectRHICallBuffer(), 0);
-                    });
+                    for (uint32 Phase = 1; Phase < static_cast<uint32>(OccPhases); ++Phase)
+                    {
+                        {
+                            RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatOcc);
+
+                            // The target's SRV flag lets the reduce read it between two raster passes; RDG adds the
+                            // transitions and does not merge the raster passes across it.
+                            FGaussianSplatOcclusionParameters* ReduceParameters = AllocOcc(Phase);
+                            ReduceParameters->OccSplatTexture = SplatTexture;
+                            ReduceParameters->OccTileUnsatUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TileUnsat, PF_R32_UINT));
+                            FComputeShaderUtils::AddPass(
+                                GraphBuilder, RDG_EVENT_NAME("GaussianSplatOcc.Reduce (%ux%u tiles of %u px)", OccTilesX, OccTilesY, 1u << OccTileShift),
+                                OccReduceCS, ReduceParameters, FIntVector(static_cast<int32>(OccTilesX), static_cast<int32>(OccTilesY), 1));
+
+                            FGaussianSplatOcclusionParameters* SatParameters = AllocOcc(Phase);
+                            SatParameters->OccTileUnsat = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TileUnsat, PF_R32_UINT));
+                            SatParameters->OccTileSatUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(TileSat, PF_R32_UINT));
+                            FComputeShaderUtils::AddPass(
+                                GraphBuilder, RDG_EVENT_NAME("GaussianSplatOcc.Sat"), OccSatCS, SatParameters, FIntVector(1, 1, 1));
+
+                            const FRDGBufferSRVRef TileSatSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(TileSat, PF_R32_UINT));
+                            if (bOccBox)
+                            {
+                                // Over every dispatch index the cull ran (CPU-known), reading the boxes in order.
+                                FGaussianSplatOcclusionParameters* TestParameters = AllocOcc(Phase);
+                                TestParameters->OccBox = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(OccBoxBuffer, PF_R32_UINT));
+                                TestParameters->OccTileSat = TileSatSRV;
+                                TestParameters->OccCullBitsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(CullBits, PF_R32_UINT));
+                                FComputeShaderUtils::AddPass(
+                                    GraphBuilder, RDG_EVENT_NAME("GaussianSplatOcc.Test (%u)", DispatchCount), OccTestCS, TestParameters,
+                                    FIntVector(static_cast<int32>(FMath::DivideAndRoundUp(DispatchCount, 256u)), 1, 1));
+                            }
+
+                            // The per-slot passes cover this phase's slots of the sorted list, a GPU-only range, so
+                            // they are dispatched indirectly from the args pass.
+                            const uint32 DispatchArgsOffset = (Phase - 1) * 4 * sizeof(uint32);
+                            FGaussianSplatOcclusionParameters* FlagParameters = AllocOcc(Phase);
+                            FlagParameters->OccSortCount = SortCountSRV;
+                            FlagParameters->OccSortedOrder = SortedOrderSRV;
+                            FlagParameters->OccFlagWordsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(FlagWords, PF_R32_UINT));
+                            FlagParameters->OccGroupCountsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(GroupCounts, PF_R32_UINT));
+                            FlagParameters->OccIndirectArgs = OccDispatchArgs;
+                            if (bOccBox)
+                            {
+                                FlagParameters->OccCullBits = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CullBits, PF_R32_UINT));
+                            }
+                            else
+                            {
+                                FlagParameters->OccTileSat = TileSatSRV;
+                                FlagParameters->Stride = Stride;
+                                FlagParameters->SplatCellRanges = CellRangeSRV;
+                                FlagParameters->SplatCellCount = Selection.CellCount;
+                                FlagParameters->SplatPackedA = Resources->GetPackedASRV();
+                                FlagParameters->SplatCellBounds = Resources->GetCellBoundsSRV();
+                                FlagParameters->ViewRectMin = InitSortParameters->ViewRectMin;
+                                FlagParameters->ViewSize = InitSortParameters->ViewSize;
+                                FlagParameters->PointSize = InitSortParameters->PointSize;
+                                FlagParameters->MinScreenVariance = InitSortParameters->MinScreenVariance;
+                                FlagParameters->ViewMatrix = InitSortParameters->ViewMatrix;
+                                FlagParameters->ProjectionMatrix = InitSortParameters->ProjectionMatrix;
+                                FlagParameters->ViewProjectionMatrix = InitSortParameters->ViewProjectionMatrix;
+                                FlagParameters->LocalToWorldMatrix = InitSortParameters->LocalToWorldMatrix;
+                            }
+                            FComputeShaderUtils::AddPass(
+                                GraphBuilder, RDG_EVENT_NAME("GaussianSplatOcc.Flag (phase %u)", Phase), OccFlagCS, FlagParameters,
+                                OccDispatchArgs, DispatchArgsOffset);
+
+                            FGaussianSplatOcclusionParameters* ScanParameters = AllocOcc(Phase);
+                            ScanParameters->OccSortCount = SortCountSRV;
+                            ScanParameters->OccGroupCounts = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(GroupCounts, PF_R32_UINT));
+                            ScanParameters->OccGroupOffsetsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(GroupOffsets, PF_R32_UINT));
+                            ScanParameters->OccDrawArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OccDrawArgs, PF_R32_UINT));
+                            FComputeShaderUtils::AddPass(
+                                GraphBuilder, RDG_EVENT_NAME("GaussianSplatOcc.Scan"), OccScanCS, ScanParameters, FIntVector(1, 1, 1));
+
+                            FGaussianSplatOcclusionParameters* ScatterParameters = AllocOcc(Phase);
+                            ScatterParameters->OccSortCount = SortCountSRV;
+                            ScatterParameters->OccSortedOrder = SortedOrderSRV;
+                            ScatterParameters->OccFlagWords = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(FlagWords, PF_R32_UINT));
+                            ScatterParameters->OccGroupOffsets = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(GroupOffsets, PF_R32_UINT));
+                            ScatterParameters->OccCompactedUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(Compacted, PF_R32_UINT));
+                            ScatterParameters->OccIndirectArgs = OccDispatchArgs;
+                            FComputeShaderUtils::AddPass(
+                                GraphBuilder, RDG_EVENT_NAME("GaussianSplatOcc.Scatter (phase %u)", Phase), OccScatterCS, ScatterParameters,
+                                OccDispatchArgs, DispatchArgsOffset);
+                        }
+
+                        // ELoad, as later batches do: a later phase is composited behind everything the earlier
+                        // phases drew into this target, which is what makes the cull conservative.
+                        AddBillboardsRaster(Compacted, OccDrawArgs, Phase * 4 * sizeof(uint32), ERenderTargetLoadAction::ELoad, static_cast<int32>(Phase));
+                    }
+                    OccReadback.DrawArgs = OccDrawArgs;
+                    OccReadback.Phases = OccPhases;
+                    OccReadback.bBoxPath = bOccBox;
+                }
             }
 
             if (bFirstBatch && !bSkipVisibleReadback)
@@ -2006,7 +2823,10 @@ namespace GaussianSplatPasses
                     Selection.CellCount,
                     View.GetViewKey(),
                     SortModeLabel,
-                    BatchIndex);
+                    BatchIndex,
+                    ViewRect,
+                    LodStats,
+                    OccReadback);
             }
 
             bFirstBatch = false;

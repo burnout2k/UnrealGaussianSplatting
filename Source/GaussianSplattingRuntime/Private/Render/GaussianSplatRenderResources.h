@@ -76,6 +76,12 @@ public:
     // asset cell is resident, so the two numbering schemes differ.
     const TArray<FGaussianSplatCell>& GetCells() const { return Cells; }
 
+    // r.GaussianSplat.LodMode 1: the median and 99th-percentile largest axis, exp(max log scale), in asset units,
+    // over every splat in a cell (all of them without cells). Asset-wide rather than resident, so LodScreenK keeps
+    // its meaning whatever MaxGpuPointCount is. 0 when nothing was uploaded.
+    float GetSizeRef() const { return SizeRef; }
+    float GetSizeP99() const { return SizeP99; }
+
 private:
     template<typename ElementType>
     void InitStructuredBuffer(
@@ -90,6 +96,8 @@ private:
 
     TArray<FGaussianSplatCell> Cells;
     FVector2f ColorEncoding = FVector2f(0.0f, 1.0f);
+    float SizeRef = 0.0f;
+    float SizeP99 = 0.0f;
 
     // 20 B per splat. The 40 B layout before this stored the covariance as six
     // floats, which cannot be quantized well -- its entries are squared lengths

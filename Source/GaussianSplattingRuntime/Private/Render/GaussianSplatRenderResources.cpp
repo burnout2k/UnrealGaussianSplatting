@@ -5,6 +5,8 @@
 #include "Math/Float16.h"
 #include "RHICommandList.h"
 
+#include <algorithm>
+
 DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatResources, Log, All);
 
 namespace
@@ -145,6 +147,64 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
     }
 
     PointCount = static_cast<uint32>(SourceOfDest.Num());
+
+    // Splat sizes for LodMode 1's full-detail distance (s_ref) and cell margin (s_p99). Element N/2 and
+    // (N-1)*99/100 of the sorted largest log scales, so S/lod/sref_f3.py reproduces them exactly.
+    SizeRef = 0.0f;
+    SizeP99 = 0.0f;
+    if (!InLogScales.IsEmpty())
+    {
+        TArray<float> LargestLog;
+        const auto AddLargest = [&InLogScales, &LargestLog](int32 Index)
+        {
+            const FVector3f& LogScale = InLogScales[Index];
+            LargestLog.Add(FMath::Max3(LogScale.X, LogScale.Y, LogScale.Z));
+        };
+        if (InCells.IsEmpty())
+        {
+            LargestLog.Reserve(InLogScales.Num());
+            for (int32 Index = 0; Index < InLogScales.Num(); ++Index)
+            {
+                AddLargest(Index);
+            }
+        }
+        else
+        {
+            int64 InCellCount = 0;
+            for (const FGaussianSplatCell& Cell : InCells)
+            {
+                InCellCount += FMath::Max(0, Cell.Count);
+            }
+            LargestLog.Reserve(InCellCount);
+            for (const FGaussianSplatCell& Cell : InCells)
+            {
+                for (int32 Offset = 0; Offset < Cell.Count; ++Offset)
+                {
+                    if (InLogScales.IsValidIndex(Cell.FirstIndex + Offset))
+                    {
+                        AddLargest(Cell.FirstIndex + Offset);
+                    }
+                }
+            }
+        }
+        if (!LargestLog.IsEmpty())
+        {
+            const int64 Count = LargestLog.Num();
+            const int64 MedianIndex = Count / 2;
+            const int64 P99Index = (Count - 1) * 99 / 100;
+            std::nth_element(LargestLog.GetData(), LargestLog.GetData() + MedianIndex, LargestLog.GetData() + Count);
+            SizeRef = static_cast<float>(FMath::Exp(static_cast<double>(LargestLog[MedianIndex])));
+            std::nth_element(LargestLog.GetData(), LargestLog.GetData() + P99Index, LargestLog.GetData() + Count);
+            SizeP99 = static_cast<float>(FMath::Exp(static_cast<double>(LargestLog[P99Index])));
+            UE_LOG(
+                LogGaussianSplatResources,
+                Display,
+                TEXT("Splat sizes for LodMode 1: s_ref %.6f, s_p99 %.6f asset units (largest axis over %lld splats in cells)"),
+                SizeRef,
+                SizeP99,
+                Count);
+        }
+    }
 
     PackedAData.Empty(PointCount);
     PackedBData.Empty(PointCount);

@@ -28,6 +28,19 @@ float4x4 ProjectionMatrix;
 float4x4 ViewProjectionMatrix;
 float4x4 LocalToWorldMatrix;
 
+#if OCC_BOX
+// The hidden-splat cull's box path (r.GaussianSplat.OccTestPath 1): the visible branch also stores the splat's
+// full-quad tile box at its dispatch index, for GaussianSplatOcclusion.usf's test. IsSplatVisible leaves the screen
+// centre and axes here.
+#include "GaussianSplatOccBox.ush"
+RWBuffer<uint> OccBoxUAV;
+uint OccTileShift;
+float OccBoxPad;
+static float2 GOccCenterPx;
+static float2 GOccAxis0;
+static float2 GOccAxis1;
+#endif
+
 uint EncodeDepthKey(float Depth)
 {
     return asuint(max(Depth, 0.0));
@@ -107,6 +120,11 @@ bool IsSplatVisible(FSplatRef Splat, out float Depth)
     float2 Axis0;
     float2 Axis1;
     BuildEllipseAxes(Cov2D, Axis0, Axis1);
+#if OCC_BOX
+    GOccCenterPx = CenterPx;
+    GOccAxis0 = Axis0;
+    GOccAxis1 = Axis1;
+#endif
     float2 BasisExtent = abs(Axis0) + abs(Axis1);
     float2 MinPx = CenterPx - BasisExtent;
     float2 MaxPx = CenterPx + BasisExtent;
@@ -145,6 +163,9 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
                 InterlockedAdd(SplatIndirectArgsUAV[1], 1, VisibleIndex);
                 SplatOrderBufferUAV[VisibleIndex] = Index;
                 SplatKeyBufferUAV[VisibleIndex] = EncodeDepthKey(Depth) >> SortKeyShift;
+#if OCC_BOX
+                OccBoxUAV[Index] = PackOccTileBox(GOccCenterPx, GOccAxis0, GOccAxis1, ViewRectMin, ViewSize, OccTileShift, OccBoxPad);
+#endif
             }
         }
         return;

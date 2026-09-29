@@ -14,3 +14,10 @@ IMPLEMENT_GLOBAL_SHADER(FGaussianSplatRadixDownsweepCS, "/GaussianSplatting/Priv
 IMPLEMENT_GLOBAL_SHADER(FGaussianSplatSortPrepareCS, "/GaussianSplatting/Private/GaussianSplatSortValidate.usf", "PrepareCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FGaussianSplatSortCompareCS, "/GaussianSplatting/Private/GaussianSplatSortValidate.usf", "CompareCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FGaussianSplatSortSelfCheckCS, "/GaussianSplatting/Private/GaussianSplatSortValidate.usf", "SelfCheckCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatOccArgsCS, "/GaussianSplatting/Private/GaussianSplatOcclusion.usf", "OccArgsCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatOccReduceCS, "/GaussianSplatting/Private/GaussianSplatOcclusion.usf", "OccReduceCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatOccSatCS, "/GaussianSplatting/Private/GaussianSplatOcclusion.usf", "OccSatCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatOccTestCS, "/GaussianSplatting/Private/GaussianSplatOcclusion.usf", "OccTestCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatOccFlagCS, "/GaussianSplatting/Private/GaussianSplatOcclusion.usf", "OccFlagCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatOccScanCS, "/GaussianSplatting/Private/GaussianSplatOcclusion.usf", "OccScanCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FGaussianSplatOccScatterCS, "/GaussianSplatting/Private/GaussianSplatOcclusion.usf", "OccScatterCS", SF_Compute);

@@ -1,0 +1,43 @@
+#pragma once
+
+// Hidden-splat cull (r.GaussianSplat.OccPhases): the screen tiles a splat's quad can touch, packed into one uint as four
+// 8-bit tile coordinates (min x, min y, max x, max y). Shared by the cull's OCC_BOX permutation (the box path)
+// and the occlusion test's recompute path, so both compute the same box.
+
+// x0 = 1 > x1 = 0: the quad covers no pixel centre inside the view, so the splat draws nothing.
+static const uint OCC_BOX_EMPTY = 1u;
+
+// The FULL quad. The vertex shader puts the corners at CenterPx +- 2 Axis0 +- 2 Axis1 (BillboardsRaster.usf), so
+// per axis the quad spans +-2 (|Axis0| + |Axis1|). BasisExtent (|Axis0| + |Axis1|, the cull's off-screen test) is
+// only half of that; a test on it would cull splats whose outer fragments land on unsaturated tiles.
+// A near-round splat's axis DIRECTION comes from two near-zero numbers (BuildEllipseAxes), so this shader and the VS,
+// compiled apart, can disagree on it by any angle while agreeing on the lengths. When the lengths are within 2 % the
+// box therefore covers every direction: 2 (a |u.x| + b |v.x|) <= 2 sqrt(a^2 + b^2) for orthonormal u, v. For the
+// common case, a splat floored to MinScreenVariance at 45 degrees, that is the same box. Above 2 % the direction's
+// rounding error moves a corner by < 0.05 px even at the 4096 px cap.
+// Pixels count when their centres fall inside, as the rasterizer covers them, then the box is clipped to the view
+// and converted to tiles anchored at ViewRectMin. Pad (px) absorbs the remaining float and vertex-snapping
+// differences between this shader and the VS; a larger pad only culls less. The clamps run in float, so a far
+// off-screen centre never overflows the integer conversion.
+uint PackOccTileBox(float2 CenterPx, float2 Axis0, float2 Axis1, float2 InViewRectMin, float2 InViewSize, uint TileShift, float Pad)
+{
+    const float LengthMajor = length(Axis0);
+    const float LengthMinor = length(Axis1);
+    float2 Half = 2.0 * (abs(Axis0) + abs(Axis1));
+    if (LengthMajor - LengthMinor <= 0.02 * LengthMajor)
+    {
+        Half = 2.0 * sqrt(LengthMajor * LengthMajor + LengthMinor * LengthMinor);
+    }
+    Half += Pad;
+    const float2 Centre = CenterPx - InViewRectMin;
+    const float2 Lo = clamp(ceil(Centre - Half - 0.5), 0.0, InViewSize);
+    const float2 Hi = clamp(floor(Centre + Half - 0.5), -1.0, InViewSize - 1.0);
+    if (!(Lo.x <= Hi.x && Lo.y <= Hi.y))
+    {
+        return OCC_BOX_EMPTY;
+    }
+
+    const uint2 TileMin = uint2(Lo) >> TileShift;
+    const uint2 TileMax = uint2(Hi) >> TileShift;
+    return TileMin.x | (TileMin.y << 8) | (TileMax.x << 16) | (TileMax.y << 24);
+}
