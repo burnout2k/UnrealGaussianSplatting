@@ -30,6 +30,8 @@ This plugin is currently developed against **Unreal Engine 5.5.4**.
 - Support for SH color, opacity, density scaling, and basic runtime controls
 - Depth-aware composition so nearer opaque Unreal objects remain visible in
   front of Gaussian splats
+- Spatial cells with a per-view, screen-space level of detail, and a
+  hidden-splat cull that skips splats behind already opaque pixels
 
 ## CARLA RGB colour matching
 
@@ -343,6 +345,95 @@ Notes for anyone changing this:
   keys that only the validator reads. Expected and harmless; with two or more
   passes every key buffer is read, so the default 24 bits never logs it.
 
+## Level of detail and hidden-splat culling
+
+Two per-frame reductions decide how many splats are drawn. Both are on by
+default. Measured on "Uno" (20.9M splats, 16 m cells, SH degree 3) in a
+1625x779 editor viewport on an RTX 3070, frame time in ms (16.7 is the 60 Hz
+compositor cap, so it reads "at most 16.7"):
+
+| View | Neither | LOD only | Cull only | Both (default) |
+|---|---|---|---|---|
+| street level, long street | 47.4 | 21.0 | 30.0 | 17.1 |
+| street level, near buildings | 24.5 | 23.4 | 16.7 | 16.7 |
+| overview from above | 38.3 | 16.7 | 38.5 | 16.7 |
+
+### Cells
+
+An asset is binned into `CellSize` cells (asset units; the class default is
+64, "Uno" is saved at 16) and each cell is sorted by importance, opacity times
+volume. Every frame the CPU frustum-culls the cells and keeps a prefix of each
+visible one, so the count to draw is known before the GPU runs. Cells with fewer
+than `MinCellOccupancy` (100) splats are floaters and are never uploaded.
+`r.GaussianSplat.Lod 0` keeps every visible cell whole.
+
+### Screen-space LOD (`r.GaussianSplat.LodMode 1`)
+
+Each visible cell keeps all its splats out to `d_full` and `(d_full / d)^2` of
+them beyond, never less than `LodMinFraction`. `d_full` follows the view:
+
+    d_full = LodScreenK x focal length (px) x 0.35 x PointSize x s_ref x actor scale
+
+where `s_ref` is the median splat's largest axis over the whole asset (logged
+at upload as `Splat sizes for LodMode 1`). So a camera with half the horizontal
+resolution stops full detail at half the distance. Every view selects from its
+own origin and resolution with no per-view state, including each scene capture
+and CARLA camera; the spectator is not needed. When `MaxRenderPoints` binds,
+one multiplier on `d_full` is lowered until the selection fits, which thins the
+far cells first.
+
+| CVar | Default | Effect |
+|---|---|---|
+| `r.GaussianSplat.LodMode` | `1` | `1` = screen-space; `0` = the distance LOD from `LodFullDistance` with a budget-feedback bias |
+| `r.GaussianSplat.LodScreenK` | `2.6` | `1` = full detail ends where the median splat projects to one pixel; `2.6` gives 28 m on the view above |
+| `r.GaussianSplat.LodMinFullDistance` | `2000` | every cell within 20 m stays whole for any camera, including low-resolution ones |
+| `r.GaussianSplat.LodMinFraction` | `0.02` | the least a far cell keeps (shared with mode 0) |
+| `r.GaussianSplat.LodCullMargin` | `3` | the cell frustum test grows each box by this many sigma of the 99th-percentile splat; the distance uses the plain box |
+| `r.GaussianSplat.LodDebugHalfFullDistance` | `0` | debug: > 0 replaces `d_full / 2`, so mode 1 can be compared with mode 0 at `LodFullDistance` of the same value |
+| `r.GaussianSplat.LodLogNext` / `LodDumpCells` | `0` | debug: log the next N selections of every view, or every selected cell's distance and take for one frame |
+
+**Look.** At street level the near field is unchanged and the far field
+thinner. Seen from far above, where every cell is distant, the capture turns
+see-through; raising `LodMinFraction` to 0.20 did not fix that. For top-down
+views, turn the LOD off, in the project's `Config/DefaultEngine.ini`:
+
+    [ConsoleVariables]
+    r.GaussianSplat.LodMode=0
+
+or with `r.GaussianSplat.LodMode 0` in the console (see "Setting these" for
+`-ExecCmds`).
+
+### Hidden-splat cull (`r.GaussianSplat.OccPhases 4`)
+
+Splats blend front to back, so after drawing the nearest part of the sorted
+list, a pixel whose alpha has reached 1 - 1/256 can change by at most 1/256 of
+any later splat's colour. The billboard draw is therefore split into phases
+over the sorted list (at 10, 25 and 50 %). After each phase the target's alpha
+is reduced to one flag per 8x8-pixel tile, a summed-area table is built over the
+tiles, and every later splat whose full quad covers only saturated tiles is
+skipped. The survivors are compacted in depth order and drawn by the next phase.
+
+At street level 86-90 % of Uno's splats are hidden behind nearer ones, and the
+cull skips 60-70 % of the visible splats. The image differs from the single
+draw on a few hundred pixels by at most a few levels (fp16 rounding and
+depth-order ties). From above few splats hide others, so it skips little there.
+
+| CVar | Default | Effect |
+|---|---|---|
+| `r.GaussianSplat.OccPhases` | `4` | `0` = one draw, `2` = phases at 25 %, `4` = phases at 10/25/50 % |
+| `r.GaussianSplat.OccTestPath` | `1` | `1` = the cull stores each visible splat's tile box; `0` = the test rebuilds it (no extra buffer, 0.5 ms slower on the long street) |
+| `r.GaussianSplat.OccBoxPad` | `1` | debug: pixels added around each tested box (at least 0.05); larger only culls less |
+
+Billboards only, and Vulkan only: elsewhere, or if its shaders are missing, a
+batch keeps the single draw and one warning says why. Memory: the stored boxes
+take 4 B per budget splat per view and batch (84 MB at 20.9M), plus under 6 MB
+of transient tile and scan buffers; sort modes 0 and 1 and `SkipSort` also
+allocate a transient compacted order of 4 B per budget splat.
+
+Neither feature adds frame-to-frame flicker: at a still pose with 24-bit keys,
+0.21 % of pixels change between frames with both off (depth ties) and 0.17 %
+with both on.
+
 ## Large captures
 
 Two hard limits used to make big PLYs impossible to import; both are fixed.
@@ -428,6 +519,7 @@ The renderer declares its own GPU stats, so `stat GPU` breaks splat cost down by
 | `GaussianSplat/Sort` | the depth sort, whichever mode runs |
 | `GaussianSplat/Raster` | billboard/point rasterization |
 | `GaussianSplat/Composite` | blending the splat layer back onto scene colour |
+| `GaussianSplat/Occ` | the hidden-splat cull's reduce, table, test and compaction passes |
 
 Before these scopes existed, the cost was attributed to whatever engine bucket
 happened to be open (it appeared under `SortLights`), which made the profile misleading.
@@ -436,7 +528,10 @@ The cull pass also reports how many splats survived rejection. Watch the log
 category `LogGaussianSplatProfile`, printed once per 60 renders of each view for
 the first splat actor. It shows the LOD selection, the visible count and the
 effective sort mode. Modes 0 and 1 sort the whole LOD selection; mode 2 sorts only
-the visible splats.
+the visible splats. After those it adds `rect WxH` (the view's pixel size),
+`lod mode M` with mode 1's `k`, budget multiplier `m`, `focal` and `d_full`, the
+CPU selection time in microseconds, and, with the hidden-splat cull on, the
+instances each phase drew and how many it skipped.
 
 Frame time from the log: the timestamp difference between two consecutive lines
 of the same view divided by the difference of the engine frame numbers in
@@ -502,7 +597,8 @@ a tile-based rasterizer with early alpha termination.
   Unreal's scene depth buffer
 - Runtime experience is still basic
   - no full loader actor workflow
-  - no streaming / LOD solution yet
+  - no streaming yet: the LOD chooses what to draw, but the whole asset stays
+    resident
 
 ## Third-party notices
 

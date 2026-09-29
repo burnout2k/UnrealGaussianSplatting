@@ -21,3 +21,8 @@
 ; These match the plugin's defaults; SortMode=1 goes back to UE's sort.
 r.GaussianSplat.SortKeyBits=24
 r.GaussianSplat.SortMode=2
+
+; Level of detail and hidden-splat cull (see the plugin README). The defaults are on:
+; LodMode 1 = screen-space LOD, per view and resolution; OccPhases 4 = skip splats behind opaque pixels.
+; For top-down or overview views the thinned far field looks see-through: uncomment to turn the LOD off.
+;r.GaussianSplat.LodMode=0

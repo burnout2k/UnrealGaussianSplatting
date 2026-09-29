@@ -303,11 +303,12 @@ namespace GaussianSplatProfiling
     // Mode 0 is the distance LOD from LodFullDistance, unchanged.
     static TAutoConsoleVariable<int32> CVarLodMode(
         TEXT("r.GaussianSplat.LodMode"),
-        0,
-        TEXT("0 = distance LOD from LodFullDistance with a budget-feedback bias. 1 = screen-space: every ")
+        1,
+        TEXT("0 = distance LOD from LodFullDistance with a budget-feedback bias. 1 (default) = screen-space: every ")
         TEXT("visible cell keeps all its splats out to d_full = LodScreenK x focal (px) x 0.35 x PointSize x s_ref x ")
         TEXT("actor scale (at least LodMinFullDistance) and (d_full / d)^2 of them beyond, with no feedback state; a ")
-        TEXT("binding MaxRenderPoints thins the far cells first. Other values mean 0."),
+        TEXT("binding MaxRenderPoints thins the far cells first. From far above, the thinned far field looks ")
+        TEXT("see-through; set 0 for top-down views. Other values mean 0."),
         ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<float> CVarLodScreenK(
@@ -363,10 +364,10 @@ namespace GaussianSplatProfiling
     // Hidden-splat cull: skip splats drawn behind pixels that earlier splats already made opaque.
     static TAutoConsoleVariable<int32> CVarOccPhases(
         TEXT("r.GaussianSplat.OccPhases"),
-        0,
+        4,
         TEXT("Hidden-splat cull, billboards only. 0 = one draw. 2 = draw the nearest 25% of the ")
         TEXT("sorted splats, then drop every later splat whose quad covers only tiles already opaque (T <= 1/256) and ")
-        TEXT("draw the rest. 4 = phases at 10/25/50%. Other values mean 0. Vulkan only; it keeps the single draw ")
+        TEXT("draw the rest. 4 (default) = phases at 10/25/50%. Other values mean 0. Vulkan only; it keeps the single draw ")
         TEXT("wherever its shaders are missing."),
         ECVF_RenderThreadSafe);
 
