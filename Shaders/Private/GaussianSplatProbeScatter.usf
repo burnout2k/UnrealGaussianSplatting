@@ -1,0 +1,47 @@
+#include "/Engine/Public/Platform.ush"
+
+// Fix 5 Step 0 upload probe (GaussianSplatProbe.cpp): copies this tick's pages from the upload buffer into their pool
+// slots in one dispatch. A page is 4,096 splats laid out as Fix 5's pool will hold them: 64 KiB of PackedA, then 16 KiB
+// of PackedB, then 16 KiB of SH index, each part going to its own region of the pool. The bytes are a pattern; only
+// the cost matters.
+
+#define PROBE_PAGE_UINT4S 6144u      // 96 KiB
+#define PROBE_A_UINT4S 4096u         // 64 KiB of PackedA
+#define PROBE_SMALL_UINT4S 1024u     // 16 KiB each of PackedB and SH index
+
+StructuredBuffer<uint4> ProbeSource;
+StructuredBuffer<uint> ProbePageSlots;
+RWStructuredBuffer<uint4> ProbePool;
+uint ProbePageCount;
+uint ProbePoolPages;
+
+[numthreads(256, 1, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    const uint Index = DTid.x;
+    if (Index >= ProbePageCount * PROBE_PAGE_UINT4S)
+    {
+        return;
+    }
+
+    const uint Page = Index / PROBE_PAGE_UINT4S;
+    const uint Within = Index - Page * PROBE_PAGE_UINT4S;
+    const uint Slot = ProbePageSlots[Page];
+
+    uint Destination;
+    if (Within < PROBE_A_UINT4S)
+    {
+        Destination = Slot * PROBE_A_UINT4S + Within;
+    }
+    else if (Within < PROBE_A_UINT4S + PROBE_SMALL_UINT4S)
+    {
+        Destination = ProbePoolPages * PROBE_A_UINT4S + Slot * PROBE_SMALL_UINT4S + (Within - PROBE_A_UINT4S);
+    }
+    else
+    {
+        Destination = ProbePoolPages * (PROBE_A_UINT4S + PROBE_SMALL_UINT4S) + Slot * PROBE_SMALL_UINT4S
+            + (Within - PROBE_A_UINT4S - PROBE_SMALL_UINT4S);
+    }
+
+    ProbePool[Destination] = ProbeSource[Index];
+}

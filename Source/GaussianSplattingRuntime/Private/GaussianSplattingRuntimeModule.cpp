@@ -2,6 +2,7 @@
 #include "Misc/CoreDelegates.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+#include "Render/GaussianSplatProbe.h"
 #include "Render/GaussianSplatViewExtension.h"
 #include "ShaderCore.h"
 
@@ -14,6 +15,7 @@ public:
     {
         // 告诉 UE 着色器编译系统，插件自带的 usf/ush 应该映射到哪个虚拟目录。
         MapShaderDirectory();
+        GaussianSplatProbe::Startup();
 
         // SceneViewExtension 依赖 GEngine，若引擎尚未初始化完成，就等到 PostEngineInit 再创建。
         if (GEngine)
@@ -35,6 +37,7 @@ public:
             PostEngineInitHandle.Reset();
         }
 
+        GaussianSplatProbe::Shutdown();
         ViewExtension.Reset();
     }
 

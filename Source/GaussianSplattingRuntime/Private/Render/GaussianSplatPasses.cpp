@@ -44,6 +44,7 @@ namespace GaussianSplatProfiling
     static constexpr uint32 OccDrawArgsCount = OccMaxPhases * 4;
 
     uint32 GetSortKeyMode();  // r.GaussianSplat.SortKeyMode, defined with the sort CVars; the profile line prints it
+    uint32 GetLodSplitRuns();  // r.GaussianSplat.LodSplitRuns (Fix 5 probe), defined with the sort CVars
 
     // What the profile line reports about the LOD selection. Mode 1's fields stay 0 in mode 0.
     struct FLodStats
@@ -203,12 +204,14 @@ namespace GaussianSplatProfiling
                 OccText = TEXT(" | occ off (min visible)");
             }
             const TCHAR* KeyText = GetSortKeyMode() == 1 ? TEXT(" | key offset16") : TEXT("");
+            const uint32 SplitRuns = GetLodSplitRuns();
+            const FString SplitText = SplitRuns > 0 ? FString::Printf(TEXT(" | split %u"), SplitRuns) : FString();
             UE_LOG(
                 LogGaussianSplatProfile,
                 Display,
                 TEXT("view %u: lod selected %u of %u budget (%.0f MiB sort scratch) ")
                 TEXT("across %u cells | visible=%u (%.1f%% of selected) | sort mode %s | batch %d")
-                TEXT(" | rect %dx%d | lod mode %d%s | select %.0f us%s%s"),
+                TEXT(" | rect %dx%d | lod mode %d%s | select %.0f us%s%s%s"),
                 ViewKey,
                 SelectedCount,
                 RenderPointCount,
@@ -227,7 +230,8 @@ namespace GaussianSplatProfiling
                 *LodText,
                 LodStats.SelectMicros,
                 *OccText,
-                KeyText);
+                KeyText,
+                *SplitText);
         }
     }
 
@@ -491,6 +495,32 @@ namespace GaussianSplatProfiling
     uint32 GetSortKeyMode()
     {
         return CVarSortKeyMode.GetValueOnRenderThread() == 1 ? 1u : 0u;
+    }
+
+    // Fix 5 Step 0 probes (fix5-plan.md v2), both off by default.
+    static TAutoConsoleVariable<int32> CVarLodSplitRuns(
+        TEXT("r.GaussianSplat.LodSplitRuns"),
+        0,
+        TEXT("Fix 5 probe: write each selected cell's range as consecutive runs of this many splats (0 = one run per ")
+        TEXT("cell). The same splats in the same order, so the pictures do not change; only the lookup's binary search ")
+        TEXT("gets as deep as a pool of pages this size would make it."),
+        ECVF_RenderThreadSafe);
+
+    static TAutoConsoleVariable<int32> CVarMaxRenderPointsOverride(
+        TEXT("r.GaussianSplat.MaxRenderPointsOverride"),
+        0,
+        TEXT("Fix 5 probe: use this draw budget instead of every component's MaxRenderPoints (0 = off). It also sizes ")
+        TEXT("the sort scratch, so it shows what the scratch costs."),
+        ECVF_RenderThreadSafe);
+
+    uint32 GetLodSplitRuns()
+    {
+        return static_cast<uint32>(FMath::Max(0, CVarLodSplitRuns.GetValueOnRenderThread()));
+    }
+
+    uint32 GetMaxRenderPointsOverride()
+    {
+        return static_cast<uint32>(FMath::Max(0, CVarMaxRenderPointsOverride.GetValueOnRenderThread()));
     }
 
     uint32 GetSortKeyBits()
@@ -1427,6 +1457,38 @@ namespace GaussianSplatLod
         uint32 TotalCount = 0;
     };
 
+    // Fix 5 probe (r.GaussianSplat.LodSplitRuns): how many entries a selection can need. One per cell, or with runs of
+    // N, at most one per cell plus one per N splats, since the sum of ceil(take / N) is at most cells + total / N.
+    // Fixed per asset, like the one-per-cell size, so the RDG pool still sees one buffer size.
+    uint32 RangeCapacity(const TArray<FGaussianSplatCell>& Cells, uint32 SplitRuns)
+    {
+        if (SplitRuns == 0)
+        {
+            return static_cast<uint32>(FMath::Max(1, Cells.Num()));
+        }
+        uint64 Total = 0;
+        for (const FGaussianSplatCell& Cell : Cells)
+        {
+            Total += static_cast<uint64>(FMath::Max(0, Cell.Count));
+        }
+        return static_cast<uint32>(FMath::Min<uint64>(MAX_int32, FMath::Max<uint64>(1, Cells.Num() + Total / SplitRuns)));
+    }
+
+    // One cell's take as one entry, or as consecutive runs of SplitRuns splats: the same splats in the same dispatch
+    // order, only more entries for ResolveSplat to search.
+    void AddRange(FSelection& Out, uint32 First, uint32 Prefix, uint32 CellIndex, uint32 Take, uint32 SplitRuns)
+    {
+        if (SplitRuns == 0)
+        {
+            Out.Ranges[Out.CellCount++] = FUintVector4(First, Prefix, CellIndex, 0u);
+            return;
+        }
+        for (uint32 Offset = 0; Offset < Take; Offset += SplitRuns)
+        {
+            Out.Ranges[Out.CellCount++] = FUintVector4(First + Offset, Prefix + Offset, CellIndex, 0u);
+        }
+    }
+
     // Per-cell frustum cull + distance LOD + budget feedback, replacing the
     // single global stride.
     //
@@ -1442,8 +1504,9 @@ namespace GaussianSplatLod
         float& InOutBias,
         FSelection& Out)
     {
+        const uint32 SplitRuns = GaussianSplatProfiling::GetLodSplitRuns();
         Out.Ranges.Reset();
-        Out.Ranges.SetNumZeroed(FMath::Max(1, Cells.Num()));
+        Out.Ranges.SetNumZeroed(RangeCapacity(Cells, SplitRuns));
         Out.CellCount = 0;
         Out.TotalCount = 0;
 
@@ -1534,7 +1597,7 @@ namespace GaussianSplatLod
         uint32 Prefix = 0;
         for (int32 Index = 0; Index < Takes.Num(); ++Index)
         {
-            Out.Ranges[Out.CellCount++] = FUintVector4(Firsts[Index], Prefix, CellIndices[Index], 0u);
+            AddRange(Out, Firsts[Index], Prefix, CellIndices[Index], Takes[Index], SplitRuns);
             Prefix += Takes[Index];
         }
         Out.TotalCount = Prefix;
@@ -1587,8 +1650,9 @@ namespace GaussianSplatLod
         FSelection& Out,
         GaussianSplatProfiling::FLodStats& Stats)
     {
+        const uint32 SplitRuns = GaussianSplatProfiling::GetLodSplitRuns();
         Out.Ranges.Reset();
-        Out.Ranges.SetNumZeroed(FMath::Max(1, Cells.Num()));
+        Out.Ranges.SetNumZeroed(RangeCapacity(Cells, SplitRuns));
         Out.CellCount = 0;
         Out.TotalCount = 0;
         Stats.Mode = 1;
@@ -1772,8 +1836,8 @@ namespace GaussianSplatLod
                 continue;
             }
             const FGaussianSplatCell& Cell = Cells[Candidates[Index].CellIndex];
-            Out.Ranges[Out.CellCount++] = FUintVector4(
-                static_cast<uint32>(Cell.FirstIndex), Prefix, static_cast<uint32>(Candidates[Index].CellIndex), 0u);
+            AddRange(Out, static_cast<uint32>(Cell.FirstIndex), Prefix, static_cast<uint32>(Candidates[Index].CellIndex),
+                Takes[Index], SplitRuns);
             Prefix += Takes[Index];
         }
         Out.TotalCount = Prefix;
@@ -2034,9 +2098,12 @@ namespace GaussianSplatPasses
 
             // RenderPointCount is the BUDGET: what the renderer may draw, stable
             // frame to frame, and therefore what sizes the buffers.
+            // r.GaussianSplat.MaxRenderPointsOverride (Fix 5 probe) replaces every component's budget.
+            const uint32 BudgetOverride = GaussianSplatProfiling::GetMaxRenderPointsOverride();
+            const uint32 MaxRenderPoints = BudgetOverride > 0 ? BudgetOverride : Batch.MaxRenderPoints;
             const uint32 RenderPointCount = bUseCells
-                ? FMath::Min(Batch.MaxRenderPoints, Batch.AssetPointCount)
-                : FMath::Min(Batch.MaxRenderPoints,
+                ? FMath::Min(MaxRenderPoints, Batch.AssetPointCount)
+                : FMath::Min(MaxRenderPoints,
                              FMath::DivideAndRoundUp(Batch.AssetPointCount, Stride));
             if (RenderPointCount == 0)
             {
