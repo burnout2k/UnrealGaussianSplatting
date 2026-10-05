@@ -4,6 +4,7 @@
 
 
 uint SortKeyShift;
+uint SortKeyMode;
 RWBuffer<uint> SplatOrderBufferUAV;
 RWBuffer<uint> SplatKeyBufferUAV;
 RWBuffer<uint> SplatIndirectArgsUAV;
@@ -41,9 +42,18 @@ static float2 GOccAxis0;
 static float2 GOccAxis1;
 #endif
 
+// 0: the depth's float bits, top SortKeyBits kept (SortKeyShift = 32 - bits). 1 (r.GaussianSplat.SortKeyMode): 16
+// bits over 8 cm .. 5.24 km, the clamped depth's low 4 exponent bits and top 12 mantissa bits = 4,096 steps per
+// doubling. Its top key is 0xFFFE, so a 16-bit mask never makes it tie with the sort's 0xFFFFFFFF padding.
 uint EncodeDepthKey(float Depth)
 {
-    return asuint(max(Depth, 0.0));
+    if (SortKeyMode == 0)
+    {
+        return asuint(max(Depth, 0.0)) >> SortKeyShift;
+    }
+    const float KeyMinDepth = 8.0;                   // 2^3 cm
+    const float KeyMaxDepth = asfloat(0x48FFF7FFu);  // 524,224 cm, one key step under 2^19 cm
+    return (asuint(clamp(Depth, KeyMinDepth, KeyMaxDepth)) - asuint(KeyMinDepth)) >> 11;
 }
 
 float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
@@ -162,7 +172,7 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
                 uint VisibleIndex = 0;
                 InterlockedAdd(SplatIndirectArgsUAV[1], 1, VisibleIndex);
                 SplatOrderBufferUAV[VisibleIndex] = Index;
-                SplatKeyBufferUAV[VisibleIndex] = EncodeDepthKey(Depth) >> SortKeyShift;
+                SplatKeyBufferUAV[VisibleIndex] = EncodeDepthKey(Depth);
 #if OCC_BOX
                 OccBoxUAV[Index] = PackOccTileBox(GOccCenterPx, GOccAxis0, GOccAxis1, ViewRectMin, ViewSize, OccTileShift, OccBoxPad);
 #endif

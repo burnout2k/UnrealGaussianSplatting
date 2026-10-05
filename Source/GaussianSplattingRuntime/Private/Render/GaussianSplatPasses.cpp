@@ -43,6 +43,8 @@ namespace GaussianSplatProfiling
     static constexpr uint32 OccMaxPhases = 4;
     static constexpr uint32 OccDrawArgsCount = OccMaxPhases * 4;
 
+    uint32 GetSortKeyMode();  // r.GaussianSplat.SortKeyMode, defined with the sort CVars; the profile line prints it
+
     // What the profile line reports about the LOD selection. Mode 1's fields stay 0 in mode 0.
     struct FLodStats
     {
@@ -61,6 +63,7 @@ namespace GaussianSplatProfiling
         FRDGBufferRef DrawArgs = nullptr;
         int32 Phases = 0;
         bool bBoxPath = false;
+        bool bSkipped = false;  // OccPhases asked for the cull, but the view was under r.GaussianSplat.OccMinVisible
     };
 
     struct FVisibleCountState
@@ -69,10 +72,12 @@ namespace GaussianSplatProfiling
         TUniquePtr<FRHIGPUBufferReadback> OccSlots[NumReadbackSlots];
         int32 OccPhasesInSlot[NumReadbackSlots] = {};
         bool OccBoxPathInSlot[NumReadbackSlots] = {};
+        bool OccSkippedInSlot[NumReadbackSlots] = {};
         int32 WriteSlot = 0;
         uint32 LastVisibleCount = 0;
         int32 LastOccPhases = 0;
         bool bLastOccBoxPath = false;
+        bool bLastOccSkipped = false;
         uint32 LastOccKept[OccMaxPhases] = {};
         uint32 FrameCounter = 0;
 
@@ -127,6 +132,7 @@ namespace GaussianSplatProfiling
             State.Slots[ReadSlot]->Unlock();
 
             State.LastOccPhases = 0;
+            State.bLastOccSkipped = State.OccSkippedInSlot[ReadSlot];
             if (bOccInSlot)
             {
                 if (const uint32* Data = static_cast<const uint32*>(State.OccSlots[ReadSlot]->Lock(OccDrawArgsBytes)))
@@ -148,6 +154,7 @@ namespace GaussianSplatProfiling
         }
         AddEnqueueCopyPass(GraphBuilder, State.Slots[State.WriteSlot].Get(), IndirectArgsBuffer, IndirectArgsBytes);
         State.OccPhasesInSlot[State.WriteSlot] = 0;
+        State.OccSkippedInSlot[State.WriteSlot] = Occ.bSkipped;
         if (Occ.DrawArgs != nullptr && Occ.Phases > 0)
         {
             if (!State.OccSlots[State.WriteSlot].IsValid())
@@ -191,12 +198,17 @@ namespace GaussianSplatProfiling
                     Culled,
                     100.0 * static_cast<double>(Culled) / static_cast<double>(FMath::Max(1u, State.LastVisibleCount)));
             }
+            else if (State.bLastOccSkipped)
+            {
+                OccText = TEXT(" | occ off (min visible)");
+            }
+            const TCHAR* KeyText = GetSortKeyMode() == 1 ? TEXT(" | key offset16") : TEXT("");
             UE_LOG(
                 LogGaussianSplatProfile,
                 Display,
                 TEXT("view %u: lod selected %u of %u budget (%.0f MiB sort scratch) ")
                 TEXT("across %u cells | visible=%u (%.1f%% of selected) | sort mode %s | batch %d")
-                TEXT(" | rect %dx%d | lod mode %d%s | select %.0f us%s"),
+                TEXT(" | rect %dx%d | lod mode %d%s | select %.0f us%s%s"),
                 ViewKey,
                 SelectedCount,
                 RenderPointCount,
@@ -214,7 +226,8 @@ namespace GaussianSplatProfiling
                 LodStats.Mode,
                 *LodText,
                 LodStats.SelectMicros,
-                *OccText);
+                *OccText,
+                KeyText);
         }
     }
 
@@ -393,6 +406,29 @@ namespace GaussianSplatProfiling
         return (Phases == 2 || Phases == 4) ? Phases : 0;
     }
 
+    // Fix 4 Step 3 lever 2 (fix4-step3-plan.md v2): the cull's Test pass runs once per later phase over the whole LOD
+    // selection, so a view that selects millions of splats but sees few pays for it and culls almost nothing (the six
+    // 800x450 cameras: -2.05 ms for the four sparse ones, ckptG-1005-1629).
+    static TAutoConsoleVariable<int32> CVarOccMinVisible(
+        TEXT("r.GaussianSplat.OccMinVisible"),
+        0,
+        TEXT("Hidden-splat cull, per view. 0 (default) = the cull runs wherever OccPhases says. N > 0 = a view whose ")
+        TEXT("visible count, from its last readback (a few of its frames old), is below N draws in one pass instead; ")
+        TEXT("while a view has no readback yet the cull stays on. The visible count is taken before the cull, so ")
+        TEXT("turning the cull off does not change it."),
+        ECVF_RenderThreadSafe);
+
+    bool ShouldSkipOccForView(uint32 ViewKey)
+    {
+        const int32 MinVisible = CVarOccMinVisible.GetValueOnRenderThread();
+        if (MinVisible <= 0)
+        {
+            return false;
+        }
+        const uint32 LastVisible = GetViewState(ViewKey).LastVisibleCount;
+        return LastVisible > 0 && LastVisible < static_cast<uint32>(MinVisible);
+    }
+
     bool ShouldUseOccBoxPath()
     {
         return CVarOccTestPath.GetValueOnRenderThread() != 0;
@@ -439,11 +475,30 @@ namespace GaussianSplatProfiling
         TEXT("and rounds an odd count up to even (20 and 24 bits both take 6); mode 2 spends ")
         TEXT("one pass per 8 bits (20 and 24 both take 3), so 24 costs no more than 20 and has ")
         TEXT("16x finer depth steps. Fewer bits means more ties: 20 was indistinguishable from 32 ")
-        TEXT("on tartu_demo, 16 was visibly wrong."),
+        TEXT("on tartu_demo, 16 was visibly wrong. Ignored when r.GaussianSplat.SortKeyMode is 1."),
         ECVF_RenderThreadSafe);
+
+    // Fix 4 Step 3 lever 1 (fix4-step3-plan.md v2): 16 bits spent only on the depths a street scene has, so mode 2
+    // sorts in 2 passes instead of 3 (-2.68 ms on the six 800x450 cameras, ckptG-1005-1629).
+    static TAutoConsoleVariable<int32> CVarSortKeyMode(
+        TEXT("r.GaussianSplat.SortKeyMode"),
+        0,
+        TEXT("Depth key. 0 (default) = the depth's float bits, the top SortKeyBits kept. 1 = 16 bits over ")
+        TEXT("8 cm .. 5.24 km, 4,096 steps per doubling of the depth (2x finer than the 20-bit key), so mode 2 ")
+        TEXT("sorts in 2 passes; nearer depths share the first key and farther ones the last."),
+        ECVF_RenderThreadSafe);
+
+    uint32 GetSortKeyMode()
+    {
+        return CVarSortKeyMode.GetValueOnRenderThread() == 1 ? 1u : 0u;
+    }
 
     uint32 GetSortKeyBits()
     {
+        if (GetSortKeyMode() == 1)
+        {
+            return 16u;
+        }
         return static_cast<uint32>(FMath::Clamp(CVarSortKeyBits.GetValueOnRenderThread(), 8, 32));
     }
 
@@ -2310,6 +2365,7 @@ namespace GaussianSplatPasses
                 InitSortParameters->SplatPackedB = Resources->GetPackedBSRV();
                 InitSortParameters->SplatCellBounds = Resources->GetCellBoundsSRV();
                 InitSortParameters->SortKeyShift = 32u - SortKeyBits;
+                InitSortParameters->SortKeyMode = GaussianSplatProfiling::GetSortKeyMode();
                 InitSortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                 InitSortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
                 InitSortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
@@ -2447,7 +2503,11 @@ namespace GaussianSplatPasses
                 // The per-splat passes run one 256-thread group per 256 slots, as one-dimensional dispatches. Mode 0 can
                 // select more than the budget (one splat per visible cell, more cells than budget); its cull already
                 // overruns the sort buffers then, and the cull's budget-sized buffers would too, so it stays off.
+                // Fix 4 Step 3 lever 2: a view that sees few splats skips the cull (r.GaussianSplat.OccMinVisible).
+                const bool bOccSkipped = OccPhases > 0 && GaussianSplatProfiling::ShouldSkipOccForView(View.GetViewKey());
+                OccReadback.bSkipped = bOccSkipped;
                 const bool bOcc = OccPhases > 0
+                    && !bOccSkipped
                     && OccTilesX > 0 && OccTilesY > 0 && OccTilesX <= 256u && OccTilesY <= 256u
                     && DispatchCount <= PaddedPointCount
                     && FMath::DivideAndRoundUp(PaddedPointCount, 256u)
@@ -2490,6 +2550,7 @@ namespace GaussianSplatPasses
                 InitSortParameters->MaxSplatDistance = GaussianSplatProfiling::GetMaxSplatDistance();
                 InitSortParameters->MinScreenVariance = GaussianSplatProfiling::GetMinScreenVariance();
                 InitSortParameters->SortKeyShift = 32u - SortKeyBits;
+                InitSortParameters->SortKeyMode = GaussianSplatProfiling::GetSortKeyMode();
                 InitSortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                 InitSortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
                 InitSortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
