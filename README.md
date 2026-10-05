@@ -223,13 +223,26 @@ passes. `r.GaussianSplat.SortKeyBits` controls this:
 | Bits | Mode 1 passes | Mode 2 passes | Depth step at 10 m / 100 m |
 |---|---|---|---|
 | 32 | 8 | 4 | exact |
-| **24 (default)** | **6** | **3** | 0.16 mm / 2.5 mm |
+| 24 | 6 | 3 | 0.16 mm / 2.5 mm |
 | 20 | 6 | 3 | 2.5 mm / 4 cm -- no visible difference from 32 on tartu_demo |
 | 16 | 4 | 2 | 4 cm / 64 cm -- visibly wrong; do not use |
+| **offset 16 (`SortKeyMode 1`, default)** | **4** | **2** | 1.25 mm / 2 cm |
 
 Mode 1 rounds an odd pass count up to even (see the notes below), so 20 bits
 costs it the same 6 passes as 24. Both modes therefore get 24 bits for the price
-of 20, with 16 times finer depth steps, which is why 24 is the default.
+of 20, with 16 times finer depth steps, which is why 24 is the default of
+`r.GaussianSplat.SortKeyMode 0`.
+
+`r.GaussianSplat.SortKeyMode 1` (the default) spends 16 bits only on the depths
+a street scene has: the depth is clamped to 8 cm .. 5.24 km and the key is its
+low 4 exponent bits and top 12 mantissa bits, 4,096 steps per doubling of the
+depth -- twice as fine as the 20-bit key above, so mode 2 sorts in 2 passes
+instead of 3. `SortKeyBits` is then ignored, and the profile line ends in
+`| key offset16`. The top key is 0xFFFE, so a 16-bit mask never ties a splat
+with the sort's 0xFFFFFFFF padding. Measured on six 800x450 CARLA cameras on
+"Uno" (RTX 3070, synchronous, the waited frame): 51.67 -> 49.91 ms. In the
+editor (Uno, three views) it differs from 24 bits less than the 20-bit key does
+and flickers less than it; the sort validators found no error.
 
 Ties are drawn in cull order rather than true depth order. Both radix sorts are
 stable, so the error is consistent frame to frame rather than flickering, which
@@ -423,6 +436,17 @@ depth-order ties). From above few splats hide others, so it skips little there.
 | `r.GaussianSplat.OccPhases` | `4` | `0` = one draw, `2` = phases at 25 %, `4` = phases at 10/25/50 % |
 | `r.GaussianSplat.OccTestPath` | `1` | `1` = the cull stores each visible splat's tile box; `0` = the test rebuilds it (no extra buffer, 0.5 ms slower on the long street) |
 | `r.GaussianSplat.OccBoxPad` | `1` | debug: pixels added around each tested box (at least 0.05); larger only culls less |
+| `r.GaussianSplat.OccMinVisible` | `750000` | a view whose visible count, from its last readback, is below this draws in one pass; `0` = the cull wherever `OccPhases` says |
+
+The cull's test runs once per later phase over the view's whole LOD selection,
+so a camera that selects millions of splats but sees few pays for it and culls
+almost nothing. `OccMinVisible` turns the cull off per view on such cameras; a
+view with no readback yet keeps it, and the profile line then ends in
+`| occ off (min visible)`. On six 800x450 CARLA cameras on "Uno" it skipped the
+four cameras that see 0.05-0.75M splats and kept the two that see 6.6-8.8M,
+where the cull is worth 7.3 ms: 51.67 -> 49.28 ms, and 47.83 ms with the offset
+key. 750,000 comes from two drive logs: below it no camera lost more than
+0.17M culled splats.
 
 Billboards only, and Vulkan only: elsewhere, or if its shaders are missing, a
 batch keeps the single draw and one warning says why. Memory: the stored boxes

@@ -411,9 +411,9 @@ namespace GaussianSplatProfiling
     // 800x450 cameras: -2.05 ms for the four sparse ones, ckptG-1005-1629).
     static TAutoConsoleVariable<int32> CVarOccMinVisible(
         TEXT("r.GaussianSplat.OccMinVisible"),
-        0,
-        TEXT("Hidden-splat cull, per view. 0 (default) = the cull runs wherever OccPhases says. N > 0 = a view whose ")
-        TEXT("visible count, from its last readback (a few of its frames old), is below N draws in one pass instead; ")
+        750000,
+        TEXT("Hidden-splat cull, per view. 0 = the cull runs wherever OccPhases says. N > 0 (default 750000) = a view ")
+        TEXT("whose visible count, from its last readback (a few of its frames old), is below N draws in one pass instead; ")
         TEXT("while a view has no readback yet the cull stays on. The visible count is taken before the cull, so ")
         TEXT("turning the cull off does not change it."),
         ECVF_RenderThreadSafe);
@@ -482,8 +482,8 @@ namespace GaussianSplatProfiling
     // sorts in 2 passes instead of 3 (-2.68 ms on the six 800x450 cameras, ckptG-1005-1629).
     static TAutoConsoleVariable<int32> CVarSortKeyMode(
         TEXT("r.GaussianSplat.SortKeyMode"),
-        0,
-        TEXT("Depth key. 0 (default) = the depth's float bits, the top SortKeyBits kept. 1 = 16 bits over ")
+        1,
+        TEXT("Depth key. 0 = the depth's float bits, the top SortKeyBits kept. 1 (default) = 16 bits over ")
         TEXT("8 cm .. 5.24 km, 4,096 steps per doubling of the depth (2x finer than the 20-bit key), so mode 2 ")
         TEXT("sorts in 2 passes; nearer depths share the first key and farther ones the last."),
         ECVF_RenderThreadSafe);

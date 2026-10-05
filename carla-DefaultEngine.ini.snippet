@@ -22,6 +22,13 @@
 r.GaussianSplat.SortKeyBits=24
 r.GaussianSplat.SortMode=2
 
+; Offset 16-bit depth key (8 cm .. 5.24 km, 2 radix passes instead of 3) and the hidden-splat cull skipped on
+; views that saw fewer than 750,000 splats (see the plugin README). These match the plugin's defaults; they are
+; written out so a package keeps them whatever plugin it was built with. 0 / 0 goes back to the 24-bit key and the
+; cull everywhere.
+r.GaussianSplat.SortKeyMode=1
+r.GaussianSplat.OccMinVisible=750000
+
 ; Level of detail and hidden-splat cull (see the plugin README). The defaults are on:
 ; LodMode 1 = screen-space LOD, per view and resolution; OccPhases 4 = skip splats behind opaque pixels.
 ; For top-down or overview views the thinned far field looks see-through: uncomment to turn the LOD off.
