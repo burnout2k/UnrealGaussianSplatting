@@ -7,6 +7,7 @@
 #include "Serialization/CustomVersion.h"
 #include "GaussianSplatBoundsUtils.h"
 #include "GaussianSplatComponent.h"
+#include "GaussianSplatFormat.h"
 #include "Render/GaussianSplatRenderResources.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatAsset, Log, All);
@@ -122,32 +123,9 @@ void UGaussianSplatAsset::RebuildBounds()
 
 namespace
 {
-    // H3DGS's merge weight: opacity * sqrt(det Sigma). sqrt(det Sigma) is the
-    // product of the three axis scales, so this ranks a splat by roughly how
-    // much visible volume it accounts for -- exactly the order in which you want
-    // to drop splats. Computable from the stored covariance alone: no camera
-    // poses, no source imagery, no retraining.
-    //
-    // The determinant is accumulated in double because the scales span
-    // 0.0000-134 m on real captures, and its cube underflows float badly at the
-    // small end.
-    // sqrt(det Sigma) is the product of the three axis scales, so with the
-    // scales in hand the weight needs no determinant at all -- and no double
-    // precision to survive cubing values as small as 1e-4.
-    FORCEINLINE float SplatImportance(const FVector3f& LogScale, float Opacity)
-    {
-        return Opacity * FMath::Exp(LogScale.X + LogScale.Y + LogScale.Z);
-    }
-
-    FORCEINLINE float SplatImportance(const FGaussianCovariance3f& C, float Opacity)
-    {
-        const double Det =
-              static_cast<double>(C.XX) * (static_cast<double>(C.YY) * C.ZZ - static_cast<double>(C.YZ) * C.YZ)
-            - static_cast<double>(C.XY) * (static_cast<double>(C.XY) * C.ZZ - static_cast<double>(C.XZ) * C.YZ)
-            + static_cast<double>(C.XZ) * (static_cast<double>(C.XY) * C.YZ - static_cast<double>(C.XZ) * C.YY);
-
-        return static_cast<float>(Opacity * FMath::Sqrt(FMath::Max(Det, 0.0)));
-    }
+    // SplatImportance moved to GaussianSplatFormat.h, so the paged importer bakes
+    // the same order from the same expression. Nothing about it changed.
+    using GaussianSplatFormat::SplatImportance;
 
     // Move Source[Order[d]] into slot d, for an array of Stride elements per
     // splat. Done one array at a time so the peak extra allocation is the size
@@ -201,10 +179,7 @@ bool UGaussianSplatAsset::BuildCells()
     for (int32 Index = 0; Index < SourceCount; ++Index)
     {
         const FVector3f P = Positions[Index];
-        const FIntVector Coord(
-            FMath::FloorToInt(P.X * InvPitch),
-            FMath::FloorToInt(P.Y * InvPitch),
-            FMath::FloorToInt(P.Z * InvPitch));
+        const FIntVector Coord = GaussianSplatFormat::CellCoord(P, InvPitch);
 
         int32 Slot = INDEX_NONE;
         if (const int32* Existing = SlotByCoord.Find(Coord))
@@ -238,11 +213,7 @@ bool UGaussianSplatAsset::BuildCells()
     }
     Algo::Sort(KeptSlots, [&SlotCoord](int32 A, int32 B)
     {
-        const FIntVector& CA = SlotCoord[A];
-        const FIntVector& CB = SlotCoord[B];
-        if (CA.X != CB.X) { return CA.X < CB.X; }
-        if (CA.Y != CB.Y) { return CA.Y < CB.Y; }
-        return CA.Z < CB.Z;
+        return GaussianSplatFormat::CellCoordLess(SlotCoord[A], SlotCoord[B]);
     });
 
     TArray<int32> CellBySlot;
@@ -303,7 +274,7 @@ bool UGaussianSplatAsset::BuildCells()
         Algo::Sort(Slice, [&Importance](int32 A, int32 B)
         {
             // Tie-break on index so the order is stable across rebuilds.
-            return Importance[A] != Importance[B] ? Importance[A] > Importance[B] : A < B;
+            return GaussianSplatFormat::ImportanceLess(Importance[A], A, Importance[B], B);
         });
     });
     Importance.Empty();

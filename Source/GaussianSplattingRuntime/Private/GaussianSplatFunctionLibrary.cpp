@@ -1,5 +1,7 @@
 #include "GaussianSplatFunctionLibrary.h"
 
+#include "Import/GaussianSplatPagedImporter.h"
+
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "GaussianSplatAsset.h"
@@ -29,4 +31,30 @@ UGaussianSplatAsset* UGaussianSplatFunctionLibrary::LoadGaussianAssetFromFile(co
     }
 
     return Asset;
+}
+
+bool UGaussianSplatFunctionLibrary::DumpPagedBakeOrder(
+    const FString& PlyPath,
+    const FString& OutCsvPath,
+    float CellSize,
+    int32 MinCellOccupancy,
+    FString& OutError)
+{
+    GaussianSplatPagedImporter::FOptions Options;
+    Options.CellSize = CellSize;
+    Options.MinCellOccupancy = MinCellOccupancy;
+    return GaussianSplatPagedImporter::DumpBakeOrder(PlyPath, Options, OutCsvPath, OutError);
+}
+
+bool UGaussianSplatFunctionLibrary::DumpLegacyBakeOrder(
+    UGaussianSplatAsset* Asset,
+    const FString& OutCsvPath,
+    FString& OutError)
+{
+    if (Asset == nullptr)
+    {
+        OutError = TEXT("No asset.");
+        return false;
+    }
+    return GaussianSplatPagedImporter::DumpLegacyBakeOrder(*Asset, OutCsvPath, OutError);
 }

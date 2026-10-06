@@ -91,6 +91,9 @@ struct GAUSSIANSPLATTINGRUNTIME_API FGaussianSplatCustomVersion
         BeforeCustomVersionWasAdded = 0,
         SpatialCells,
         RotationAndScale,
+        // Fix 5: UGaussianSplatPagedAsset's inline tables. Shared with the
+        // legacy class so one registered GUID versions the whole plugin.
+        PagedAsset,
 
         VersionPlusOne,
         LatestVersion = VersionPlusOne - 1

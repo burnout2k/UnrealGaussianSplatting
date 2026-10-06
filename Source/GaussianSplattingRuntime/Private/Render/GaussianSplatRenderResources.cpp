@@ -1,6 +1,7 @@
 #include "Render/GaussianSplatRenderResources.h"
 
 #include "GaussianSplatBoundsUtils.h"
+#include "GaussianSplatFormat.h"
 #include "Hash/CityHash.h"
 #include "Math/Float16.h"
 #include "RHICommandList.h"
@@ -8,64 +9,6 @@
 #include <algorithm>
 
 DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatResources, Log, All);
-
-namespace
-{
-    // Smallest-three: the largest component of a unit quaternion is recoverable
-    // from the other three, so 2 bits name it and 10 bits each carry the rest
-    // over [-1/sqrt(2), 1/sqrt(2)] -- the widest any non-largest component can
-    // be. 32 bits total, ~0.1 degrees of error.
-    FORCEINLINE uint32 PackUnitQuaternion(const FQuat4f& Q)
-    {
-        float C[4] = { Q.X, Q.Y, Q.Z, Q.W };
-
-        int32 Largest = 0;
-        for (int32 I = 1; I < 4; ++I)
-        {
-            if (FMath::Abs(C[I]) > FMath::Abs(C[Largest]))
-            {
-                Largest = I;
-            }
-        }
-
-        // q and -q are the same rotation, so force the named component positive
-        // and the decoder can take the positive square root unconditionally.
-        if (C[Largest] < 0.0f)
-        {
-            for (int32 I = 0; I < 4; ++I)
-            {
-                C[I] = -C[I];
-            }
-        }
-
-        constexpr float Range = 0.70710678f;   // 1/sqrt(2)
-        uint32 Packed = static_cast<uint32>(Largest);
-        int32 Shift = 2;
-        for (int32 I = 0; I < 4; ++I)
-        {
-            if (I == Largest)
-            {
-                continue;
-            }
-
-            const float Normalised = FMath::Clamp(C[I] / Range * 0.5f + 0.5f, 0.0f, 1.0f);
-            Packed |= static_cast<uint32>(FMath::RoundToInt(Normalised * 1023.0f)) << Shift;
-            Shift += 10;
-        }
-        return Packed;
-    }
-
-    FORCEINLINE uint32 PackHalf2(float A, float B)
-    {
-        return static_cast<uint32>(FFloat16(A).Encoded)
-            | (static_cast<uint32>(FFloat16(B).Encoded) << 16);
-    }
-
-    FORCEINLINE uint32 QuantizeUnit16(float Normalised)
-    {
-        return static_cast<uint32>(FMath::RoundToInt(FMath::Clamp(Normalised, 0.0f, 1.0f) * 65535.0f));
-    }
-}
 
 void FGaussianSplatRenderResources::BuildFromAssetData(
     const TArray<FVector3f>& InPositions,
@@ -267,13 +210,7 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
         ColorMin = FMath::Min3(ColorMin, FMath::Min(Color.X, Color.Y), Color.Z);
         ColorMax = FMath::Max3(ColorMax, FMath::Max(Color.X, Color.Y), Color.Z);
     }
-    if (ColorMin > ColorMax)
-    {
-        ColorMin = 0.0f;
-        ColorMax = 1.0f;
-    }
-    // A degenerate range (every splat one colour) would divide by zero.
-    ColorEncoding = FVector2f(ColorMin, FMath::Max(ColorMax - ColorMin, KINDA_SMALL_NUMBER));
+    ColorEncoding = GaussianSplatFormat::MakeColorEncoding(ColorMin, ColorMax);
 
     // A capture exported at SH degree 0 has no f_rest_* data, so every
     // coefficient would be zero: read every frame and multiplied by nothing.
@@ -295,12 +232,7 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
     for (const FGaussianSplatCell& Cell : Cells)
     {
         const FVector3f Origin = Cell.BoundsMin;
-        // A cell one splat wide has zero extent on some axis; the reciprocal
-        // would be infinite and the quantized value NaN.
-        const FVector3f Extent(
-            FMath::Max(Cell.BoundsMax.X - Origin.X, UE_KINDA_SMALL_NUMBER),
-            FMath::Max(Cell.BoundsMax.Y - Origin.Y, UE_KINDA_SMALL_NUMBER),
-            FMath::Max(Cell.BoundsMax.Z - Origin.Z, UE_KINDA_SMALL_NUMBER));
+        const FVector3f Extent = GaussianSplatFormat::CellExtent(Origin, Cell.BoundsMax);
 
         CellBoundsData.Add(FVector4f(Origin.X, Origin.Y, Origin.Z, 0.0f));
         CellBoundsData.Add(FVector4f(Extent.X, Extent.Y, Extent.Z, 0.0f));
@@ -315,24 +247,8 @@ void FGaussianSplatRenderResources::BuildFromAssetData(
                 ? InColorsOpacity[SourceIndex]
                 : FVector4f(1.0f, 1.0f, 1.0f, 1.0f);
 
-            const FVector3f Local = (Position - Origin) / Extent;
-            const uint32 QX = QuantizeUnit16(Local.X);
-            const uint32 QY = QuantizeUnit16(Local.Y);
-            const uint32 QZ = QuantizeUnit16(Local.Z);
-
-            PackedAData.Add(FUintVector4(
-                QX | (QY << 16),
-                QZ | (static_cast<uint32>(FFloat16(LogScale.X).Encoded) << 16),
-                PackHalf2(LogScale.Y, LogScale.Z),
-                PackUnitQuaternion(Rotation)));
-
-            const FVector3f Normalised =
-                (FVector3f(Color.X, Color.Y, Color.Z) - FVector3f(ColorEncoding.X)) / ColorEncoding.Y;
-            PackedBData.Add(
-                  static_cast<uint32>(FMath::RoundToInt(FMath::Clamp(Normalised.X, 0.0f, 1.0f) * 255.0f))
-                | static_cast<uint32>(FMath::RoundToInt(FMath::Clamp(Normalised.Y, 0.0f, 1.0f) * 255.0f)) << 8
-                | static_cast<uint32>(FMath::RoundToInt(FMath::Clamp(Normalised.Z, 0.0f, 1.0f) * 255.0f)) << 16
-                | static_cast<uint32>(FMath::RoundToInt(FMath::Clamp(Color.W, 0.0f, 1.0f) * 255.0f)) << 24);
+            PackedAData.Add(GaussianSplatFormat::PackSplatA(Position, Origin, Extent, LogScale, Rotation));
+            PackedBData.Add(GaussianSplatFormat::PackSplatB(Color, ColorEncoding));
 
             if (!bHasSH)
             {

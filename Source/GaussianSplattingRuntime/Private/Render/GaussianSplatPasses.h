@@ -21,6 +21,12 @@ enum class EGaussianSplatRenderMode : uint32
 struct FGaussianSplatRenderBatch
 {
     const FGaussianSplatRenderResources* Resources = nullptr;
+
+    // Fix 5: set together, and only for a paged asset, which draws from the
+    // process-wide pool and so has no FGaussianSplatRenderResources of its own.
+    // Both stay null while r.GaussianSplat.PagedAssets is 0.
+    const class UGaussianSplatPagedAsset* PagedAsset = nullptr;
+    const struct FGaussianSplatPoolResidency* PagedResidency = nullptr;
     EGaussianSplatRenderMode RenderMode = EGaussianSplatRenderMode::Billboards;
     FMatrix44f LocalToWorld = FMatrix44f::Identity;
     FVector4f WorldToLocalRow0 = FVector4f(1, 0, 0, 0);

@@ -1,5 +1,8 @@
 #include "Render/GaussianSplatViewExtension.h"
 
+#include "GaussianSplatPagedAsset.h"
+#include "Render/GaussianSplatPagePool.h"
+
 #include "GaussianSplatAsset.h"
 #include "GaussianSplatComponent.h"
 #include "GaussianSplatWorldSubsystem.h"
@@ -120,19 +123,39 @@ void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread(const UWorld* Ta
             continue;
         }
 
+        // Fix 5: a paged component draws from the pool. Registering is a map lookup
+        // after the first call, and the first call is what uploads the asset.
+        const UGaussianSplatPagedAsset* Paged = nullptr;
+        const FGaussianSplatPoolResidency* Residency = nullptr;
+        if (FGaussianSplatPagePool::ArePagedAssetsEnabled() && IsValid(Component->PagedAsset))
+        {
+            Paged = Component->PagedAsset;
+            Residency = FGaussianSplatPagePool::Get().RegisterAsset(Paged);
+            if (Residency == nullptr)
+            {
+                continue;   // it did not fit, and RegisterAsset has already said why
+            }
+        }
+
         const UGaussianSplatAsset* Asset = Component->Asset;
-        if (!IsValid(Asset))
+        const FGaussianSplatRenderResources* RenderResources = nullptr;
+        if (Paged == nullptr)
         {
-            continue;
+            if (!IsValid(Asset))
+            {
+                continue;
+            }
+
+            RenderResources = Asset->GetRenderResources();
+            if (Asset->Positions.IsEmpty() || RenderResources == nullptr || RenderResources->GetPointCount() == 0)
+            {
+                continue;
+            }
         }
 
-        const FGaussianSplatRenderResources* RenderResources = Asset->GetRenderResources();
-        if (Asset->Positions.IsEmpty() || RenderResources == nullptr || RenderResources->GetPointCount() == 0)
-        {
-            continue;
-        }
-
-        const int32 GpuPointCount = static_cast<int32>(RenderResources->GetPointCount());
+        const int32 GpuPointCount = Paged != nullptr
+            ? static_cast<int32>(FMath::Min<int64>(Paged->TotalSplats, MAX_int32))
+            : static_cast<int32>(RenderResources->GetPointCount());
         const float Density = FMath::Clamp(Component->DensityScale, 0.001f, 1.0f);
         const int32 DensityStride = FMath::Max(1, FMath::RoundToInt(1.0f / Density));
         const int32 LocalMax = FMath::Max(1, Component->MaxRenderPoints);
@@ -145,6 +168,8 @@ void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread(const UWorld* Ta
 
         FGaussianSplatRenderBatch Batch;
         Batch.Resources = RenderResources;
+        Batch.PagedAsset = Paged;
+        Batch.PagedResidency = Residency;
         Batch.RenderMode = Component->PreviewRenderMode == EGaussianPreviewRenderMode::Points
             ? EGaussianSplatRenderMode::Points
             : EGaussianSplatRenderMode::Billboards;
@@ -166,7 +191,7 @@ void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread(const UWorld* Ta
             0.0f);
         Batch.PointSize = FMath::Clamp(Component->PointSize, 0.1f, 32.0f);
         Batch.OpacityScale = FMath::Clamp(Component->OpacityScale, 0.0f, 8.0f);
-        Batch.AssetPointCount = RenderResources->GetPointCount();
+        Batch.AssetPointCount = static_cast<uint32>(GpuPointCount);
         Batch.Stride = static_cast<uint32>(Stride);
         Batch.MaxRenderPoints = static_cast<uint32>(LocalMax);
         NewPoints.Add(Batch);

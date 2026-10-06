@@ -1,5 +1,8 @@
 #include "Render/GaussianSplatPasses.h"
 
+#include "GaussianSplatPagedAsset.h"
+#include "Render/GaussianSplatPagePool.h"
+
 #include "./GaussianSplatShaders.h"
 #include "Render/GaussianSplatRenderResources.h"
 #include "PipelineStateCache.h"
@@ -113,7 +116,13 @@ namespace GaussianSplatProfiling
         int32 BatchIndex,
         const FIntRect& ViewRect,
         const FLodStats& LodStats,
-        const FOccReadback& Occ)
+        const FOccReadback& Occ,
+        // Fix 5. Entries is what D6's trigger reads -- the range table's length,
+        // which is what decides whether the lookup stays in L1 -- and Misses must
+        // be 0 on a camera frame in synchronous mode.
+        bool bPaged = false,
+        uint32 PagedEntries = 0,
+        uint32 PagedMisses = 0)
     {
         FVisibleCountState& State = GetViewState(ViewKey);
         const uint32 IndirectArgsBytes = 4 * sizeof(uint32);
@@ -206,12 +215,15 @@ namespace GaussianSplatProfiling
             const TCHAR* KeyText = GetSortKeyMode() == 1 ? TEXT(" | key offset16") : TEXT("");
             const uint32 SplitRuns = GetLodSplitRuns();
             const FString SplitText = SplitRuns > 0 ? FString::Printf(TEXT(" | split %u"), SplitRuns) : FString();
+            const FString PagedText = bPaged
+                ? FString::Printf(TEXT(" | pool entries %u misses %u"), PagedEntries, PagedMisses)
+                : FString();
             UE_LOG(
                 LogGaussianSplatProfile,
                 Display,
                 TEXT("view %u: lod selected %u of %u budget (%.0f MiB sort scratch) ")
                 TEXT("across %u cells | visible=%u (%.1f%% of selected) | sort mode %s | batch %d")
-                TEXT(" | rect %dx%d | lod mode %d%s | select %.0f us%s%s%s"),
+                TEXT(" | rect %dx%d | lod mode %d%s | select %.0f us%s%s%s%s"),
                 ViewKey,
                 SelectedCount,
                 RenderPointCount,
@@ -231,7 +243,8 @@ namespace GaussianSplatProfiling
                 LodStats.SelectMicros,
                 *OccText,
                 KeyText,
-                *SplitText);
+                *SplitText,
+                *PagedText);
         }
     }
 
@@ -1460,6 +1473,11 @@ namespace GaussianSplatLod
     // Fix 5 probe (r.GaussianSplat.LodSplitRuns): how many entries a selection can need. One per cell, or with runs of
     // N, at most one per cell plus one per N splats, since the sum of ceil(take / N) is at most cells + total / N.
     // Fixed per asset, like the one-per-cell size, so the RDG pool still sees one buffer size.
+    // A paged cell emits its floor run and its tail run -- two entries when the
+    // allocator could place its pages contiguously, which it does whenever there is
+    // untouched space. Four per cell leaves room for a fragmented pool.
+    constexpr uint32 PagedRangesPerCell = 4;
+
     uint32 RangeCapacity(const TArray<FGaussianSplatCell>& Cells, uint32 SplitRuns)
     {
         if (SplitRuns == 0)
@@ -1487,6 +1505,32 @@ namespace GaussianSplatLod
         {
             Out.Ranges[Out.CellCount++] = FUintVector4(First + Offset, Prefix + Offset, CellIndex, 0u);
         }
+    }
+
+    // The paged form: the same splats in the same dispatch order, but addressed by
+    // POOL SLOT rather than by position in the asset's own buffer. Returns how many
+    // splats it could actually cover -- the shortfall is a miss, which must be zero
+    // on a camera frame in synchronous mode.
+    uint32 AddPagedRange(
+        FSelection& Out,
+        const UGaussianSplatPagedAsset& Asset,
+        const FGaussianSplatPoolResidency& Residency,
+        uint32 CellIndex,
+        uint32 Take,
+        uint32& InOutPrefix,
+        TArray<FGaussianSplatPoolRun>& Scratch)
+    {
+        const uint32 Covered = BuildPoolRuns(Asset, Residency, static_cast<int32>(CellIndex), Take, Scratch);
+        for (const FGaussianSplatPoolRun& Run : Scratch)
+        {
+            if (Out.CellCount >= static_cast<uint32>(Out.Ranges.Num()))
+            {
+                break;   // the capacity estimate was short; better a missing run than a write past the end
+            }
+            Out.Ranges[Out.CellCount++] = FUintVector4(Run.FirstSlot, InOutPrefix, CellIndex, 0u);
+            InOutPrefix += Run.Count;
+        }
+        return Covered;
     }
 
     // Per-cell frustum cull + distance LOD + budget feedback, replacing the
@@ -1648,11 +1692,22 @@ namespace GaussianSplatLod
         uint32 Budget,
         const FScreenLodInputs& In,
         FSelection& Out,
-        GaussianSplatProfiling::FLodStats& Stats)
+        GaussianSplatProfiling::FLodStats& Stats,
+        // Set together, and only for a paged asset: the selection itself is
+        // unchanged -- it still works on the asset's FULL cell counts, so a view's
+        // take does not move when a page is evicted -- but the ranges it emits then
+        // address pool slots, and anything the pool does not hold is counted as a
+        // miss rather than silently dropped.
+        const UGaussianSplatPagedAsset* PagedAsset = nullptr,
+        const FGaussianSplatPoolResidency* PagedResidency = nullptr,
+        uint32* OutMissCount = nullptr)
     {
+        const bool bPaged = PagedAsset != nullptr && PagedResidency != nullptr;
         const uint32 SplitRuns = GaussianSplatProfiling::GetLodSplitRuns();
         Out.Ranges.Reset();
-        Out.Ranges.SetNumZeroed(RangeCapacity(Cells, SplitRuns));
+        Out.Ranges.SetNumZeroed(bPaged
+            ? FMath::Max(1, Cells.Num() * static_cast<int32>(PagedRangesPerCell))
+            : static_cast<int32>(RangeCapacity(Cells, SplitRuns)));
         Out.CellCount = 0;
         Out.TotalCount = 0;
         Stats.Mode = 1;
@@ -1829,18 +1884,31 @@ namespace GaussianSplatLod
         }
 
         uint32 Prefix = 0;
+        uint32 Missed = 0;
+        TArray<FGaussianSplatPoolRun> Runs;
         for (int32 Index = 0; Index < Takes.Num(); ++Index)
         {
             if (Takes[Index] == 0)
             {
                 continue;
             }
+            const uint32 CellIndex = static_cast<uint32>(Candidates[Index].CellIndex);
+            if (bPaged)
+            {
+                // Prefix advances by what each run actually covers, so a partly
+                // resident cell leaves no hole in dispatch space.
+                Missed += Takes[Index] - AddPagedRange(Out, *PagedAsset, *PagedResidency, CellIndex, Takes[Index], Prefix, Runs);
+                continue;
+            }
             const FGaussianSplatCell& Cell = Cells[Candidates[Index].CellIndex];
-            AddRange(Out, static_cast<uint32>(Cell.FirstIndex), Prefix, static_cast<uint32>(Candidates[Index].CellIndex),
-                Takes[Index], SplitRuns);
+            AddRange(Out, static_cast<uint32>(Cell.FirstIndex), Prefix, CellIndex, Takes[Index], SplitRuns);
             Prefix += Takes[Index];
         }
         Out.TotalCount = Prefix;
+        if (OutMissCount != nullptr)
+        {
+            *OutMissCount = Missed;
+        }
 
         Stats.K = K;
         Stats.Multiplier = Multiplier;
@@ -2075,17 +2143,54 @@ namespace GaussianSplatPasses
         {
             const FGaussianSplatRenderBatch& Batch = Batches[BatchIndex];
             const FGaussianSplatRenderResources* Resources = Batch.Resources;
-            if (Resources == nullptr || Resources->GetPointCount() == 0 || Resources->GetPackedASRV() == nullptr)
+
+            // Fix 5's seam. A paged batch draws from the process-wide pool and
+            // carries no resources of its own; with r.GaussianSplat.PagedAssets 0
+            // nothing ever sets these, every Src* below IS the old expression, and
+            // the legacy path runs line for line as before.
+            const UGaussianSplatPagedAsset* const PagedAsset = Batch.PagedAsset;
+            const FGaussianSplatPoolResidency* const PagedResidency = Batch.PagedResidency;
+            const bool bPaged = PagedAsset != nullptr && PagedResidency != nullptr;
+            FGaussianSplatPagePool& Pool = FGaussianSplatPagePool::Get();
+
+            const FGaussianSplatRenderResources* const Legacy = bPaged ? nullptr : Resources;
+            if (bPaged
+                    ? (!Pool.IsAllocated() || PagedAsset->Cells.IsEmpty())
+                    : (Legacy == nullptr || Legacy->GetPointCount() == 0 || Legacy->GetPackedASRV() == nullptr))
             {
                 continue;
             }
+
+            const TArray<FGaussianSplatCell>& SrcCells = bPaged ? PagedAsset->SelectionCells : Legacy->GetCells();
+            FRHIShaderResourceView* const SrcPackedA =
+                bPaged ? Pool.GetPackedASRV() : Legacy->GetPackedASRV().GetReference();
+            FRHIShaderResourceView* const SrcPackedB =
+                bPaged ? Pool.GetPackedBSRV() : Legacy->GetPackedBSRV().GetReference();
+            FRHIShaderResourceView* const SrcCellBounds =
+                bPaged ? PagedResidency->GetCellBoundsSRV() : Legacy->GetCellBoundsSRV().GetReference();
+            FRHIShaderResourceView* const SrcSHIndex =
+                bPaged ? Pool.GetSHIndexSRV() : Legacy->GetSHIndexSRV().GetReference();
+            FRHIShaderResourceView* const SrcSHPalette =
+                bPaged ? PagedResidency->GetSHPaletteSRV() : Legacy->GetSHPaletteSRV().GetReference();
+            const FVector2f SrcColorEncoding = bPaged ? PagedAsset->ColorEncoding : Legacy->GetColorEncoding();
+            const float SrcSizeRef = bPaged ? PagedAsset->SizeRef : Legacy->GetSizeRef();
+            const float SrcSizeP99 = bPaged ? PagedAsset->SizeP99 : Legacy->GetSizeP99();
+            const bool bSrcHasSH = bPaged ? PagedAsset->HasSH() : Legacy->HasSH();
+            const uint32 SrcPointCount = bPaged
+                ? static_cast<uint32>(FMath::Min<int64>(PagedAsset->TotalSplats, MAX_uint32))
+                : Legacy->GetPointCount();
+
+            // Any splat a view selected but the pool does not hold. It must be 0 on a
+            // camera frame in synchronous mode -- that is the gate's assertion, and
+            // in Step 1a it is also how G1e shows the clamp did what it claims.
+            uint32 PagedMisses = 0;
 
             // Cells are MANDATORY once the asset has them. The 20 B record stores
             // each position as a 16-bit fraction of its OWN cell, so without a cell
             // index there is nothing to decode against -- the legacy stride path
             // renders an empty screen. r.GaussianSplat.Lod therefore selects the
             // distance falloff only (see SelectCells), never whether cells are used.
-            const bool bUseCells = !Resources->GetCells().IsEmpty();
+            const bool bUseCells = !SrcCells.IsEmpty();
 
             // The component's Stride is vestigial once cells exist: the cull
             // resolves thread -> splat through the per-frame ranges, and LOD
@@ -2130,25 +2235,46 @@ namespace GaussianSplatPasses
                         : 0.0;
                     LodInputs.ActorScale = static_cast<double>(Batch.LocalToWorld.GetMaximumAxisScale());
                     LodInputs.PointSize = Batch.PointSize;
-                    LodInputs.SizeRef = Resources->GetSizeRef();
-                    LodInputs.SizeP99 = Resources->GetSizeP99();
+                    LodInputs.SizeRef = SrcSizeRef;
+                    LodInputs.SizeP99 = SrcSizeP99;
                     LodInputs.bFullCells = !bPerspective || Batch.RenderMode == EGaussianSplatRenderMode::Points;
                     LodInputs.ViewKey = View.GetViewKey();
                     LodInputs.BatchIndex = BatchIndex;
                     LodInputs.ViewRect = ViewRect;
                     GaussianSplatLod::SelectCellsScreen(
-                        Resources->GetCells(),
+                        SrcCells,
                         Batch.LocalToWorld,
                         View,
                         RenderPointCount,
                         LodInputs,
                         Selection,
-                        LodStats);
+                        LodStats,
+                        bPaged ? PagedAsset : nullptr,
+                        bPaged ? PagedResidency : nullptr,
+                        &PagedMisses);
+                }
+                else if (bPaged)
+                {
+                    // LOD mode 0 addresses splats by their position in the asset's
+                    // own buffer, which a paged asset does not have. Mode 1 is the
+                    // shipping mode; rather than emit ranges that point at the wrong
+                    // slots, say so once and draw nothing this batch.
+                    static bool bWarned = false;
+                    if (!bWarned)
+                    {
+                        bWarned = true;
+                        UE_LOG(
+                            LogGaussianSplatProfile,
+                            Warning,
+                            TEXT("A paged asset needs r.GaussianSplat.LodMode 1; mode 0 cannot address pool slots. ")
+                            TEXT("Nothing was drawn for this batch."));
+                    }
+                    continue;
                 }
                 else
                 {
                     GaussianSplatLod::SelectCells(
-                        Resources->GetCells(),
+                        SrcCells,
                         Batch.LocalToWorld,
                         View,
                         RenderPointCount,
@@ -2428,9 +2554,9 @@ namespace GaussianSplatPasses
                 InitSortParameters->PointSize = Batch.PointSize;
                 InitSortParameters->ViewProjectionMatrix = ViewProjection;
                 InitSortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
-                InitSortParameters->SplatPackedA = Resources->GetPackedASRV();
-                InitSortParameters->SplatPackedB = Resources->GetPackedBSRV();
-                InitSortParameters->SplatCellBounds = Resources->GetCellBoundsSRV();
+                InitSortParameters->SplatPackedA = SrcPackedA;
+                InitSortParameters->SplatPackedB = SrcPackedB;
+                InitSortParameters->SplatCellBounds = SrcCellBounds;
                 InitSortParameters->SortKeyShift = 32u - SortKeyBits;
                 InitSortParameters->SortKeyMode = GaussianSplatProfiling::GetSortKeyMode();
                 InitSortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
@@ -2472,9 +2598,9 @@ namespace GaussianSplatPasses
                             SortParameters->PointSize = 0.0f;
                             SortParameters->ViewProjectionMatrix = FMatrix44f::Identity;
                             SortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
-                            SortParameters->SplatPackedA = Resources->GetPackedASRV();
-                            SortParameters->SplatPackedB = Resources->GetPackedBSRV();
-                            SortParameters->SplatCellBounds = Resources->GetCellBoundsSRV();
+                            SortParameters->SplatPackedA = SrcPackedA;
+                            SortParameters->SplatPackedB = SrcPackedB;
+                            SortParameters->SplatCellBounds = SrcCellBounds;
                             SortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                             SortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
                             SortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
@@ -2503,10 +2629,10 @@ namespace GaussianSplatPasses
                 RasterParameters->LocalToWorldMatrix = Batch.LocalToWorld;
                 RasterParameters->ViewProjectionMatrix = ViewProjection;
                 RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedOrderBuffer, PF_R32_UINT));
-                RasterParameters->SplatPackedA = Resources->GetPackedASRV();
-                RasterParameters->SplatPackedB = Resources->GetPackedBSRV();
-                RasterParameters->SplatCellBounds = Resources->GetCellBoundsSRV();
-                RasterParameters->SplatColorEncoding = Resources->GetColorEncoding();
+                RasterParameters->SplatPackedA = SrcPackedA;
+                RasterParameters->SplatPackedB = SrcPackedB;
+                RasterParameters->SplatCellBounds = SrcCellBounds;
+                RasterParameters->SplatColorEncoding = SrcColorEncoding;
                 SetDepthTestParameters(PassParameters->PS.DepthTest);
                 PassParameters->IndirectArgsBuffer = IndirectArgsBuffer;
                 PassParameters->RenderTargets[0] = FRenderTargetBinding(
@@ -2608,10 +2734,10 @@ namespace GaussianSplatPasses
                 InitSortParameters->ProjectionMatrix = ProjectionMatrix;
                 InitSortParameters->ViewProjectionMatrix = ViewProjection;
                 InitSortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
-                InitSortParameters->SplatPackedA = Resources->GetPackedASRV();
-                InitSortParameters->SplatPackedB = Resources->GetPackedBSRV();
-                InitSortParameters->SplatCellBounds = Resources->GetCellBoundsSRV();
-                InitSortParameters->SplatColorEncoding = Resources->GetColorEncoding();
+                InitSortParameters->SplatPackedA = SrcPackedA;
+                InitSortParameters->SplatPackedB = SrcPackedB;
+                InitSortParameters->SplatCellBounds = SrcCellBounds;
+                InitSortParameters->SplatColorEncoding = SrcColorEncoding;
                 InitSortParameters->OpacityScale = Batch.OpacityScale;
                 InitSortParameters->MinSplatOpacity = GaussianSplatProfiling::GetMinSplatOpacity();
                 InitSortParameters->MaxSplatDistance = GaussianSplatProfiling::GetMaxSplatDistance();
@@ -2669,9 +2795,9 @@ namespace GaussianSplatPasses
                             SortParameters->ProjectionMatrix = FMatrix44f::Identity;
                             SortParameters->ViewProjectionMatrix = FMatrix44f::Identity;
                             SortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
-                            SortParameters->SplatPackedA = Resources->GetPackedASRV();
-                            SortParameters->SplatPackedB = Resources->GetPackedBSRV();
-                            SortParameters->SplatCellBounds = Resources->GetCellBoundsSRV();
+                            SortParameters->SplatPackedA = SrcPackedA;
+                            SortParameters->SplatPackedB = SrcPackedB;
+                            SortParameters->SplatCellBounds = SrcCellBounds;
                             SortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                             SortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
                             SortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
@@ -2715,15 +2841,15 @@ namespace GaussianSplatPasses
                     RasterParameters->WorldToLocalRow1 = Batch.WorldToLocalRow1;
                     RasterParameters->WorldToLocalRow2 = Batch.WorldToLocalRow2;
                     RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(DrawOrder, PF_R32_UINT));
-                    RasterParameters->SplatPackedA = Resources->GetPackedASRV();
-                    RasterParameters->SplatPackedB = Resources->GetPackedBSRV();
-                    RasterParameters->SplatCellBounds = Resources->GetCellBoundsSRV();
-                    RasterParameters->SplatColorEncoding = Resources->GetColorEncoding();
+                    RasterParameters->SplatPackedA = SrcPackedA;
+                    RasterParameters->SplatPackedB = SrcPackedB;
+                    RasterParameters->SplatCellBounds = SrcCellBounds;
+                    RasterParameters->SplatColorEncoding = SrcColorEncoding;
                     RasterParameters->PerPixelDepth = GaussianSplatProfiling::ShouldUsePerPixelDepth() ? 1u : 0u;
-                    RasterParameters->HasSH = Resources->HasSH() ? 1u : 0u;
+                    RasterParameters->HasSH = bSrcHasSH ? 1u : 0u;
                     RasterParameters->MinScreenVariance = GaussianSplatProfiling::GetMinScreenVariance();
-                    RasterParameters->SplatSHIndexBuffer = Resources->GetSHIndexSRV();
-                    RasterParameters->SplatSHPaletteBuffer = Resources->GetSHPaletteSRV();
+                    RasterParameters->SplatSHIndexBuffer = SrcSHIndex;
+                    RasterParameters->SplatSHPaletteBuffer = SrcSHPalette;
                     PassParameters->PS.AlphaCutoff = GaussianSplatProfiling::GetAlphaCutoff();
                     SetDepthTestParameters(PassParameters->PS.DepthTest);
                     PassParameters->IndirectArgsBuffer = DrawArgs;
@@ -2897,8 +3023,8 @@ namespace GaussianSplatPasses
                                 FlagParameters->Stride = Stride;
                                 FlagParameters->SplatCellRanges = CellRangeSRV;
                                 FlagParameters->SplatCellCount = Selection.CellCount;
-                                FlagParameters->SplatPackedA = Resources->GetPackedASRV();
-                                FlagParameters->SplatCellBounds = Resources->GetCellBoundsSRV();
+                                FlagParameters->SplatPackedA = SrcPackedA;
+                                FlagParameters->SplatCellBounds = SrcCellBounds;
                                 FlagParameters->ViewRectMin = InitSortParameters->ViewRectMin;
                                 FlagParameters->ViewSize = InitSortParameters->ViewSize;
                                 FlagParameters->PointSize = InitSortParameters->PointSize;
@@ -2955,7 +3081,10 @@ namespace GaussianSplatPasses
                     BatchIndex,
                     ViewRect,
                     LodStats,
-                    OccReadback);
+                    OccReadback,
+                    bPaged,
+                    Selection.CellCount,
+                    PagedMisses);
             }
 
             bFirstBatch = false;

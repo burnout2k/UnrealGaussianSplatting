@@ -2,6 +2,7 @@
 #include "Misc/CoreDelegates.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+#include "Render/GaussianSplatPagePool.h"
 #include "Render/GaussianSplatProbe.h"
 #include "Render/GaussianSplatViewExtension.h"
 #include "ShaderCore.h"
@@ -38,6 +39,11 @@ public:
         }
 
         GaussianSplatProbe::Shutdown();
+
+        // The pool holds pooled RDG buffers. Letting the module go while they are
+        // alive leaves the RHI holding allocations nothing owns any more, which is
+        // a crash on exit rather than a leak.
+        BeginReleaseResource(&FGaussianSplatPagePool::Get());
         ViewExtension.Reset();
     }
 

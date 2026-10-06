@@ -5,6 +5,7 @@
 #include "GaussianSplatComponent.generated.h"
 
 class UGaussianSplatAsset;
+class UGaussianSplatPagedAsset;
 class UTexture2D;
 struct FPropertyChangedEvent;
 
@@ -27,6 +28,13 @@ public:
     // 指向真正存放高斯数据的 Asset。
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Gaussian Splat")
     TObjectPtr<UGaussianSplatAsset> Asset;
+
+    // Fix 5: the same capture stored as packed pages, drawn from the process-wide
+    // pool instead of from buffers of its own. Used only while
+    // r.GaussianSplat.PagedAssets is 1, and only when Asset above is not set, so a
+    // component can carry both through a migration and switch with one CVar.
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Gaussian Splat")
+    TObjectPtr<UGaussianSplatPagedAsset> PagedAsset;
 
     // 密度缩放。实现上通过“抽样步长 Stride”实现，而不是随机删点。
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splat", meta = (ClampMin = "0.0"))

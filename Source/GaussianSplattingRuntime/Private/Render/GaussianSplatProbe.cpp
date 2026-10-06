@@ -15,6 +15,8 @@
 #include "ShaderParameterStruct.h"
 #include "UObject/UObjectIterator.h"
 
+#include "Render/GaussianSplatDeviceMemory.h"
+
 #if GAUSSIANSPLAT_WITH_VULKAN
 #include "IVulkanDynamicRHI.h"
 #endif
@@ -33,6 +35,10 @@
 // camera or not.
 
 DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatProbe, Log, All);
+
+// The budget query moved to Render/GaussianSplatDeviceMemory.h so the pool sizes itself
+// from the same numbers the probe reports.
+using namespace GaussianSplatDeviceMemory;
 
 class FGaussianSplatProbeScatterCS final : public FGlobalShader
 {
@@ -100,57 +106,6 @@ namespace
     constexpr uint32 PartSmallBytes = 16 * 1024;
     constexpr uint32 DefaultPoolMB = 512;           // the upload probe's pool when PoolMB is 0
     constexpr uint32 TimerRing = 16;                // a timestamp pair is read back this many ticks after it is written
-
-    // VK_EXT_memory_budget over the device-local heaps of at least 1 GiB (this card also has a 246 MB device-local,
-    // host-visible BAR heap, which is not VRAM for our purposes).
-    struct FDeviceMemory
-    {
-        uint64 Usage = 0;
-        uint64 Budget = 0;
-        uint64 Size = 0;
-    };
-
-    bool QueryDeviceMemory(FDeviceMemory& Out)
-    {
-        Out = FDeviceMemory();
-#if GAUSSIANSPLAT_WITH_VULKAN
-        if (GDynamicRHI == nullptr || RHIGetInterfaceType() != ERHIInterfaceType::Vulkan)
-        {
-            return false;
-        }
-        IVulkanDynamicRHI* Rhi = GetIVulkanDynamicRHI();
-        const auto GetProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
-            Rhi->RHIGetVkInstanceProcAddr("vkGetPhysicalDeviceMemoryProperties2"));
-        if (GetProperties2 == nullptr)
-        {
-            return false;
-        }
-        VkPhysicalDeviceMemoryBudgetPropertiesEXT Budget{};
-        Budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
-        VkPhysicalDeviceMemoryProperties2 Properties{};
-        Properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
-        Properties.pNext = &Budget;
-        GetProperties2(Rhi->RHIGetVkPhysicalDevice(), &Properties);
-        for (uint32 Heap = 0; Heap < Properties.memoryProperties.memoryHeapCount; ++Heap)
-        {
-            const VkMemoryHeap& Info = Properties.memoryProperties.memoryHeaps[Heap];
-            if ((Info.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 && Info.size >= (1ull << 30))
-            {
-                Out.Usage += Budget.heapUsage[Heap];
-                Out.Budget += Budget.heapBudget[Heap];
-                Out.Size += Info.size;
-            }
-        }
-        return Out.Size > 0;
-#else
-        return false;
-#endif
-    }
-
-    double ToMiB(uint64 Bytes)
-    {
-        return static_cast<double>(Bytes) / (1024.0 * 1024.0);
-    }
 
 #if GAUSSIANSPLAT_WITH_VULKAN
     // The probe's own timestamp queries. The RHI's timing queries keep a four-deep ring per query object and report
