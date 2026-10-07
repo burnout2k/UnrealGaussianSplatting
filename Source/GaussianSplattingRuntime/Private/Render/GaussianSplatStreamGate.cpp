@@ -606,10 +606,20 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     {
         return RequiredSeen.Contains(PageKey(Page.Asset, Page.GlobalPage));
     });
-    TSet<uint64> KeepSet = RequiredSeen;
+    // ONLY the required set is protected from eviction. A wanted page is prefetch:
+    // D4 says it ranks BELOW a required page, and that has to mean it yields its
+    // slot when a required page needs one -- not that it holds the slot hostage.
+    //
+    // Protecting them was a real bug, and the first capped drive found it: at a
+    // 600 MiB pool (6,400 pages) a 5,270-page required set should have fitted,
+    // but required ∪ wanted came to ~10,200 pages, so almost nothing was
+    // evictable, 57-91 required uploads failed every tick (`short`), and up to
+    // 3.88M splats went missing -- while the overflow bisection engaged (m 0.83)
+    // and could not help, because the fit was never the problem.
+    TSet<uint64> WantedSet;
     for (const FWantedPage& Page : Wanted)
     {
-        KeepSet.Add(PageKey(Page.Asset, Page.GlobalPage));
+        WantedSet.Add(PageKey(Page.Asset, Page.GlobalPage));
     }
 
     // ---- The plan. Uploads first so the order is prefix-per-cell; evictions are
@@ -661,6 +671,7 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
             FGaussianSplatStreamPage Page;
             int32 LastNeeded = MIN_int32;
             int32 PageInCell = 0;
+            bool bWanted = false;    // prefetch: evictable, but only after everything else
         };
         TArray<FCandidate> Candidates;
 
@@ -687,19 +698,24 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                 }
                 const int32 PageInCell = Resident - 1;
                 const int32 GlobalPage = Cell.FirstTailPage + PageInCell;
-                if (KeepSet.Contains(PageKey(Asset, GlobalPage)))
+                const uint64 Key = PageKey(Asset, GlobalPage);
+                if (RequiredSeen.Contains(Key))
                 {
-                    continue;
+                    continue;   // never evict what this tick needs to draw
                 }
                 Candidates.Add({
                     {Asset, GlobalPage, CellIndex},
                     Residency->LastNeededTick.IsValidIndex(GlobalPage) ? Residency->LastNeededTick[GlobalPage] : MIN_int32,
-                    PageInCell});
+                    PageInCell,
+                    WantedSet.Contains(Key)});
             }
         }
 
         Candidates.Sort([](const FCandidate& A, const FCandidate& B)
         {
+            // Prefetch goes last: a page nothing wants is always a better victim
+            // than one the look-ahead asked for, but both yield to a required page.
+            if (A.bWanted != B.bWanted) { return !A.bWanted; }
             if (A.LastNeeded != B.LastNeeded) { return A.LastNeeded < B.LastNeeded; }   // least recently needed first
             return A.PageInCell > B.PageInCell;                                          // deeper tails before shallow
         });
