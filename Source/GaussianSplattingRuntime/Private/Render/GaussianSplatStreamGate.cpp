@@ -690,24 +690,34 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                 const int32 Resident = Residency->ResidentTailPages.IsValidIndex(CellIndex)
                     ? Residency->ResidentTailPages[CellIndex]
                     : 0;
-                // Only the LAST resident page of a cell is ever a candidate, so a
-                // cell is peeled from the end and residency stays a prefix.
+                // The whole evictable SUFFIX of the cell, deepest page first -- not
+                // just its last page. Offering one page per cell per tick was a real
+                // bug: a capped drive needed dozens of slots and only 13-16 pages
+                // were ever candidates, so required uploads failed (`short` 36-93)
+                // with the pool nominally large enough.
+                //
+                // Walking from the end and stopping at the first required page keeps
+                // residency a PREFIX, which BuildPoolRuns depends on; the pages share
+                // the cell's rank and stay in descending order, so taking any prefix
+                // of the sorted candidate list still removes a valid suffix.
                 if (Resident <= 0)
                 {
                     continue;
                 }
-                const int32 PageInCell = Resident - 1;
-                const int32 GlobalPage = Cell.FirstTailPage + PageInCell;
-                const uint64 Key = PageKey(Asset, GlobalPage);
-                if (RequiredSeen.Contains(Key))
+                for (int32 PageInCell = Resident - 1; PageInCell >= 0; --PageInCell)
                 {
-                    continue;   // never evict what this tick needs to draw
+                    const int32 GlobalPage = Cell.FirstTailPage + PageInCell;
+                    const uint64 Key = PageKey(Asset, GlobalPage);
+                    if (RequiredSeen.Contains(Key))
+                    {
+                        break;   // this tick needs it, and everything below it is a prefix
+                    }
+                    Candidates.Add({
+                        {Asset, GlobalPage, CellIndex},
+                        Residency->LastNeededTick.IsValidIndex(GlobalPage) ? Residency->LastNeededTick[GlobalPage] : MIN_int32,
+                        PageInCell,
+                        WantedSet.Contains(Key)});
                 }
-                Candidates.Add({
-                    {Asset, GlobalPage, CellIndex},
-                    Residency->LastNeededTick.IsValidIndex(GlobalPage) ? Residency->LastNeededTick[GlobalPage] : MIN_int32,
-                    PageInCell,
-                    WantedSet.Contains(Key)});
             }
         }
 
@@ -717,7 +727,11 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
             // than one the look-ahead asked for, but both yield to a required page.
             if (A.bWanted != B.bWanted) { return !A.bWanted; }
             if (A.LastNeeded != B.LastNeeded) { return A.LastNeeded < B.LastNeeded; }   // least recently needed first
-            return A.PageInCell > B.PageInCell;                                          // deeper tails before shallow
+            // Within one cell, DEEPEST FIRST, so any prefix of this list is a valid
+            // suffix of that cell -- which is what keeps residency a prefix.
+            if (A.Page.Asset != B.Page.Asset) { return A.Page.Asset < B.Page.Asset; }
+            if (A.Page.CellIndex != B.Page.CellIndex) { return A.Page.CellIndex < B.Page.CellIndex; }
+            return A.PageInCell > B.PageInCell;
         });
 
         const int32 Take = FMath::Min(NeedPages, Candidates.Num());
