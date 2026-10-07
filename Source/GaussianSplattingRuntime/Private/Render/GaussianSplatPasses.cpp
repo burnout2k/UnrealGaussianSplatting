@@ -1858,6 +1858,18 @@ namespace GaussianSplatLod
             }
         }
 
+        // D4's overflow rule, second half: the gate's multiplier is the UPPER BOUND
+        // of this view's. When the pool cannot hold what the current poses want, the
+        // gate trims the required set and uploads exactly that; a view selecting
+        // above the same bound would ask for pages that were deliberately left out
+        // and draw them as misses (measured: 1.9M at a 600 MiB cap). TakeAt is
+        // monotone in the full distance, so clamping after the bisection still fits
+        // the budget.
+        if (bPaged && FGaussianSplatPagePool::IsStreamingEnabled())
+        {
+            Multiplier = FMath::Min(Multiplier, static_cast<double>(FGaussianSplatStreamGate::GetOverflowMultiplier()));
+        }
+
         TArray<uint32> Takes;
         Takes.Reserve(Candidates.Num());
         uint64 Total = 0;

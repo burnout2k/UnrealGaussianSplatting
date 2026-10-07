@@ -9,6 +9,8 @@
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 
+#include <atomic>
+
 DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatStream, Log, All);
 
 namespace
@@ -134,6 +136,19 @@ namespace
     // One tick function per world. A map rather than a member because worlds come
     // and go (PIE, level switches) and the gate itself is process-wide, like the pool.
     TMap<TWeakObjectPtr<UWorld>, TUniquePtr<FGaussianSplatGateTickFunction>> GTickFunctions;
+}
+
+namespace
+{
+    // Written once a tick by the gate (game thread), read per view by the selection
+    // (render thread). Relaxed is enough: it is a hint that bounds a bisection, and
+    // a tick of staleness costs at most one frame of slightly conservative LOD.
+    std::atomic<float> GOverflowMultiplier{1.0f};
+}
+
+float FGaussianSplatStreamGate::GetOverflowMultiplier()
+{
+    return GOverflowMultiplier.load(std::memory_order_relaxed);
 }
 
 FGaussianSplatStreamGate& FGaussianSplatStreamGate::Get()
@@ -272,6 +287,8 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
 {
     if (World == nullptr || !FGaussianSplatPagePool::IsStreamingEnabled())
     {
+        // Streaming off: no clamp, or a stale one would quietly thin every view.
+        GOverflowMultiplier.store(1.0f, std::memory_order_relaxed);
         return;
     }
 
@@ -581,6 +598,7 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
         }
     }
     Stats.OverflowMultiplier = static_cast<float>(Multiplier);
+    GOverflowMultiplier.store(Stats.OverflowMultiplier, std::memory_order_relaxed);
 
     // ---- Expand the fitted cells to pages, in prefix order per cell: the pool
     // refuses an upload that would leave a hole, because BuildPoolRuns stops at
@@ -666,14 +684,24 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     const int32 NeedPages = Plan.RequiredUploads - Pool.GetFreePageCount();
     if (NeedPages > 0)
     {
-        struct FCandidate
+        // Candidates are ranked per CELL, not per page. Ranking pages by their own
+        // LastNeededTick splits a cell apart -- a deeper page was needed less
+        // recently, so it sorts away from its neighbours -- and the plan then asks
+        // to evict page 5 while 6, 7 and 8 are still resident. The pool refuses
+        // that, correctly, because residency must stay a prefix: 12,432 refusals
+        // in one capped drive, and the required uploads failed for want of the
+        // slots those evictions would have freed.
+        struct FCandidateCell
         {
-            FGaussianSplatStreamPage Page;
-            int32 LastNeeded = MIN_int32;
-            int32 PageInCell = 0;
-            bool bWanted = false;    // prefetch: evictable, but only after everything else
+            const UGaussianSplatPagedAsset* Asset = nullptr;
+            int32 CellIndex = 0;
+            int32 FirstTailPage = 0;
+            int32 Shallowest = 0;        // the shallowest page in the evictable suffix
+            int32 Deepest = 0;           // the deepest resident page
+            int32 Rank = MIN_int32;      // the suffix's least-recently-needed page
+            bool bWanted = false;        // any page in the suffix is prefetch
         };
-        TArray<FCandidate> Candidates;
+        TArray<FCandidateCell> Candidates;
 
         TArray<const UGaussianSplatPagedAsset*> Assets;
         Pool.GetRegisteredAssets(Assets);
@@ -690,54 +718,61 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                 const int32 Resident = Residency->ResidentTailPages.IsValidIndex(CellIndex)
                     ? Residency->ResidentTailPages[CellIndex]
                     : 0;
-                // The whole evictable SUFFIX of the cell, deepest page first -- not
-                // just its last page. Offering one page per cell per tick was a real
-                // bug: a capped drive needed dozens of slots and only 13-16 pages
-                // were ever candidates, so required uploads failed (`short` 36-93)
-                // with the pool nominally large enough.
-                //
-                // Walking from the end and stopping at the first required page keeps
-                // residency a PREFIX, which BuildPoolRuns depends on; the pages share
-                // the cell's rank and stay in descending order, so taking any prefix
-                // of the sorted candidate list still removes a valid suffix.
                 if (Resident <= 0)
                 {
                     continue;
                 }
+
+                // Walk the tail from the end and stop at the first required page:
+                // what is left is a suffix, which is the only shape that may go.
+                int32 Shallowest = Resident;
+                int32 Rank = MAX_int32;
+                bool bWanted = false;
                 for (int32 PageInCell = Resident - 1; PageInCell >= 0; --PageInCell)
                 {
                     const int32 GlobalPage = Cell.FirstTailPage + PageInCell;
                     const uint64 Key = PageKey(Asset, GlobalPage);
                     if (RequiredSeen.Contains(Key))
                     {
-                        break;   // this tick needs it, and everything below it is a prefix
+                        break;
                     }
-                    Candidates.Add({
-                        {Asset, GlobalPage, CellIndex},
-                        Residency->LastNeededTick.IsValidIndex(GlobalPage) ? Residency->LastNeededTick[GlobalPage] : MIN_int32,
-                        PageInCell,
-                        WantedSet.Contains(Key)});
+                    Shallowest = PageInCell;
+                    bWanted = bWanted || WantedSet.Contains(Key);
+                    const int32 Needed = Residency->LastNeededTick.IsValidIndex(GlobalPage)
+                        ? Residency->LastNeededTick[GlobalPage]
+                        : MIN_int32;
+                    Rank = FMath::Min(Rank, Needed);
                 }
+                if (Shallowest >= Resident)
+                {
+                    continue;   // the whole tail is required
+                }
+                Candidates.Add({Asset, CellIndex, Cell.FirstTailPage, Shallowest, Resident - 1, Rank, bWanted});
             }
         }
 
-        Candidates.Sort([](const FCandidate& A, const FCandidate& B)
+        Candidates.Sort([](const FCandidateCell& A, const FCandidateCell& B)
         {
-            // Prefetch goes last: a page nothing wants is always a better victim
-            // than one the look-ahead asked for, but both yield to a required page.
+            // A cell whose suffix is pure prefetch goes last: a page nothing wants
+            // is always the better victim, but both yield to a required page.
             if (A.bWanted != B.bWanted) { return !A.bWanted; }
-            if (A.LastNeeded != B.LastNeeded) { return A.LastNeeded < B.LastNeeded; }   // least recently needed first
-            // Within one cell, DEEPEST FIRST, so any prefix of this list is a valid
-            // suffix of that cell -- which is what keeps residency a prefix.
-            if (A.Page.Asset != B.Page.Asset) { return A.Page.Asset < B.Page.Asset; }
-            if (A.Page.CellIndex != B.Page.CellIndex) { return A.Page.CellIndex < B.Page.CellIndex; }
-            return A.PageInCell > B.PageInCell;
+            return A.Rank < B.Rank;                                   // least recently needed cell first
         });
 
-        const int32 Take = FMath::Min(NeedPages, Candidates.Num());
-        for (int32 Index = 0; Index < Take; ++Index)
+        int32 Freed = 0;
+        for (const FCandidateCell& Cell : Candidates)
         {
-            Plan.Evict.Add(Candidates[Index].Page);
+            // Deepest first, so each eviction is that cell's LAST resident page at
+            // the moment the pool applies it, and residency stays a prefix.
+            for (int32 PageInCell = Cell.Deepest; PageInCell >= Cell.Shallowest && Freed < NeedPages; --PageInCell)
+            {
+                Plan.Evict.Add({Cell.Asset, Cell.FirstTailPage + PageInCell, Cell.CellIndex});
+                ++Freed;
+            }
+            if (Freed >= NeedPages)
+            {
+                break;
+            }
         }
     }
 

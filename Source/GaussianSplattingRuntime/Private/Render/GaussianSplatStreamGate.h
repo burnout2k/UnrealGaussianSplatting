@@ -121,6 +121,15 @@ public:
 
     const FGaussianSplatGateStats& GetLastStats() const { return LastStats; }
 
+    // D4: "The same multiplier is the upper bound of every view's bisection that
+    // frame." The gate solves it on the game thread; the selection reads it on the
+    // render thread. 1.0 means the required set fitted and nothing is clamped.
+    //
+    // Without this the gate trims the required set to m and uploads exactly that,
+    // and the views then select at 1.0 and ask for the pages it deliberately did
+    // not upload -- which is what 1.9M misses at a 600 MiB cap turned out to be.
+    static float GetOverflowMultiplier();
+
 private:
     // The stamps, written on the render thread and drained on the game thread.
     mutable FCriticalSection StampLock;
