@@ -47,6 +47,18 @@ namespace
         TEXT("1: one line per gate tick with the group set, the required and wanted page counts and the timings."),
         ECVF_RenderThreadSafe);
 
+    // A cell the look-ahead wants some tail of. Per cell for the same reason the
+    // required set is: expanding to pages inside the walk was the gate's largest
+    // single cost.
+    struct FWantedCell
+    {
+        const UGaussianSplatPagedAsset* Asset = nullptr;
+        int32 CellIndex = 0;
+        int32 FirstTailPage = 0;
+        int32 Pages = 0;
+        double Distance = 0.0;
+    };
+
     // One cell the gate decided it needs some tail of. Recorded rather than
     // expanded straight to pages, because the overflow bisection has to re-solve
     // every cell's take at a smaller multiplier and must not walk the grid again.
@@ -326,12 +338,13 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     // Required pages this tick, and the pages merely wanted by look-ahead. Both
     // keyed the way the pool names a page, so the plan needs no translation.
     TArray<FRequiredCell> RequiredCells;
+    TArray<FWantedCell> WantedCells;
+    TMap<uint64, int32> WantedCellIndex;
     TArray<FWantedPage> Wanted;
     // Key -> index into RequiredCells. A TSet plus FindByPredicate was a LINEAR
     // scan inside the cell walk: at 690 cells that is up to 238,000 comparisons
     // per tick, and it was most of the 1.88 ms the first measured run cost.
     TMap<uint64, int32> RequiredCellIndex;
-    TSet<uint64> WantedSeen;
 
     const auto PageKey = [](const UGaussianSplatPagedAsset* Asset, int32 GlobalPage) -> uint64
     {
@@ -529,15 +542,25 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                     continue;
                 }
 
+                // Per CELL, not per page. Enumerating wanted pages here cost a TSet
+                // contains, a TSet insert and a TArray append EACH, about 7,000 times
+                // a tick -- and the measurement says so: two runs visiting the same
+                // 212 cells differed 2.2x in gate ms while their wanted-page counts
+                // differed 1.7x. The cost tracked pages, not cells.
                 const int32 WantedPages = PagesFor(WantedDistance);
-                for (int32 PageInCell = 0; PageInCell < WantedPages; ++PageInCell)
+                if (WantedPages > 0)
                 {
-                    const int32 GlobalPage = Cell.FirstTailPage + PageInCell;
-                    const uint64 Key = PageKey(Asset, GlobalPage);
-                    if (!WantedSeen.Contains(Key))
+                    const uint64 CellKey = PageKey(Asset, CellIndex);
+                    if (int32* Found = WantedCellIndex.Find(CellKey))
                     {
-                        WantedSeen.Add(Key);
-                        Wanted.Add({Asset, CellIndex, PageInCell, GlobalPage, WantedDistance});
+                        FWantedCell& Existing = WantedCells[*Found];
+                        Existing.Pages = FMath::Max(Existing.Pages, WantedPages);
+                        Existing.Distance = FMath::Min(Existing.Distance, WantedDistance);
+                    }
+                    else
+                    {
+                        WantedCellIndex.Add(CellKey, WantedCells.Num());
+                        WantedCells.Add({Asset, CellIndex, Cell.FirstTailPage, WantedPages, WantedDistance});
                     }
                 }
             }
@@ -616,14 +639,24 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
             Required.Add({Cell.Asset, Cell.CellIndex, PageInCell, GlobalPage, Cell.Distance});
         }
     }
+    // Expand the wanted cells to pages ONCE, here, skipping anything already
+    // required -- which is most of the saving, since the two sets overlap heavily
+    // near the camera.
+    for (const FWantedCell& WCell : WantedCells)
+    {
+        for (int32 PageInCell = 0; PageInCell < WCell.Pages; ++PageInCell)
+        {
+            const int32 GlobalPage = WCell.FirstTailPage + PageInCell;
+            if (!RequiredSeen.Contains(PageKey(WCell.Asset, GlobalPage)))
+            {
+                Wanted.Add({WCell.Asset, WCell.CellIndex, PageInCell, GlobalPage, WCell.Distance});
+            }
+        }
+    }
+
     Stats.RequiredPages = Required.Num();
     Stats.WantedPages = Wanted.Num();
 
-    // Anything required is no longer merely wanted.
-    Wanted.RemoveAll([&RequiredSeen, &PageKey](const FWantedPage& Page)
-    {
-        return RequiredSeen.Contains(PageKey(Page.Asset, Page.GlobalPage));
-    });
     // ONLY the required set is protected from eviction. A wanted page is prefetch:
     // D4 says it ranks BELOW a required page, and that has to mean it yields its
     // slot when a required page needs one -- not that it holds the slot hostage.
