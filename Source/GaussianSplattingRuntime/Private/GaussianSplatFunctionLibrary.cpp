@@ -1,5 +1,6 @@
 #include "GaussianSplatFunctionLibrary.h"
 
+#include "GaussianSplatPagedAsset.h"
 #include "Import/GaussianSplatPagedImporter.h"
 
 #include "Engine/World.h"
@@ -57,4 +58,18 @@ bool UGaussianSplatFunctionLibrary::DumpLegacyBakeOrder(
         return false;
     }
     return GaussianSplatPagedImporter::DumpLegacyBakeOrder(*Asset, OutCsvPath, OutError);
+}
+
+bool UGaussianSplatFunctionLibrary::ComparePackedRecords(
+    UGaussianSplatAsset* Legacy,
+    UGaussianSplatPagedAsset* Paged,
+    int32 MaxReports,
+    FString& OutReport)
+{
+    if (Legacy == nullptr || Paged == nullptr)
+    {
+        OutReport = TEXT("both a legacy and a paged asset are needed");
+        return false;
+    }
+    return GaussianSplatPagedImporter::ComparePackedRecords(*Legacy, *Paged, MaxReports, OutReport);
 }

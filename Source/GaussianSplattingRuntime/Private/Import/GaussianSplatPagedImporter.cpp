@@ -670,6 +670,142 @@ namespace GaussianSplatPagedImporter
         return true;
     }
 
+    bool ComparePackedRecords(
+        const UGaussianSplatAsset& Legacy,
+        const UGaussianSplatPagedAsset& Paged,
+        int32 MaxReports,
+        FString& OutReport)
+    {
+        TArray<FString> Lines;
+        const auto Fail = [&Lines, &OutReport](const FString& Why)
+        {
+            Lines.Add(Why);
+            OutReport = FString::Join(Lines, TEXT("\n"));
+            return false;
+        };
+
+        if (!Paged.IsPayloadResident())
+        {
+            return Fail(TEXT("the paged asset's payload is not in RAM"));
+        }
+        if (Legacy.Cells.Num() != Paged.Cells.Num())
+        {
+            return Fail(FString::Printf(TEXT("different cell counts: legacy %d, paged %d"),
+                Legacy.Cells.Num(), Paged.Cells.Num()));
+        }
+
+        // The legacy colour range, fitted over EVERY splat exactly as
+        // FGaussianSplatRenderResources::BuildFromAssetData fits it.
+        float ColorMin = TNumericLimits<float>::Max();
+        float ColorMax = TNumericLimits<float>::Lowest();
+        for (const FVector4f& Color : Legacy.ColorsOpacity)
+        {
+            ColorMin = FMath::Min3(ColorMin, FMath::Min(Color.X, Color.Y), Color.Z);
+            ColorMax = FMath::Max3(ColorMax, FMath::Max(Color.X, Color.Y), Color.Z);
+        }
+        const FVector2f LegacyEncoding = GaussianSplatFormat::MakeColorEncoding(ColorMin, ColorMax);
+
+        Lines.Add(FString::Printf(TEXT("colour range: legacy (%.6f, %.6f), paged (%.6f, %.6f)%s"),
+            LegacyEncoding.X, LegacyEncoding.Y, Paged.ColorEncoding.X, Paged.ColorEncoding.Y,
+            LegacyEncoding == Paged.ColorEncoding ? TEXT("") : TEXT("   <-- THEY DIFFER")));
+
+        const TConstArrayView64<uint8> Payload = Paged.GetPayload();
+        const bool bHasSH = Paged.HasSH();
+        int64 BoundsMismatches = 0;
+        int64 ABytes = 0;
+        int64 BBytes = 0;
+        int32 Reported = 0;
+
+        for (int32 CellIndex = 0; CellIndex < Legacy.Cells.Num(); ++CellIndex)
+        {
+            const FGaussianSplatCell& L = Legacy.Cells[CellIndex];
+            const FGaussianSplatPagedCell& P = Paged.Cells[CellIndex];
+
+            if (L.Count != P.Count || L.BoundsMin != P.BoundsMin || L.BoundsMax != P.BoundsMax)
+            {
+                ++BoundsMismatches;
+                if (Reported < MaxReports)
+                {
+                    ++Reported;
+                    Lines.Add(FString::Printf(
+                        TEXT("cell %d: count %d/%d  min (%.6f %.6f %.6f)/(%.6f %.6f %.6f)  max (%.6f %.6f %.6f)/(%.6f %.6f %.6f)"),
+                        CellIndex, L.Count, P.Count,
+                        L.BoundsMin.X, L.BoundsMin.Y, L.BoundsMin.Z, P.BoundsMin.X, P.BoundsMin.Y, P.BoundsMin.Z,
+                        L.BoundsMax.X, L.BoundsMax.Y, L.BoundsMax.Z, P.BoundsMax.X, P.BoundsMax.Y, P.BoundsMax.Z));
+                }
+                continue;   // comparing records against different bounds would report every splat
+            }
+
+            const FVector3f Origin = L.BoundsMin;
+            const FVector3f Extent = GaussianSplatFormat::CellExtent(L.BoundsMin, L.BoundsMax);
+            const int64 FloorFirst = Paged.GetFloorFirstSlot(CellIndex);
+            const int64 TailFirst = static_cast<int64>(P.FirstTailPage) * Paged.PageSplats;
+
+            for (int32 Rank = 0; Rank < L.Count; ++Rank)
+            {
+                const int32 Source = L.FirstIndex + Rank;
+                if (!Legacy.Positions.IsValidIndex(Source) || !Legacy.Rotations.IsValidIndex(Source)
+                        || !Legacy.LogScales.IsValidIndex(Source))
+                {
+                    continue;
+                }
+
+                const FVector4f Color = Legacy.ColorsOpacity.IsValidIndex(Source)
+                    ? Legacy.ColorsOpacity[Source]
+                    : FVector4f(1.0f, 1.0f, 1.0f, 1.0f);
+                const FUintVector4 WantA = GaussianSplatFormat::PackSplatA(
+                    Legacy.Positions[Source], Origin, Extent, Legacy.LogScales[Source], Legacy.Rotations[Source]);
+                const uint32 WantB = GaussianSplatFormat::PackSplatB(Color, LegacyEncoding);
+
+                // Where the paged asset keeps that same rank. Pages are contiguous,
+                // so the tail is one run from the cell's first page.
+                const bool bFloor = Rank < P.FloorCount;
+                const int64 Slot = bFloor ? FloorFirst + Rank : TailFirst + (Rank - P.FloorCount);
+                const int64 OffA = (bFloor ? Paged.GetFloorOffsetA() : Paged.GetTailOffsetA())
+                    + Slot * GAUSSIAN_SPLAT_PACKED_A_STRIDE;
+                const int64 OffB = (bFloor ? Paged.GetFloorOffsetB() : Paged.GetTailOffsetB())
+                    + Slot * GAUSSIAN_SPLAT_PACKED_B_STRIDE;
+                if (OffA + 16 > Payload.Num() || OffB + 4 > Payload.Num())
+                {
+                    return Fail(FString::Printf(TEXT("cell %d rank %d reads past the payload (offset %lld of %lld)"),
+                        CellIndex, Rank, FMath::Max(OffA, OffB), Payload.Num()));
+                }
+
+                FUintVector4 GotA;
+                uint32 GotB = 0;
+                FMemory::Memcpy(&GotA, Payload.GetData() + OffA, sizeof(GotA));
+                FMemory::Memcpy(&GotB, Payload.GetData() + OffB, sizeof(GotB));
+
+                const bool bBadA = GotA != WantA;
+                const bool bBadB = GotB != WantB;
+                ABytes += bBadA ? 1 : 0;
+                BBytes += bBadB ? 1 : 0;
+                if ((bBadA || bBadB) && Reported < MaxReports)
+                {
+                    ++Reported;
+                    Lines.Add(FString::Printf(
+                        TEXT("cell %d rank %d (%s slot %lld): A want %08x %08x %08x %08x got %08x %08x %08x %08x | B want %08x got %08x"),
+                        CellIndex, Rank, bFloor ? TEXT("floor") : TEXT("tail"), Slot,
+                        WantA.X, WantA.Y, WantA.Z, WantA.W, GotA.X, GotA.Y, GotA.Z, GotA.W, WantB, GotB));
+                }
+            }
+        }
+
+        Lines.Add(FString::Printf(
+            TEXT("%d cells, %lld splats: %lld cells with different count or bounds, %lld PackedA mismatches, "
+                 "%lld PackedB mismatches%s"),
+            Legacy.Cells.Num(), Paged.TotalSplats, BoundsMismatches, ABytes, BBytes,
+            (BoundsMismatches || ABytes || BBytes) ? TEXT("") : TEXT("  -- IDENTICAL")));
+        if (bHasSH)
+        {
+            Lines.Add(TEXT("(SH indices are not compared: the two palettes are built over different sets by design, "
+                           "so the indices differ while the 45 floats they resolve to do not.)"));
+        }
+
+        OutReport = FString::Join(Lines, TEXT("\n"));
+        return BoundsMismatches == 0 && ABytes == 0 && BBytes == 0;
+    }
+
     bool DumpLegacyBakeOrder(const UGaussianSplatAsset& Asset, const FString& OutCsvPath, FString& OutError)
     {
         if (Asset.Cells.IsEmpty())

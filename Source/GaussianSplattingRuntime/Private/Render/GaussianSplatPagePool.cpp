@@ -338,12 +338,21 @@ int32 FGaussianSplatPagePool::AllocatePages(int32 PageCount)
     // Contiguous from the untouched space whenever it is there: a cell whose
     // pages are adjacent costs ONE range entry instead of one per page, which is
     // what keeps the lookup out of the expensive regime (plan D6).
+    //
+    // ALIGNED, because a page is addressed by its INDEX: page p lives at slot
+    // p * SlotsPerPage, so the page region has to begin on a page boundary. The
+    // floor blocks before it are variable-size and leave NextUnusedSlot wherever
+    // they end. Truncating here instead of rounding up put the first page BELOW
+    // the floor block's end and the upload overwrote it: Uno's floor is 418,347
+    // slots, 418,347 / 4,096 = 102.13, so page 102 started 555 slots inside the
+    // floor and corrupted 555 splats -- about ten of which were visible in two of
+    // six cameras (2026-10-07).
     const int64 Needed = static_cast<int64>(PageCount) * SlotsPerPage;
-    if (NextUnusedSlot + Needed <= TotalSlots)
+    const int64 Aligned = FMath::DivideAndRoundUp<int64>(NextUnusedSlot, SlotsPerPage) * SlotsPerPage;
+    if (Aligned + Needed <= TotalSlots)
     {
-        const int32 FirstPage = static_cast<int32>(NextUnusedSlot / SlotsPerPage);
-        NextUnusedSlot += Needed;
-        return FirstPage;
+        NextUnusedSlot = Aligned + Needed;
+        return static_cast<int32>(Aligned / SlotsPerPage);
     }
 
     // Otherwise the free list, which only has pages once something unregistered.

@@ -5,6 +5,7 @@
 #include "GaussianSplatFunctionLibrary.generated.h"
 
 class UGaussianSplatAsset;
+class UGaussianSplatPagedAsset;
 class UGaussianSplatComponent;
 class AGaussianSplatActor;
 class APlayerController;
@@ -36,4 +37,12 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "Gaussian Splat|Fix 5")
     static bool DumpLegacyBakeOrder(UGaussianSplatAsset* Asset, const FString& OutCsvPath, FString& OutError);
+
+    // The byte-level identity check: same order is not the same bytes.
+    UFUNCTION(BlueprintCallable, Category = "Gaussian Splat|Fix 5")
+    static bool ComparePackedRecords(
+        UGaussianSplatAsset* Legacy,
+        UGaussianSplatPagedAsset* Paged,
+        int32 MaxReports,
+        FString& OutReport);
 };

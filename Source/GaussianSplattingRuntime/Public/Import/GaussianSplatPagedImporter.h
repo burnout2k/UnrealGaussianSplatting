@@ -58,4 +58,19 @@ namespace GaussianSplatPagedImporter
         const UGaussianSplatAsset& Asset,
         const FString& OutCsvPath,
         FString& OutError);
+
+    // The identity check the order dump does NOT make: the same splats in the same
+    // order can still be PACKED differently, and a splat whose 16-bit position or
+    // fp16 scale lands one step away can fail the cull that its twin passes.
+    //
+    // Re-packs every splat of the legacy asset through the shared format functions,
+    // using the legacy asset's own cell bounds and colour range, and compares the
+    // bytes with the paged asset's payload. Reports the first MaxReports
+    // mismatches with the cell, the rank and both values, so the answer is a splat
+    // rather than a suspicion.
+    GAUSSIANSPLATTINGRUNTIME_API bool ComparePackedRecords(
+        const UGaussianSplatAsset& Legacy,
+        const UGaussianSplatPagedAsset& Paged,
+        int32 MaxReports,
+        FString& OutReport);
 }
