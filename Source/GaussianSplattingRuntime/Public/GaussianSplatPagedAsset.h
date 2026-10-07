@@ -256,8 +256,25 @@ public:
 
     // INDEX_NONE when the grid slot holds no cell -- most of a city's box is
     // empty, and the occupancy threshold drops sparse slots at bake time.
+    //
+    // A DENSE array when the coordinate box is small enough to hold one, which it
+    // is for every scene we have except Perry Road (whose 64,214 floaters stretch
+    // its bounds to 4.5 km for a 324 m street, so its box would cost 69 MiB and it
+    // keeps the map). The gate walks the whole box including its empty slots, and
+    // at a dense pose that was a TMap hash per slot -- the largest single cost in
+    // a gate tick that has a 0.5 ms budget and was measured at up to 1.55 ms.
     int32 FindCellByCoord(const FIntVector& Coord) const
     {
+        if (CellGrid.Num() > 0)
+        {
+            const FIntVector Local = Coord - CoordMin;
+            if (Local.X < 0 || Local.Y < 0 || Local.Z < 0
+                || Local.X >= GridSize.X || Local.Y >= GridSize.Y || Local.Z >= GridSize.Z)
+            {
+                return INDEX_NONE;
+            }
+            return CellGrid[(Local.X * GridSize.Y + Local.Y) * GridSize.Z + Local.Z];
+        }
         const int32* Found = CellByCoord.Find(Coord);
         return Found != nullptr ? *Found : INDEX_NONE;
     }
@@ -309,7 +326,9 @@ private:
 
     // Derived, never serialized: see GetCellCoord.
     TArray<FIntVector> CellCoords;
-    TMap<FIntVector, int32> CellByCoord;
+    TMap<FIntVector, int32> CellByCoord;    // the fallback, for an absurdly sparse box
+    TArray<int32> CellGrid;                 // dense, INDEX_NONE where empty; empty when not built
+    FIntVector GridSize = FIntVector::ZeroValue;
     FIntVector CoordMin = FIntVector::ZeroValue;
     FIntVector CoordMax = FIntVector::ZeroValue;
 };

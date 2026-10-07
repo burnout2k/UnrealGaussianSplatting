@@ -145,6 +145,39 @@ void UGaussianSplatPagedAsset::RefreshDerivedData()
             CoordMax = FIntVector(FMath::Max(CoordMax.X, Coord.X), FMath::Max(CoordMax.Y, Coord.Y), FMath::Max(CoordMax.Z, Coord.Z));
         }
     }
+
+    // The dense lookup, when the box is small enough to be worth it. The gate
+    // visits every slot of a coordinate box, empty ones included, so this replaces
+    // a hash per slot with an array index. Every scene we hold needs under 0.01 MiB
+    // of it; Perry Road alone would need 69 MiB, because its floaters stretch a
+    // 324 m street's bounds to 4.5 km, and it keeps the map instead.
+    CellGrid.Reset();
+    GridSize = FIntVector::ZeroValue;
+    if (!Cells.IsEmpty())
+    {
+        const FIntVector Size = CoordMax - CoordMin + FIntVector(1, 1, 1);
+        const int64 Entries = static_cast<int64>(Size.X) * Size.Y * Size.Z;
+        constexpr int64 MaxEntries = 4 * 1024 * 1024;   // 16 MiB of int32
+        if (Size.X > 0 && Size.Y > 0 && Size.Z > 0 && Entries > 0 && Entries <= MaxEntries)
+        {
+            GridSize = Size;
+            CellGrid.Init(INDEX_NONE, static_cast<int32>(Entries));
+            for (int32 CellIndex = 0; CellIndex < CellCoords.Num(); ++CellIndex)
+            {
+                const FIntVector Local = CellCoords[CellIndex] - CoordMin;
+                CellGrid[(Local.X * GridSize.Y + Local.Y) * GridSize.Z + Local.Z] = CellIndex;
+            }
+        }
+        else
+        {
+            UE_LOG(
+                LogGaussianSplatPaged,
+                Display,
+                TEXT("%s: coordinate box %dx%dx%d is %lld slots, past the %lld a dense lookup is worth; the gate "
+                     "will use the hash map. Usually a sign of floaters stretching the bounds."),
+                *GetName(), Size.X, Size.Y, Size.Z, Entries, MaxEntries);
+        }
+    }
 }
 
 int32 UGaussianSplatPagedAsset::GetPageSplatCount(int32 CellIndex, int32 PageInCell) const
