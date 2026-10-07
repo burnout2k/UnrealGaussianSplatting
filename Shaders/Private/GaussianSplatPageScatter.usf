@@ -1,0 +1,66 @@
+#include "/Engine/Public/Platform.ush"
+
+// Fix 5 Step 2 (plan D5): copies this tick's pages from the upload buffer into their pool slots in ONE dispatch.
+//
+// Why a scatter and not a copy per page: a page lands in three places -- PackedA, PackedB and the SH index are three
+// separate buffers -- so a copy-based upload costs three AddCopyBufferPass per page, each with two full barriers and
+// no batching (Step 0 measured that path). The scatter reads the staging buffer once over PCIe and writes all three.
+//
+// The staging layout is per page and contiguous, so the render thread's memcpy is one ParallelFor over pages:
+//   PackedA   4,096 x 16 B = 64 KiB   (one uint4 per slot)
+//   PackedB   4,096 x  4 B = 16 KiB   (one uint per slot, so one uint4 covers four slots)
+//   SHIndex   4,096 x  4 B = 16 KiB   (only when the asset has spherical harmonics)
+// A page is therefore 96 KiB with SH and 80 KiB without, and HasSH is uniform across a dispatch because a batch
+// never mixes assets.
+
+#define PAGE_SLOTS 4096u
+#define A_UINT4S 4096u        // 16 B per slot: one uint4 each
+#define SMALL_UINT4S 1024u    //  4 B per slot: four slots per uint4
+
+StructuredBuffer<uint4> SrcPages;
+StructuredBuffer<uint> DestSlots;      // per page in this batch: the destination PAGE index
+
+RWStructuredBuffer<uint4> DstPackedA;
+RWStructuredBuffer<uint> DstPackedB;
+RWStructuredBuffer<uint> DstSHIndex;
+
+uint PageCount;
+uint HasSH;
+
+[numthreads(256, 1, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    const uint PageUint4s = A_UINT4S + SMALL_UINT4S + (HasSH != 0u ? SMALL_UINT4S : 0u);
+    const uint Index = DTid.x;
+    if (Index >= PageCount * PageUint4s)
+    {
+        return;
+    }
+
+    const uint Page = Index / PageUint4s;
+    const uint Within = Index - Page * PageUint4s;
+    const uint Slot = DestSlots[Page];
+    const uint4 Value = SrcPages[Index];
+
+    if (Within < A_UINT4S)
+    {
+        DstPackedA[Slot * PAGE_SLOTS + Within] = Value;
+        return;
+    }
+
+    if (Within < A_UINT4S + SMALL_UINT4S)
+    {
+        const uint Base = Slot * PAGE_SLOTS + (Within - A_UINT4S) * 4u;
+        DstPackedB[Base + 0u] = Value.x;
+        DstPackedB[Base + 1u] = Value.y;
+        DstPackedB[Base + 2u] = Value.z;
+        DstPackedB[Base + 3u] = Value.w;
+        return;
+    }
+
+    const uint Base = Slot * PAGE_SLOTS + (Within - A_UINT4S - SMALL_UINT4S) * 4u;
+    DstSHIndex[Base + 0u] = Value.x;
+    DstSHIndex[Base + 1u] = Value.y;
+    DstSHIndex[Base + 2u] = Value.z;
+    DstSHIndex[Base + 3u] = Value.w;
+}

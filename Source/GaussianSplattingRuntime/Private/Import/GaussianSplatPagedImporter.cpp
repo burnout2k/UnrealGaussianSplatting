@@ -463,7 +463,12 @@ namespace GaussianSplatPagedImporter
             SizeP99 = static_cast<float>(FMath::Exp(static_cast<double>(LargestLog[P99Index])));
         }
 
-        const bool bHasSH = Layout.bHasSH && !Pass1.SHPalette.IsEmpty();
+        // bStripSH bakes an SH0 asset from an SH3 capture (review M1): the palette
+        // is dropped, the per-splat index is not written, and the record stride
+        // falls from 24 to 20 B. Everything else -- the bake order, the cells, the
+        // floor, the packed positions and colours -- is byte for byte the same, so
+        // the pair differs in the SH read and nothing else.
+        const bool bHasSH = Layout.bHasSH && !Pass1.SHPalette.IsEmpty() && !Options.bStripSH;
         const FVector2f ColorEncoding = GaussianSplatFormat::MakeColorEncoding(Pass1.ColorMin, Pass1.ColorMax);
         const int64 TailSplats = TailPages * GAUSSIAN_SPLAT_PAGE_SPLATS;
         const int64 RecordStride = GAUSSIAN_SPLAT_PACKED_A_STRIDE + GAUSSIAN_SPLAT_PACKED_B_STRIDE
@@ -555,6 +560,7 @@ namespace GaussianSplatPagedImporter
         OutAsset.CellSize = Pitch;
         OutAsset.MinCellOccupancy = Options.MinCellOccupancy;
         OutAsset.FloorFraction = Options.FloorFraction;
+        OutAsset.bStrippedSH = Options.bStripSH;
         OutAsset.ColorEncoding = ColorEncoding;
         OutAsset.SizeRef = SizeRef;
         OutAsset.SizeP99 = SizeP99;

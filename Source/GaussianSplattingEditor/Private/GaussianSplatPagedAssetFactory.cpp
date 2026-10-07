@@ -15,6 +15,7 @@ namespace
         Options.CellSize = Factory.CellSize;
         Options.MinCellOccupancy = Factory.MinCellOccupancy;
         Options.FloorFraction = Factory.FloorFraction;
+        Options.bStripSH = Factory.bStripSH;
         return Options;
     }
 }
@@ -106,6 +107,7 @@ EReimportResult::Type UGaussianSplatPagedAssetFactory::Reimport(UObject* Obj)
     Options.CellSize = Asset->CellSize;
     Options.MinCellOccupancy = Asset->MinCellOccupancy;
     Options.FloorFraction = Asset->FloorFraction;
+    Options.bStripSH = Asset->bStrippedSH;
 
     FString Error;
     if (!GaussianSplatPagedImporter::ImportFromFile(Asset->SourcePath, Options, *Asset, Error))

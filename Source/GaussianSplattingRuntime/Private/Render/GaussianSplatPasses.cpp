@@ -2,6 +2,7 @@
 
 #include "GaussianSplatPagedAsset.h"
 #include "Render/GaussianSplatPagePool.h"
+#include "Render/GaussianSplatStreamGate.h"
 
 #include "./GaussianSplatShaders.h"
 #include "Render/GaussianSplatRenderResources.h"
@@ -218,12 +219,46 @@ namespace GaussianSplatProfiling
             const FString PagedText = bPaged
                 ? FString::Printf(TEXT(" | pool entries %u misses %u"), PagedEntries, PagedMisses)
                 : FString();
+
+            // Fix 5 Step 2 (plan 2e, review M1/M4/M5/m7): streaming's own costs, kept
+            // SEPARATE from render ms. The headroom at the districts' worst spot is
+            // ~17-20 ms, so "the frame got slower" is not a usable signal -- which of
+            // the gate, the uploads or the raster grew has to be readable directly.
+            //   drawn       what the raster actually drew, so the cost model can be
+            //               re-fitted on that rather than on the selection (M1)
+            //   gate/upload the two halves of the streaming cost; gate is barred at 0.5 ms (M4)
+            //   thrash      pages re-uploaded within the protected age of their own
+            //               eviction; invisible in the picture and in the frame time (M5)
+            //   req#        the required-set hash: the same pose reached forwards and
+            //               backwards must print the same number (m7)
+            FString StreamText;
+            if (bPaged && FGaussianSplatPagePool::IsStreamingEnabled())
+            {
+                const FGaussianSplatStreamStats& Up = FGaussianSplatPagePool::Get().GetLastStreamStats();
+                const FGaussianSplatGateStats& Gate = FGaussianSplatStreamGate::Get().GetLastStats();
+                StreamText = FString::Printf(
+                    TEXT(" | stream req %d want %d resident %d | up %d (%.1f MiB) evict %d short %d thrash %d")
+                    TEXT(" | gate %.3f ms upload %.3f ms | m %.4f | cells %d | req# %llx"),
+                    Gate.RequiredPages,
+                    Gate.WantedPages,
+                    Gate.ResidentPages,
+                    Up.PagesUploaded,
+                    Up.UploadBytes / (1024.0 * 1024.0),
+                    Up.PagesEvicted,
+                    Up.PagesRequiredNotUploaded,
+                    Up.ThrashCount,
+                    Gate.GateMs,
+                    Up.UploadMs,
+                    Gate.OverflowMultiplier,
+                    Gate.CellsVisited,
+                    Gate.RequiredHash);
+            }
             UE_LOG(
                 LogGaussianSplatProfile,
                 Display,
                 TEXT("view %u: lod selected %u of %u budget (%.0f MiB sort scratch) ")
                 TEXT("across %u cells | visible=%u (%.1f%% of selected) | sort mode %s | batch %d")
-                TEXT(" | rect %dx%d | lod mode %d%s | select %.0f us%s%s%s%s"),
+                TEXT(" | rect %dx%d | lod mode %d%s | select %.0f us%s%s%s%s%s"),
                 ViewKey,
                 SelectedCount,
                 RenderPointCount,
@@ -244,7 +279,8 @@ namespace GaussianSplatProfiling
                 *OccText,
                 KeyText,
                 *SplitText,
-                *PagedText);
+                *PagedText,
+                *StreamText);
         }
     }
 
@@ -1734,12 +1770,9 @@ namespace GaussianSplatLod
 
         // F' = d_full / 2 at m = 1. The debug value goes through the same float Max and widening as mode 0's
         // FullDistance, so the two modes compare identical doubles.
-        double HalfFull = DebugHalf > 0.0f
-            ? static_cast<double>(FMath::Max(1.0f, DebugHalf))
-            : 0.5 * (static_cast<double>(K) * In.FocalPx * 0.35 * static_cast<double>(In.PointSize)
-                * static_cast<double>(In.SizeRef) * In.ActorScale);
-        HalfFull = FMath::Max(HalfFull, 0.5 * static_cast<double>(MinFull));
-        HalfFull = FMath::Max(HalfFull, 1.0);
+        // Shared with the settle gate (GaussianSplatLod), so the two cannot drift.
+        double HalfFull = GaussianSplatLod::ComputeHalfFull(
+            In.FocalPx, In.PointSize, In.SizeRef, In.ActorScale);
 
         struct FCandidate
         {
@@ -1776,19 +1809,15 @@ namespace GaussianSplatLod
                 FMath::Sqrt(ComputeSquaredDistanceFromBoxToPoint(WorldBox.Min, WorldBox.Max, ViewOrigin))});
         }
 
-        const float Bias = 4.0f;
-        const auto TakeAt = [&Cells, &In, MinFraction, Bias](const FCandidate& Candidate, double FullDistance) -> uint32
+        const auto TakeAt = [&Cells, &In, MinFraction](const FCandidate& Candidate, double FullDistance) -> uint32
         {
             const FGaussianSplatCell& Cell = Cells[Candidate.CellIndex];
             if (In.bFullCells)
             {
                 return static_cast<uint32>(Cell.Count);
             }
-            const double Distance = FMath::Max(Candidate.Distance, FullDistance);
-            const double Falloff = (FullDistance / Distance) * (FullDistance / Distance);
-            const float Fraction = FMath::Clamp(static_cast<float>(Bias * Falloff), MinFraction, 1.0f);
-            return static_cast<uint32>(
-                FMath::Clamp(FMath::RoundToInt(Cell.Count * Fraction), 1, Cell.Count));
+            // Shared with the settle gate, so the gate's bound is the same arithmetic.
+            return GaussianSplatLod::TakeAt(Cell.Count, Candidate.Distance, FullDistance, MinFraction);
         };
         const auto TotalAt = [&Candidates, &TakeAt](double FullDistance) -> uint64
         {
@@ -2059,6 +2088,43 @@ static bool HasOcclusionShaders(bool bBoxPath)
     return bHasAll;
 }
 
+namespace GaussianSplatLod
+{
+    float GetMinFraction()
+    {
+        // r.GaussianSplat.Lod 0 keeps every visible cell whole, as mode 0 does.
+        return (GaussianSplatProfiling::CVarLodEnabled.GetValueOnAnyThread() != 0)
+            ? FMath::Clamp(GaussianSplatProfiling::CVarLodMinFraction.GetValueOnAnyThread(), 0.0f, 1.0f)
+            : 1.0f;
+    }
+
+    double ComputeHalfFull(double FocalPx, float PointSize, float SizeRef, double ActorScale)
+    {
+        const float K = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodScreenK.GetValueOnAnyThread());
+        const float MinFull = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodMinFullDistance.GetValueOnAnyThread());
+        const float DebugHalf = GaussianSplatProfiling::CVarLodDebugHalfFullDistance.GetValueOnAnyThread();
+
+        // The debug value goes through the same float Max and widening as mode 0's
+        // FullDistance, so the two modes compare identical doubles.
+        double HalfFull = DebugHalf > 0.0f
+            ? static_cast<double>(FMath::Max(1.0f, DebugHalf))
+            : 0.5 * (static_cast<double>(K) * FocalPx * 0.35 * static_cast<double>(PointSize)
+                * static_cast<double>(SizeRef) * ActorScale);
+        HalfFull = FMath::Max(HalfFull, 0.5 * static_cast<double>(MinFull));
+        HalfFull = FMath::Max(HalfFull, 1.0);
+        return HalfFull;
+    }
+
+    uint32 TakeAt(int32 CellCount, double Distance, double FullDistance, float MinFraction)
+    {
+        constexpr float Bias = 4.0f;
+        const double Clamped = FMath::Max(Distance, FullDistance);
+        const double Falloff = (FullDistance / Clamped) * (FullDistance / Clamped);
+        const float Fraction = FMath::Clamp(static_cast<float>(Bias * Falloff), MinFraction, 1.0f);
+        return static_cast<uint32>(FMath::Clamp(FMath::RoundToInt(CellCount * Fraction), 1, CellCount));
+    }
+}
+
 namespace GaussianSplatPasses
 {
     FScreenPassTexture AddPostProcessPass(
@@ -2238,6 +2304,19 @@ namespace GaussianSplatPasses
                     LodInputs.SizeRef = SrcSizeRef;
                     LodInputs.SizeP99 = SrcSizeP99;
                     LodInputs.bFullCells = !bPerspective || Batch.RenderMode == EGaussianSplatRenderMode::Points;
+
+                    // Fix 5 Step 2 (review M6): tell the settle gate this view drew
+                    // splats. Only views the gate may serve are stamped -- perspective,
+                    // Billboards, a paged asset -- so an orthographic or Points view,
+                    // or a capture that never reaches here at all, can never inflate
+                    // the required set. The owner comes from the capture component
+                    // (SceneCaptureRendering.cpp:1284) and the gate holds it weakly.
+                    if (!LodInputs.bFullCells && Batch.PagedAsset != nullptr
+                        && FGaussianSplatPagePool::IsStreamingEnabled())
+                    {
+                        FGaussianSplatStreamGate::Get().StampView(
+                            View.ViewActor, View.ViewMatrices.GetViewOrigin(), LodInputs.FocalPx);
+                    }
                     LodInputs.ViewKey = View.GetViewKey();
                     LodInputs.BatchIndex = BatchIndex;
                     LodInputs.ViewRect = ViewRect;

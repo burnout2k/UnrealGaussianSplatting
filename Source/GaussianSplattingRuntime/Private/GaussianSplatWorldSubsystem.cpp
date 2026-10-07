@@ -1,6 +1,19 @@
 #include "GaussianSplatWorldSubsystem.h"
 
 #include "GaussianSplatComponent.h"
+#include "Render/GaussianSplatStreamGate.h"
+
+void UGaussianSplatWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+    Super::Initialize(Collection);
+    FGaussianSplatStreamGate::OnWorldInitialized(GetWorld());
+}
+
+void UGaussianSplatWorldSubsystem::Deinitialize()
+{
+    FGaussianSplatStreamGate::OnWorldTornDown(GetWorld());
+    Super::Deinitialize();
+}
 
 void UGaussianSplatWorldSubsystem::RegisterComponent(UGaussianSplatComponent* Component)
 {

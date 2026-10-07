@@ -23,6 +23,14 @@ namespace GaussianSplatPagedImporter
         // path then clamps to this baked value.
         float FloorFraction = 0.02f;
 
+        // Fix 5 Step 2 (review M1, m3): bake the capture WITHOUT its spherical
+        // harmonics even though the PLY carries them. This exists for one
+        // measurement -- Uno against Uno-nosh at the same spot, identical geometry
+        // and identical selection, the SH read the only difference -- which is what
+        // replaces the cross-scene residual the Step 2 plan used to price SH3.
+        // It also drops the palette, so the asset is ~380 MiB smaller.
+        bool bStripSH = false;
+
         // Log a line per cell-size candidate instead of importing. Used to pick a
         // cell size for a new capture.
         bool bSurveyOnly = false;

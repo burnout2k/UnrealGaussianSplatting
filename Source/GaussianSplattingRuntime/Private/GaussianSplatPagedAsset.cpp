@@ -1,5 +1,7 @@
 #include "GaussianSplatPagedAsset.h"
 
+#include "GaussianSplatFormat.h"
+
 #include "GaussianSplatAsset.h"
 #include "Serialization/CustomVersion.h"
 
@@ -101,6 +103,48 @@ void UGaussianSplatPagedAsset::RefreshDerivedData()
         Box += FBox(FVector(Cell.BoundsMin), FVector(Cell.BoundsMax));
     }
     Bounds = Cells.IsEmpty() ? FBoxSphereBounds(ForceInit) : FBoxSphereBounds(Box);
+
+    // The grid coordinate, rebuilt rather than serialized (Step 2, review M4).
+    // BoundsMin is shrink-wrapped to the splats the cell holds, and every one of
+    // them fell in this slot at bake time, so flooring it by the same pitch the
+    // importer used returns the same coordinate -- without touching the payload
+    // format or asking the four baked assets to be imported again.
+    CellCoords.SetNumUninitialized(Cells.Num());
+    CellByCoord.Empty(Cells.Num());
+    CoordMin = FIntVector::ZeroValue;
+    CoordMax = FIntVector::ZeroValue;
+
+    const float InvCellPitch = CellSize > 0.0f ? 1.0f / CellSize : 0.0f;
+    for (int32 CellIndex = 0; CellIndex < Cells.Num(); ++CellIndex)
+    {
+        const FIntVector Coord = GaussianSplatFormat::CellCoord(Cells[CellIndex].BoundsMin, InvCellPitch);
+        CellCoords[CellIndex] = Coord;
+
+        // Two cells on one coordinate would mean the gate could miss one of them,
+        // so it is worth a line rather than a silent overwrite. It cannot happen
+        // from this importer -- the bake emits one cell per occupied slot.
+        if (int32* Existing = CellByCoord.Find(Coord))
+        {
+            UE_LOG(
+                LogGaussianSplatPaged,
+                Warning,
+                TEXT("%s: cells %d and %d both map to grid slot (%d, %d, %d). The streaming gate will only find the ")
+                TEXT("first. Re-import the asset."),
+                *GetName(), *Existing, CellIndex, Coord.X, Coord.Y, Coord.Z);
+            continue;
+        }
+        CellByCoord.Add(Coord, CellIndex);
+
+        if (CellIndex == 0)
+        {
+            CoordMin = CoordMax = Coord;
+        }
+        else
+        {
+            CoordMin = FIntVector(FMath::Min(CoordMin.X, Coord.X), FMath::Min(CoordMin.Y, Coord.Y), FMath::Min(CoordMin.Z, Coord.Z));
+            CoordMax = FIntVector(FMath::Max(CoordMax.X, Coord.X), FMath::Max(CoordMax.Y, Coord.Y), FMath::Max(CoordMax.Z, Coord.Z));
+        }
+    }
 }
 
 int32 UGaussianSplatPagedAsset::GetPageSplatCount(int32 CellIndex, int32 PageInCell) const

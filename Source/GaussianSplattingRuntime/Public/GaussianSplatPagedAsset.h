@@ -140,6 +140,13 @@ public:
 
     // The median and 99th-percentile largest axis, exp(max log scale), over
     // every splat in a cell. LodMode 1's full-detail distance and cell margin.
+    // Fix 5 Step 2: this capture was baked WITHOUT its spherical harmonics on
+    // purpose (review M1). Stored so a reimport reproduces the bake rather than
+    // silently picking the SH back up -- the same reason every other bake setting
+    // is a UPROPERTY here and not a console variable.
+    UPROPERTY(VisibleAnywhere, Category = "Gaussian Splat|Bake")
+    bool bStrippedSH = false;
+
     UPROPERTY(VisibleAnywhere, Category = "Gaussian Splat|Format")
     float SizeRef = 0.0f;
 
@@ -202,7 +209,16 @@ public:
     bool IsPayloadResident() const { return PayloadBytes.Num() > 0; }
 
     // The payload, in RAM, as one buffer. Valid after PostLoad.
-    TConstArrayView64<uint8> GetPayload() const { return MakeArrayView(PayloadBytes); }
+    // Constructed explicitly, NOT with MakeArrayView: that deduces TArrayView<uint8>,
+    // whose SizeType defaults to int32 (ArrayView.h:829), so a payload past 2 GiB
+    // trips the count assertion at ArrayView.h:229 before the conversion to the
+    // 64-bit view declared here ever happens. Lublin is 5.22 GB and crashed the
+    // editor on 2026-10-07 the first time its viewport drew; every earlier asset
+    // (Uno 516 MB, San Juan 1.29 GB, Vuores 1.68 GB) was under the line.
+    TConstArrayView64<uint8> GetPayload() const
+    {
+        return TConstArrayView64<uint8>(PayloadBytes.GetData(), PayloadBytes.Num());
+    }
 
     bool HasSH() const { return !SHPalette.IsEmpty(); }
 
@@ -227,6 +243,29 @@ public:
     // Where cell c's floor block starts, in slots. A prefix sum over FloorCount,
     // computed at load rather than stored: it is derivable, and a stored copy
     // would be a second thing to keep right.
+    // Fix 5 Step 2 (review M4): the gate visits only the cells inside the floor
+    // radius, so it needs to walk a coordinate box rather than the whole table.
+    // The coordinate is NOT serialized -- it is rebuilt at load from BoundsMin
+    // and CellSize, which is exactly how the importer derived it, so every asset
+    // baked before Step 2 gains it without a re-import and the payload format is
+    // untouched.
+    FIntVector GetCellCoord(int32 CellIndex) const
+    {
+        return CellCoords.IsValidIndex(CellIndex) ? CellCoords[CellIndex] : FIntVector::ZeroValue;
+    }
+
+    // INDEX_NONE when the grid slot holds no cell -- most of a city's box is
+    // empty, and the occupancy threshold drops sparse slots at bake time.
+    int32 FindCellByCoord(const FIntVector& Coord) const
+    {
+        const int32* Found = CellByCoord.Find(Coord);
+        return Found != nullptr ? *Found : INDEX_NONE;
+    }
+
+    // The inclusive coordinate box the cells span, for clamping a gate's walk.
+    FIntVector GetCoordMin() const { return CoordMin; }
+    FIntVector GetCoordMax() const { return CoordMax; }
+
     int64 GetFloorFirstSlot(int32 CellIndex) const
     {
         return FloorFirstSlots.IsValidIndex(CellIndex) ? FloorFirstSlots[CellIndex] : 0;
@@ -267,4 +306,10 @@ private:
     TArray64<uint8> PayloadBytes;
 
     TArray<int64> FloorFirstSlots;
+
+    // Derived, never serialized: see GetCellCoord.
+    TArray<FIntVector> CellCoords;
+    TMap<FIntVector, int32> CellByCoord;
+    FIntVector CoordMin = FIntVector::ZeroValue;
+    FIntVector CoordMax = FIntVector::ZeroValue;
 };

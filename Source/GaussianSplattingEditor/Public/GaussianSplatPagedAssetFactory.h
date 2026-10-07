@@ -37,6 +37,12 @@ public:
         meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float FloorFraction = 0.02f;
 
+    // Fix 5 Step 2 (review M1): bake this capture without its spherical harmonics.
+    // The one measurement that prices SH3 directly -- Uno against Uno-nosh at the
+    // same spot, same geometry, same selection.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splat|Bake")
+    bool bStripSH = false;
+
     virtual UObject* FactoryCreateFile(
         UClass* InClass,
         UObject* InParent,

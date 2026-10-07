@@ -8,6 +8,10 @@
 #include "RenderingThread.h"
 #include "GaussianSplatFormat.h"
 #include "Render/GaussianSplatDeviceMemory.h"
+#include "GlobalShader.h"
+#include "ShaderParameterStruct.h"
+#include "DataDrivenShaderPlatformInfo.h"
+#include "Async/ParallelFor.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatPool, Log, All);
 
@@ -55,6 +59,47 @@ namespace
         TEXT("1: the physical budget. For splat-only maps, where nothing allocates a texture after the pool."),
         ECVF_RenderThreadSafe);
 
+    TAutoConsoleVariable<int32> CVarStream(
+        TEXT("r.GaussianSplat.Stream"),
+        0,
+        TEXT("0 (default): every registered paged asset is uploaded whole when it registers, as Step 1a does.\n")
+        TEXT("1: only the pinned floor is uploaded at registration and the settle gate moves tail pages in and out\n")
+        TEXT("   every tick, so an asset may be far larger than the pool. Needs r.GaussianSplat.PagedAssets 1."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarStreamProtectedTicks(
+        TEXT("r.GaussianSplat.Stream.ProtectedTicks"),
+        30,
+        TEXT("A page that left the required set within this many gate ticks is evicted only when no older candidate\n")
+        TEXT("exists. LRU already gives hysteresis except at 100%% pool occupancy, which is exactly the regime a\n")
+        TEXT("capped pool creates, so without this a pose oscillating at a cell boundary would re-upload the same\n")
+        TEXT("pages every tick -- visible as upload time, never as a wrong picture (review M5)."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarStreamMaxUploadMBPerCommand(
+        TEXT("r.GaussianSplat.Stream.MaxUploadMBPerCommand"),
+        256,
+        TEXT("No single render command carries more than this, MiB. A large required fill -- a teleport is ~1 GB --\n")
+        TEXT("is split into several commands in the same tick, so render-thread work stays bounded per command and\n")
+        TEXT("nothing comes near g.TimeoutForBlockOnRenderFence (30 s in CARLA's ini), which is fatal in a package."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarStreamParallelCopy(
+        TEXT("r.GaussianSplat.Stream.ParallelCopy"),
+        1,
+        TEXT("1 (default): fill the staging buffer with a ParallelFor over pages. Two thirds of the measured\n")
+        TEXT("0.1 ms/MiB is one render thread copying into write-combined memory at ~11 GB/s, so this is the\n")
+        TEXT("difference between ~90 ms and ~25 ms on a 1 GB teleport fill. 0 keeps the serial copy, for comparison."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarStreamMaxUploadMB(
+        TEXT("r.GaussianSplat.Stream.MaxUploadMBPerTick"),
+        32,
+        TEXT("Prefetch byte cap per gate tick, MiB. REQUIRED pages ignore it -- a camera frame must not draw a hole --\n")
+        TEXT("so this bounds only the look-ahead. 32 MiB measured +9.6 ms on the 10 Hz cycle when saturated every\n")
+        TEXT("tick; steady driving needs 4.7-6.9 MiB and the worst 1/30 s is 12 MiB, so it rarely binds."),
+        ECVF_RenderThreadSafe);
+
     // UE's texture-eviction line, r.Vulkan.EvictionLimitPercentage.
     constexpr double EvictionLimitFraction = 0.70;
 
@@ -78,6 +123,24 @@ int32 FGaussianSplatPoolResidency::GetResidentSplats(int32 CellIndex) const
     const int64 TailCount = static_cast<int64>(Cell.Count) - Cell.FloorCount;
     const int64 ResidentTail = FMath::Min(Pages * FGaussianSplatPagePool::SlotsPerPage, TailCount);
     return static_cast<int32>(Cell.FloorCount + ResidentTail);
+}
+
+int32 FGaussianSplatPoolResidency::GetTailPageSlot(
+    const UGaussianSplatPagedAsset& InAsset,
+    int32 CellIndex,
+    int32 PageInCell) const
+{
+    if (!InAsset.Cells.IsValidIndex(CellIndex))
+    {
+        return INDEX_NONE;
+    }
+    const FGaussianSplatPagedCell& Cell = InAsset.Cells[CellIndex];
+    if (PageInCell < 0 || PageInCell >= Cell.TailPageCount)
+    {
+        return INDEX_NONE;
+    }
+    const int32 Global = Cell.FirstTailPage + PageInCell;
+    return TailPageSlot.IsValidIndex(Global) ? TailPageSlot[Global] : INDEX_NONE;
 }
 
 uint32 BuildPoolRuns(
@@ -120,27 +183,43 @@ uint32 BuildPoolRuns(
         Covered += FloorTake;
     }
 
-    // Then the resident tail pages, which the allocator placed contiguously, so
-    // this normally appends exactly one more run.
+    // Then the resident tail pages, one run each, merged wherever two land in
+    // adjacent slots. Step 1a allocated a cell's pages contiguously and so got
+    // ONE entry per cell (measured: entries == cell count at G1d); streaming
+    // reuses freed slots, so adjacency is likely but no longer guaranteed, and
+    // this is where D6's entry count can grow. The stats line reports it.
     const int32 ResidentPages = Residency.ResidentTailPages.IsValidIndex(CellIndex)
         ? Residency.ResidentTailPages[CellIndex]
         : 0;
-    const int32 FirstPage = Residency.FirstTailPageSlotIndex.IsValidIndex(CellIndex)
-        ? Residency.FirstTailPageSlotIndex[CellIndex]
-        : INDEX_NONE;
-    if (ResidentPages <= 0 || FirstPage == INDEX_NONE)
+    if (ResidentPages <= 0 || Covered >= Take)
     {
         return Covered;
     }
 
     const int64 TailCount = static_cast<int64>(Cell.Count) - Cell.FloorCount;
-    const int64 ResidentTail = FMath::Min<int64>(
-        static_cast<int64>(ResidentPages) * FGaussianSplatPagePool::SlotsPerPage, TailCount);
-    const uint32 TailTake = static_cast<uint32>(FMath::Min<int64>(Take - Covered, ResidentTail));
-    if (TailTake > 0)
+    for (int32 PageInCell = 0; PageInCell < ResidentPages && Covered < Take; ++PageInCell)
     {
-        Append(static_cast<uint32>(static_cast<int64>(FirstPage) * FGaussianSplatPagePool::SlotsPerPage), TailTake);
-        Covered += TailTake;
+        const int32 Slot = Residency.GetTailPageSlot(Asset, CellIndex, PageInCell);
+        if (Slot == INDEX_NONE)
+        {
+            // Residency is a prefix by invariant, so a hole means the page table
+            // and the count disagree. Stopping is correct: drawing past a hole
+            // would read whatever the slot held before.
+            break;
+        }
+
+        // The last page of a cell is partial, so it carries only what is left.
+        const int64 PageSplats = FMath::Min<int64>(
+            FGaussianSplatPagePool::SlotsPerPage,
+            TailCount - static_cast<int64>(PageInCell) * FGaussianSplatPagePool::SlotsPerPage);
+        if (PageSplats <= 0)
+        {
+            break;
+        }
+
+        const uint32 PageTake = static_cast<uint32>(FMath::Min<int64>(Take - Covered, PageSplats));
+        Append(static_cast<uint32>(static_cast<int64>(Slot) * FGaussianSplatPagePool::SlotsPerPage), PageTake);
+        Covered += PageTake;
     }
     return Covered;
 }
@@ -374,21 +453,70 @@ int32 FGaussianSplatPagePool::AllocatePages(int32 PageCount)
 
 void FGaussianSplatPagePool::FreePagesOf(FGaussianSplatPoolResidency& Residency)
 {
-    for (int32 CellIndex = 0; CellIndex < Residency.FirstTailPageSlotIndex.Num(); ++CellIndex)
+    // The page table is the one source of truth for what this asset holds, so an
+    // unregister returns exactly those slots -- whether they were handed out in
+    // one contiguous run at registration or one at a time by the gate.
+    for (const int32 Slot : Residency.TailPageSlot)
     {
-        const int32 FirstPage = Residency.FirstTailPageSlotIndex[CellIndex];
-        const int32 Pages = Residency.ResidentTailPages.IsValidIndex(CellIndex) ? Residency.ResidentTailPages[CellIndex] : 0;
-        for (int32 Page = 0; Page < Pages; ++Page)
+        if (Slot != INDEX_NONE)
         {
-            if (FirstPage != INDEX_NONE)
-            {
-                FreePages.Add(FirstPage + Page);
-            }
+            FreePages.Add(Slot);
         }
     }
+    Residency.TailPageSlot.Reset();
     Residency.ResidentTailPages.Reset();
-    Residency.FirstTailPageSlotIndex.Reset();
+    Residency.ResidentPageCount = 0;
+    Residency.LastNeededTick.Reset();
+    Residency.EvictedTick.Reset();
     Residency.ResidentSplats = 0;
+}
+
+bool FGaussianSplatPagePool::IsStreamingEnabled()
+{
+    return ArePagedAssetsEnabled() && CVarStream.GetValueOnAnyThread() != 0;
+}
+
+int32 FGaussianSplatPagePool::AcquirePage()
+{
+    if (FreePages.Num() > 0)
+    {
+        return FreePages.Pop(EAllowShrinking::No);
+    }
+
+    // The untouched frontier, page-aligned for the same reason AllocatePages is:
+    // a page is addressed by its INDEX, so page p must begin at slot p * SlotsPerPage.
+    // Getting this wrong cost an afternoon in Step 1a (it silently overwrote 555
+    // floor splats), so the alignment is computed, never assumed.
+    const int64 Aligned = FMath::DivideAndRoundUp<int64>(NextUnusedSlot, SlotsPerPage) * SlotsPerPage;
+    if (Aligned + SlotsPerPage > TotalSlots)
+    {
+        return INDEX_NONE;
+    }
+    NextUnusedSlot = Aligned + SlotsPerPage;
+    return static_cast<int32>(Aligned / SlotsPerPage);
+}
+
+void FGaussianSplatPagePool::ReleasePage(int32 PageIndex)
+{
+    if (PageIndex != INDEX_NONE)
+    {
+        FreePages.Add(PageIndex);
+    }
+}
+
+int32 FGaussianSplatPagePool::GetFreePageCount() const
+{
+    const int64 Frontier = (TotalSlots - NextUnusedSlot) / SlotsPerPage;
+    return static_cast<int32>(FMath::Min<int64>(FreePages.Num() + FMath::Max<int64>(0, Frontier), MAX_int32));
+}
+
+void FGaussianSplatPagePool::GetRegisteredAssets(TArray<const UGaussianSplatPagedAsset*>& Out) const
+{
+    Out.Reset(Residencies.Num());
+    for (const TPair<const UGaussianSplatPagedAsset*, FGaussianSplatPoolResidency>& Pair : Residencies)
+    {
+        Out.Add(Pair.Key);
+    }
 }
 
 void FGaussianSplatPagePool::BuildAssetBuffers(
@@ -498,6 +626,158 @@ void FGaussianSplatPagePool::UploadRange(
         });
 }
 
+// D5's scatter shader. Three destination buffers, because a page lands in three
+// of them, which is exactly why a copy-based upload costs three passes per page.
+class FGaussianSplatPageScatterCS final : public FGlobalShader
+{
+public:
+    DECLARE_GLOBAL_SHADER(FGaussianSplatPageScatterCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatPageScatterCS, FGlobalShader);
+
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        // Raw, not RDG: the staging buffer is BUF_Dynamic host memory written
+        // before the graph opens, so RDG has nothing to track and no barrier to
+        // insert (D5; the Step 0 probe validated this shape).
+        SHADER_PARAMETER_SRV(StructuredBuffer<uint4>, SrcPages)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, DestSlots)
+        SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint4>, DstPackedA)
+        SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, DstPackedB)
+        SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, DstSHIndex)
+        SHADER_PARAMETER(uint32, PageCount)
+        SHADER_PARAMETER(uint32, HasSH)
+    END_SHADER_PARAMETER_STRUCT()
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+};
+
+IMPLEMENT_GLOBAL_SHADER(
+    FGaussianSplatPageScatterCS,
+    "/GaussianSplatting/Private/GaussianSplatPageScatter.usf",
+    "MainCS",
+    SF_Compute);
+
+void FGaussianSplatPagePool::UploadPageBatch(
+    const UGaussianSplatPagedAsset& Asset,
+    const TArray<int32>& GlobalPages,
+    const TArray<int32>& DestPageSlots)
+{
+    if (GlobalPages.Num() == 0 || GlobalPages.Num() != DestPageSlots.Num() || !IsAllocated())
+    {
+        return;
+    }
+
+    const bool bHasSH = !Asset.SHPalette.IsEmpty();
+    const int64 PageBytesA = SlotsPerPage * GAUSSIAN_SPLAT_PACKED_A_STRIDE;
+    const int64 PageBytesSmall = SlotsPerPage * GAUSSIAN_SPLAT_PACKED_B_STRIDE;
+    const int64 PageBytes = PageBytesA + PageBytesSmall + (bHasSH ? PageBytesSmall : 0);
+    const int64 MaxCommandBytes = static_cast<int64>(
+        FMath::Max(1, CVarStreamMaxUploadMBPerCommand.GetValueOnAnyThread())) * 1024 * 1024;
+    const int32 PagesPerCommand = FMath::Max(1, static_cast<int32>(MaxCommandBytes / PageBytes));
+    const bool bParallel = CVarStreamParallelCopy.GetValueOnAnyThread() != 0;
+
+    const TConstArrayView64<uint8> Payload = Asset.GetPayload();
+    const uint8* const SourceA = Payload.GetData() + Asset.GetTailOffsetA();
+    const uint8* const SourceB = Payload.GetData() + Asset.GetTailOffsetB();
+    const uint8* const SourceSH = bHasSH ? Payload.GetData() + Asset.GetTailOffsetSH() : nullptr;
+
+    // Split so no single render command carries more than the cap. A teleport's
+    // ~1 GB fill becomes several bounded commands in the same tick, rather than
+    // one that could sit on the render thread long enough to matter.
+    for (int32 First = 0; First < GlobalPages.Num(); First += PagesPerCommand)
+    {
+        const int32 Count = FMath::Min(PagesPerCommand, GlobalPages.Num() - First);
+        TArray<int32> Pages(GlobalPages.GetData() + First, Count);
+        TArray<uint32> Slots;
+        Slots.SetNumUninitialized(Count);
+        for (int32 Index = 0; Index < Count; ++Index)
+        {
+            Slots[Index] = static_cast<uint32>(DestPageSlots[First + Index]);
+        }
+
+        FGaussianSplatPagePool* Self = this;
+        const int64 Bytes = static_cast<int64>(Count) * PageBytes;
+        ENQUEUE_RENDER_COMMAND(GaussianSplatPageScatter)(
+            [Self, Pages = MoveTemp(Pages), Slots = MoveTemp(Slots), Bytes, PageBytes, PageBytesA,
+             PageBytesSmall, bHasSH, bParallel, SourceA, SourceB, SourceSH]
+            (FRHICommandListImmediate& RHICmdList)
+            {
+                // BUF_Dynamic: each lock hands back a FRESH host-visible block that
+                // the RHI thread swaps in, so there is no copy at unlock and no
+                // barrier before it. A static buffer's unlock records a copy with
+                // nothing ordering it against the previous tick's scatter still
+                // reading -- rare, non-deterministic corruption (D5).
+                FRHIResourceCreateInfo CreateInfo(TEXT("GaussianSplat.PageUpload"));
+                FBufferRHIRef Staging = RHICmdList.CreateStructuredBuffer(
+                    16, Bytes, BUF_Dynamic | BUF_ShaderResource, CreateInfo);
+                if (!Staging.IsValid())
+                {
+                    return;
+                }
+
+                uint8* const Mapped = static_cast<uint8*>(RHICmdList.LockBuffer(Staging, 0, Bytes, RLM_WriteOnly));
+                if (Mapped == nullptr)
+                {
+                    return;
+                }
+
+                // One page's three parts, contiguous in staging, which is what lets
+                // the fill be a ParallelFor over pages (review m2).
+                const auto FillPage = [&](int32 Index)
+                {
+                    const int64 Page = Pages[Index];
+                    const int64 SourceFirstSlot = Page * SlotsPerPage;
+                    uint8* const Dest = Mapped + static_cast<int64>(Index) * PageBytes;
+                    FMemory::Memcpy(Dest, SourceA + SourceFirstSlot * GAUSSIAN_SPLAT_PACKED_A_STRIDE, PageBytesA);
+                    FMemory::Memcpy(Dest + PageBytesA, SourceB + SourceFirstSlot * GAUSSIAN_SPLAT_PACKED_B_STRIDE, PageBytesSmall);
+                    if (bHasSH)
+                    {
+                        FMemory::Memcpy(
+                            Dest + PageBytesA + PageBytesSmall,
+                            SourceSH + SourceFirstSlot * GAUSSIAN_SPLAT_SH_INDEX_STRIDE,
+                            PageBytesSmall);
+                    }
+                };
+                if (bParallel)
+                {
+                    ParallelFor(Pages.Num(), FillPage);
+                }
+                else
+                {
+                    for (int32 Index = 0; Index < Pages.Num(); ++Index) { FillPage(Index); }
+                }
+                RHICmdList.UnlockBuffer(Staging);
+
+                FRDGBuilder GraphBuilder(RHICmdList, RDG_EVENT_NAME("GaussianSplat.PageScatter"));
+                FRDGBufferRef SlotBuffer = CreateStructuredBuffer(
+                    GraphBuilder, TEXT("GaussianSplat.PageDestSlots"),
+                    sizeof(uint32), Slots.Num(), Slots.GetData(), Slots.Num() * sizeof(uint32));
+
+                FGaussianSplatPageScatterCS::FParameters* Parameters =
+                    GraphBuilder.AllocParameters<FGaussianSplatPageScatterCS::FParameters>();
+                Parameters->SrcPages = RHICmdList.CreateShaderResourceView(Staging);
+                Parameters->DestSlots = GraphBuilder.CreateSRV(SlotBuffer);
+                Parameters->DstPackedA = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalBuffer(Self->PackedA));
+                Parameters->DstPackedB = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalBuffer(Self->PackedB));
+                Parameters->DstSHIndex = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalBuffer(Self->SHIndex));
+                Parameters->PageCount = static_cast<uint32>(Pages.Num());
+                Parameters->HasSH = bHasSH ? 1u : 0u;
+
+                const uint32 Uint4sPerPage = static_cast<uint32>(PageBytes / 16);
+                TShaderMapRef<FGaussianSplatPageScatterCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+                FComputeShaderUtils::AddPass(
+                    GraphBuilder,
+                    RDG_EVENT_NAME("GaussianSplat.PageScatter %d pages", Pages.Num()),
+                    Shader,
+                    Parameters,
+                    FComputeShaderUtils::GetGroupCount(Pages.Num() * Uint4sPerPage, 256));
+                GraphBuilder.Execute();
+            });
+    }
+}
+
 const FGaussianSplatPoolResidency* FGaussianSplatPagePool::FindResidency(const UGaussianSplatPagedAsset* Asset) const
 {
     return Residencies.Find(Asset);
@@ -558,6 +838,44 @@ const FGaussianSplatPoolResidency* FGaussianSplatPagePool::RegisterAsset(const U
         Residency.FloorSlots);
     Residency.ResidentSplats = Residency.FloorSlots;
 
+    // The per-page tables, sized once. int32 per entry over Lublin's ~1.45M pages
+    // is ~17 MiB of RAM for all three, which is the price of being able to move a
+    // single page rather than a cell's whole run.
+    const int32 TotalTailPages = static_cast<int32>(FMath::Min<int64>(Asset->TailPages, MAX_int32));
+    Residency.TailPageSlot.Init(INDEX_NONE, TotalTailPages);
+    Residency.ResidentTailPages.Init(0, Asset->Cells.Num());
+
+    if (IsStreamingEnabled())
+    {
+        // Streaming: the floor is all that registration uploads. Every tail page
+        // is the gate's to move, which is what lets an asset be larger than the
+        // pool -- Lublin is 5,928 MiB against a pool this card derives at ~2,158.
+        Residency.LastNeededTick.Init(MIN_int32, TotalTailPages);
+        Residency.EvictedTick.Init(MIN_int32, TotalTailPages);
+        Residency.bComplete = Asset->TailPages == 0;
+
+        UE_LOG(
+            LogGaussianSplatPool,
+            Display,
+            TEXT("%s registered for STREAMING: floor %lld splats resident (%.0f MiB), %lld tail pages left to the ")
+            TEXT("gate (%.0f MiB if all were resident), pool %.0f of %.0f MiB used."),
+            *Asset->GetName(),
+            Residency.FloorSlots,
+            ToMiB(Residency.FloorSlots * BytesPerSlot),
+            Asset->TailPages,
+            ToMiB(Asset->TailPages * SlotsPerPage * BytesPerSlot),
+            ToMiB((TotalSlots - GetFreeSlots()) * BytesPerSlot),
+            ToMiB(TotalSlots * BytesPerSlot));
+
+        // BuildAssetBuffers too, and not only on the whole-asset path below: the
+        // cell bounds are what a 16-bit position decodes against and the palette
+        // is what SH reads, so a streaming asset without them draws garbage with
+        // no error. Returning early past it was a bug, found before it ever ran.
+        FGaussianSplatPoolResidency& StoredStreaming = Residencies.Add(Asset, MoveTemp(Residency));
+        BuildAssetBuffers(*Asset, StoredStreaming);
+        return &StoredStreaming;
+    }
+
     // How much of the tail fits. When it all does, every cell is whole; when it
     // does not, every cell keeps the SAME FRACTION of its own pages, which is the
     // rule today's residency already uses -- thinning evenly everywhere rather
@@ -567,9 +885,6 @@ const FGaussianSplatPoolResidency* FGaussianSplatPagePool::RegisterAsset(const U
     const double Ratio = (TailPagesNeeded <= TailPagesFree || TailPagesNeeded == 0)
         ? 1.0
         : static_cast<double>(TailPagesFree) / static_cast<double>(TailPagesNeeded);
-
-    Residency.ResidentTailPages.Init(0, Asset->Cells.Num());
-    Residency.FirstTailPageSlotIndex.Init(INDEX_NONE, Asset->Cells.Num());
 
     for (int32 CellIndex = 0; CellIndex < Asset->Cells.Num(); ++CellIndex)
     {
@@ -593,8 +908,16 @@ const FGaussianSplatPoolResidency* FGaussianSplatPagePool::RegisterAsset(const U
             continue;   // the pool filled up mid-way; the rest of this cell is a miss, not an error
         }
 
-        Residency.FirstTailPageSlotIndex[CellIndex] = FirstPage;
         Residency.ResidentTailPages[CellIndex] = Wanted;
+        Residency.ResidentPageCount += Wanted;
+        for (int32 PageInCell = 0; PageInCell < Wanted; ++PageInCell)
+        {
+            const int32 Global = Cell.FirstTailPage + PageInCell;
+            if (Residency.TailPageSlot.IsValidIndex(Global))
+            {
+                Residency.TailPageSlot[Global] = FirstPage + PageInCell;
+            }
+        }
 
         const int64 SourceFirstSlot = static_cast<int64>(Cell.FirstTailPage) * SlotsPerPage;
         const int64 Slots = static_cast<int64>(Wanted) * SlotsPerPage;
@@ -638,6 +961,172 @@ const FGaussianSplatPoolResidency* FGaussianSplatPagePool::RegisterAsset(const U
     FGaussianSplatPoolResidency& Stored = Residencies.Add(Asset, MoveTemp(Residency));
     BuildAssetBuffers(*Asset, Stored);
     return &Stored;
+}
+
+void FGaussianSplatPagePool::ApplyStreamPlan(FGaussianSplatStreamPlan&& Plan, int32 TickNumber)
+{
+    StreamTick = TickNumber;
+    LastStreamStats = FGaussianSplatStreamStats();
+    LastStreamStats.OverflowMultiplierUnused = Plan.OverflowMultiplier;
+    if (!IsAllocated())
+    {
+        return;
+    }
+
+    const double StartTime = FPlatformTime::Seconds();
+    const int32 ProtectedTicks = FMath::Max(0, CVarStreamProtectedTicks.GetValueOnAnyThread());
+
+    // ---- Evictions first, so a tick that swaps pages needs no spare capacity.
+    for (const FGaussianSplatStreamPage& Page : Plan.Evict)
+    {
+        FGaussianSplatPoolResidency* Residency = Residencies.Find(Page.Asset);
+        if (Residency == nullptr || !Residency->TailPageSlot.IsValidIndex(Page.GlobalPage))
+        {
+            continue;
+        }
+        const int32 Slot = Residency->TailPageSlot[Page.GlobalPage];
+        if (Slot == INDEX_NONE)
+        {
+            continue;
+        }
+
+        // Residency is a PREFIX of a cell's pages and the drawn set depends on
+        // that (BuildPoolRuns stops at the first hole). Evicting from the middle
+        // would silently shorten the cell instead, so it is refused here rather
+        // than trusted to the gate.
+        const FGaussianSplatPagedCell& Cell = Page.Asset->Cells[Page.CellIndex];
+        const int32 PageInCell = Page.GlobalPage - Cell.FirstTailPage;
+        const int32 Resident = Residency->ResidentTailPages.IsValidIndex(Page.CellIndex)
+            ? Residency->ResidentTailPages[Page.CellIndex]
+            : 0;
+        if (PageInCell != Resident - 1)
+        {
+            UE_LOG(
+                LogGaussianSplatPool,
+                Warning,
+                TEXT("%s cell %d: asked to evict page %d of %d resident, which is not the last. Refused -- residency ")
+                TEXT("must stay a prefix."),
+                *Page.Asset->GetName(), Page.CellIndex, PageInCell, Resident);
+            continue;
+        }
+
+        Residency->TailPageSlot[Page.GlobalPage] = INDEX_NONE;
+        Residency->ResidentTailPages[Page.CellIndex] = Resident - 1;
+        if (Residency->EvictedTick.IsValidIndex(Page.GlobalPage))
+        {
+            Residency->EvictedTick[Page.GlobalPage] = StreamTick;
+        }
+        Residency->ResidentSplats -= FMath::Min<int64>(
+            SlotsPerPage,
+            static_cast<int64>(Cell.Count) - Cell.FloorCount - static_cast<int64>(PageInCell) * SlotsPerPage);
+        Residency->bComplete = false;
+        --Residency->ResidentPageCount;
+        ReleasePage(Slot);
+        ++LastStreamStats.PagesEvicted;
+    }
+
+    // ---- Then uploads. The required prefix is uncapped (D4): the pages are in
+    // RAM, so this costs memcpy and PCIe, never a wait on IO or the GPU.
+    const int64 PrefetchCapBytes = static_cast<int64>(FMath::Max(0, CVarStreamMaxUploadMB.GetValueOnAnyThread()))
+        * 1024 * 1024;
+    int64 PrefetchBytes = 0;
+
+    // Batched per asset and flushed at the end: one staging buffer and one scatter
+    // dispatch per asset rather than a lock per page (D5). HasSH is uniform inside
+    // a dispatch, which is the other reason the batch key is the asset.
+    TMap<const UGaussianSplatPagedAsset*, TPair<TArray<int32>, TArray<int32>>> Batches;
+
+    for (int32 Index = 0; Index < Plan.Upload.Num(); ++Index)
+    {
+        const FGaussianSplatStreamPage& Page = Plan.Upload[Index];
+        const bool bRequired = Index < Plan.RequiredUploads;
+
+        FGaussianSplatPoolResidency* Residency = Residencies.Find(Page.Asset);
+        if (Residency == nullptr || !Residency->TailPageSlot.IsValidIndex(Page.GlobalPage)
+            || Residency->TailPageSlot[Page.GlobalPage] != INDEX_NONE)
+        {
+            continue;
+        }
+
+        const FGaussianSplatPagedCell& Cell = Page.Asset->Cells[Page.CellIndex];
+        const int32 PageInCell = Page.GlobalPage - Cell.FirstTailPage;
+        const int32 Resident = Residency->ResidentTailPages.IsValidIndex(Page.CellIndex)
+            ? Residency->ResidentTailPages[Page.CellIndex]
+            : 0;
+        if (PageInCell != Resident)
+        {
+            continue;   // out of prefix order; the gate emits pages in order, so this is a no-op guard
+        }
+
+        const int64 PageSlots = FMath::Min<int64>(
+            SlotsPerPage,
+            static_cast<int64>(Cell.Count) - Cell.FloorCount - static_cast<int64>(PageInCell) * SlotsPerPage);
+        if (PageSlots <= 0)
+        {
+            continue;
+        }
+
+        // A whole page is uploaded even when its last slots are padding: the page
+        // is the residency unit, and the padding repeats the cell's last splat so
+        // nothing the shader can reach is uninitialised.
+        const int64 Bytes = SlotsPerPage * BytesPerSlot;
+        if (!bRequired && PrefetchBytes + Bytes > PrefetchCapBytes)
+        {
+            continue;   // prefetch stops at the cap; required pages never do
+        }
+
+        const int32 Slot = AcquirePage();
+        if (Slot == INDEX_NONE)
+        {
+            if (bRequired)
+            {
+                ++LastStreamStats.PagesRequiredNotUploaded;
+            }
+            continue;
+        }
+
+        TPair<TArray<int32>, TArray<int32>>& Batch = Batches.FindOrAdd(Page.Asset);
+        Batch.Key.Add(Page.GlobalPage);
+        Batch.Value.Add(Slot);
+
+        Residency->TailPageSlot[Page.GlobalPage] = Slot;
+        Residency->ResidentTailPages[Page.CellIndex] = Resident + 1;
+        Residency->ResidentSplats += PageSlots;
+        ++Residency->ResidentPageCount;
+
+        // Thrash: this page was evicted within the protected age and is already
+        // wanted again. It costs upload time and shows up nowhere else.
+        if (Residency->EvictedTick.IsValidIndex(Page.GlobalPage)
+            && Residency->EvictedTick[Page.GlobalPage] != MIN_int32
+            && StreamTick - Residency->EvictedTick[Page.GlobalPage] <= ProtectedTicks)
+        {
+            ++LastStreamStats.ThrashCount;
+        }
+        if (Residency->LastNeededTick.IsValidIndex(Page.GlobalPage))
+        {
+            Residency->LastNeededTick[Page.GlobalPage] = StreamTick;
+        }
+
+        ++LastStreamStats.PagesUploaded;
+        LastStreamStats.UploadBytes += Bytes;
+        if (!bRequired)
+        {
+            PrefetchBytes += Bytes;
+        }
+    }
+
+    // The copies themselves, now that the page table says where everything goes.
+    // Doing it here rather than inside the loop means one command per asset (split
+    // only by the per-command cap), not one per page.
+    for (const TPair<const UGaussianSplatPagedAsset*, TPair<TArray<int32>, TArray<int32>>>& Batch : Batches)
+    {
+        UploadPageBatch(*Batch.Key, Batch.Value.Key, Batch.Value.Value);
+    }
+
+    // Game-thread time only: the scatter itself is render-thread work, and the
+    // frame's own timing is what reports that. Calling this "upload ms" without
+    // saying so would hide the part that actually lands on the GPU.
+    LastStreamStats.UploadMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
 }
 
 void FGaussianSplatPagePool::UnregisterAsset(const UGaussianSplatPagedAsset* Asset)
