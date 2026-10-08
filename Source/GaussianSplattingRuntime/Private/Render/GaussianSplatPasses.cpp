@@ -2242,6 +2242,49 @@ namespace GaussianSplatPasses
         TShaderMapRef<FGaussianSplatBillboardsRasterPS> BillboardsRasterPS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
         bool bFirstBatch = true;
 
+        // Fix 5 Step 3 (plan D7): the per-asset table, one entry per batch, indexed by
+        // the batch id the range entries now carry. Built for EVERY batch including the
+        // ones that early-out below, so a batch's id is its index here and nothing has
+        // to renumber; an unused entry is never referenced. The legacy path reads it
+        // too -- it is simply the only batch in its own draw.
+        TArray<FGaussianSplatBatchEntry> BatchEntries;
+        BatchEntries.SetNum(FMath::Max(1, Batches.Num()));
+        for (int32 Index = 0; Index < Batches.Num(); ++Index)
+        {
+            const FGaussianSplatRenderBatch& Entry = Batches[Index];
+            FGaussianSplatBatchEntry& Out = BatchEntries[Index];
+            Out.LocalToWorld = FMatrix44f(Entry.LocalToWorld * FTranslationMatrix(PreViewTranslation));
+            Out.WorldToLocalRow0 = Entry.WorldToLocalRow0;
+            Out.WorldToLocalRow1 = Entry.WorldToLocalRow1;
+            Out.WorldToLocalRow2 = Entry.WorldToLocalRow2;
+            Out.PointSize = Entry.PointSize;
+            Out.OpacityScale = Entry.OpacityScale;
+            Out.Stride = Entry.Stride;
+            const UGaussianSplatPagedAsset* const EntryPaged = Entry.PagedAsset;
+            const bool bEntryPaged = EntryPaged != nullptr && Entry.PagedResidency != nullptr;
+            if (bEntryPaged)
+            {
+                Out.ColorEncoding = EntryPaged->ColorEncoding;
+                Out.HasSH = EntryPaged->HasSH() ? 1u : 0u;
+                // An SH0 asset has no slot; HasSH stops the read before the slot matters.
+                Out.PaletteSlot = static_cast<uint32>(FMath::Max(0, Entry.PagedResidency->PaletteSlot));
+            }
+            else if (Entry.Resources != nullptr)
+            {
+                Out.ColorEncoding = Entry.Resources->GetColorEncoding();
+                Out.HasSH = Entry.Resources->HasSH() ? 1u : 0u;
+                Out.PaletteSlot = 0;   // a legacy draw binds its own palette into slot 0
+            }
+        }
+        FRDGBufferRef BatchTable = CreateStructuredBuffer(
+            GraphBuilder,
+            TEXT("GaussianSplat.BatchTable"),
+            sizeof(FGaussianSplatBatchEntry),
+            BatchEntries.Num(),
+            BatchEntries.GetData(),
+            BatchEntries.Num() * sizeof(FGaussianSplatBatchEntry));
+        FRDGBufferSRVRef BatchTableSRV = GraphBuilder.CreateSRV(BatchTable);
+
         for (int32 BatchIndex = 0; BatchIndex < Batches.Num(); ++BatchIndex)
         {
             const FGaussianSplatRenderBatch& Batch = Batches[BatchIndex];
@@ -2981,7 +3024,30 @@ namespace GaussianSplatPasses
                     RasterParameters->HasSH = bSrcHasSH ? 1u : 0u;
                     RasterParameters->MinScreenVariance = GaussianSplatProfiling::GetMinScreenVariance();
                     RasterParameters->SplatSHIndexBuffer = SrcSHIndex;
-                    RasterParameters->SplatSHPaletteBuffer = SrcSHPalette;
+                    // Paged batches share the pool's slots; a legacy batch draws alone, so
+                    // its own palette goes in slot 0 and its table entry names slot 0.
+                    FRHIShaderResourceView* Palettes[FGaussianSplatPagePool::MaxSHPalettes] = {};
+                    if (bPaged)
+                    {
+                        Pool.GetSHPaletteSRVs(Palettes);
+                    }
+                    else
+                    {
+                        for (int32 Slot = 0; Slot < FGaussianSplatPagePool::MaxSHPalettes; ++Slot)
+                        {
+                            Palettes[Slot] = SrcSHPalette;
+                        }
+                    }
+                    RasterParameters->SplatSHPalette0 = Palettes[0];
+                    RasterParameters->SplatSHPalette1 = Palettes[1];
+                    RasterParameters->SplatSHPalette2 = Palettes[2];
+                    RasterParameters->SplatSHPalette3 = Palettes[3];
+                    RasterParameters->SplatSHPalette4 = Palettes[4];
+                    RasterParameters->SplatSHPalette5 = Palettes[5];
+                    RasterParameters->SplatSHPalette6 = Palettes[6];
+                    RasterParameters->SplatSHPalette7 = Palettes[7];
+                    static_assert(FGaussianSplatPagePool::MaxSHPalettes == 8, "bind every palette slot");
+                    RasterParameters->SplatBatches = BatchTableSRV;
                     PassParameters->PS.AlphaCutoff = GaussianSplatProfiling::GetAlphaCutoff();
                     SetDepthTestParameters(PassParameters->PS.DepthTest);
                     PassParameters->IndirectArgsBuffer = DrawArgs;
@@ -3157,6 +3223,7 @@ namespace GaussianSplatPasses
                                 FlagParameters->SplatCellCount = Selection.CellCount;
                                 FlagParameters->SplatPackedA = SrcPackedA;
                                 FlagParameters->SplatCellBounds = SrcCellBounds;
+                                FlagParameters->SplatBatches = BatchTableSRV;
                                 FlagParameters->ViewRectMin = InitSortParameters->ViewRectMin;
                                 FlagParameters->ViewSize = InitSortParameters->ViewSize;
                                 FlagParameters->PointSize = InitSortParameters->PointSize;

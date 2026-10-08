@@ -24,9 +24,32 @@
 // rotation and scale they are built from both quantize well.
 
 // x = first resident splat of the cell, y = where its run starts in the
-// dispatch, z = the cell's index into SplatCellBounds.
+// dispatch, z = the cell's index into SplatCellBounds (GLOBAL since Step 3: the
+// pool concatenates every registered asset's cells), w = the batch it belongs to.
 StructuredBuffer<uint4> SplatCellRanges;
 uint SplatCellCount;
+
+// Fix 5 Step 3 (plan D7): everything that is per ASSET rather than per view, so one
+// draw can cover several districts. Indexed by the batch id in SplatCellRanges[].w.
+//
+// Why a table and not uniforms: a single sort across assets puts splats from
+// different actors in one draw, and each needs its own transform, point size,
+// colour range and palette. 144 bytes per batch, a handful of entries.
+struct FGaussianSplatBatch
+{
+    float4x4 LocalToWorld;        // LOCAL TO TRANSLATED WORLD -- relative to the view origin
+    float4 WorldToLocalRow0;      // rotation only, for turning a world direction into asset space
+    float4 WorldToLocalRow1;
+    float4 WorldToLocalRow2;
+    float2 ColorEncoding;         // (min, range) RGB was quantized over
+    float PointSize;
+    float OpacityScale;
+    uint HasSH;                   // 0 for a degree-0 capture: its SH slots hold whatever was there before
+    uint PaletteSlot;             // which SplatSHPalettes[] entry holds this asset's coefficients
+    uint Stride;                  // the no-cells fallback's thinning stride
+    uint Pad;
+};
+StructuredBuffer<FGaussianSplatBatch> SplatBatches;
 
 StructuredBuffer<uint4> SplatPackedA;
 StructuredBuffer<uint> SplatPackedB;
@@ -35,12 +58,15 @@ StructuredBuffer<uint> SplatPackedB;
 StructuredBuffer<float4> SplatCellBounds;
 
 // (min, range) that RGB was quantized over, fitted to the capture at build time.
+// Still a uniform for the passes that draw ONE batch and never read the table --
+// the culls. The raster and the occlusion recompute take it from the batch instead.
 float2 SplatColorEncoding;
 
 struct FSplatRef
 {
     uint Index;
     uint Cell;
+    uint Batch;
 };
 
 FSplatRef ResolveSplat(uint DispatchIndex, uint Stride)
@@ -51,6 +77,7 @@ FSplatRef ResolveSplat(uint DispatchIndex, uint Stride)
     {
         Result.Index = DispatchIndex * max(Stride, 1);
         Result.Cell = 0;
+        Result.Batch = 0;
         return Result;
     }
 
@@ -73,6 +100,7 @@ FSplatRef ResolveSplat(uint DispatchIndex, uint Stride)
 
     Result.Index = SplatCellRanges[Lo].x + (DispatchIndex - SplatCellRanges[Lo].y);
     Result.Cell = SplatCellRanges[Lo].z;
+    Result.Batch = SplatCellRanges[Lo].w;
     return Result;
 }
 
@@ -145,7 +173,7 @@ void DecodeSplatCovariance(uint Index, float ScaleFactor, out float3 Cov3D0, out
 // RGB share one affine range fitted to the capture; a fixed [0,1] would clamp,
 // since 3DGS colour is 0.5 + 0.28209 * f_dc and this capture reaches 2.259.
 // Opacity comes from a sigmoid so it always occupies [0,1].
-float4 DecodeSplatColor(uint Index)
+float4 DecodeSplatColor(uint Index, float2 Encoding)
 {
     const uint Bits = SplatPackedB[Index];
     const float4 Quantised = float4(
@@ -154,5 +182,11 @@ float4 DecodeSplatColor(uint Index)
         (Bits >> 16) & 0xFF,
         (Bits >> 24) & 0xFF) * (1.0 / 255.0);
 
-    return float4(Quantised.rgb * SplatColorEncoding.y + SplatColorEncoding.x, Quantised.a);
+    return float4(Quantised.rgb * Encoding.y + Encoding.x, Quantised.a);
+}
+
+// The culls draw one batch and keep their uniform.
+float4 DecodeSplatColor(uint Index)
+{
+    return DecodeSplatColor(Index, SplatColorEncoding);
 }

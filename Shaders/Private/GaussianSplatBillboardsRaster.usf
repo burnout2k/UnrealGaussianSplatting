@@ -6,7 +6,22 @@
 Buffer<uint> SplatOrderBuffer;
 // One index per splat into a palette of distinct 45-float coefficient sets.
 StructuredBuffer<uint> SplatSHIndexBuffer;
-StructuredBuffer<float> SplatSHPaletteBuffer;
+// Fix 5 Step 3 (review M5): one palette PER ASSET, bound as an array and chosen by
+// the batch's slot. NOT one concatenated buffer: FRHIBufferDesc::Size is a uint32, so
+// a single buffer caps at 4 GiB = 23.86M degree-3 entries, and concatenating would
+// apply that cap to the SUM across districts. The switch below keeps the index static,
+// so this needs no descriptor indexing and no bindless.
+// EIGHT NAMED BUFFERS, not StructuredBuffer<float>[8]: an HLSL array of structured
+// buffers does not survive this compiler ("subscripted value is not an array"), and
+// SHADER_PARAMETER_SRV_ARRAY has no precedent in the engine's own renderer.
+StructuredBuffer<float> SplatSHPalette0;
+StructuredBuffer<float> SplatSHPalette1;
+StructuredBuffer<float> SplatSHPalette2;
+StructuredBuffer<float> SplatSHPalette3;
+StructuredBuffer<float> SplatSHPalette4;
+StructuredBuffer<float> SplatSHPalette5;
+StructuredBuffer<float> SplatSHPalette6;
+StructuredBuffer<float> SplatSHPalette7;
 
 float2 ViewRectMin;
 float2 ViewSize;
@@ -37,21 +52,27 @@ static const float SH_C1 = 0.4886025;
 static const float SH_C2[5] = { 1.0925484, -1.0925484, 0.3153916, -1.0925484, 0.5462742 };
 static const float SH_C3[7] = { -0.5900436, 2.8906114, -0.4570458, 0.3731763, -0.4570458, 1.4453057, -0.5900436 };
 
-float3 LoadSHCoeff(uint SHBase, uint CoeffIndex)
+float3 LoadSHCoeff(uint Slot, uint SHBase, uint CoeffIndex)
 {
     const uint Offset = SHBase + CoeffIndex * 3;
-    return float3(
-        SplatSHPaletteBuffer[Offset + 0],
-        SplatSHPaletteBuffer[Offset + 1],
-        SplatSHPaletteBuffer[Offset + 2]);
+    #define GS_FETCH(N) case N: return float3(SplatSHPalette##N[Offset + 0], \
+                                              SplatSHPalette##N[Offset + 1], \
+                                              SplatSHPalette##N[Offset + 2])
+    switch (Slot)
+    {
+        GS_FETCH(0); GS_FETCH(1); GS_FETCH(2); GS_FETCH(3);
+        GS_FETCH(4); GS_FETCH(5); GS_FETCH(6); GS_FETCH(7);
+    }
+    #undef GS_FETCH
+    return float3(0.0, 0.0, 0.0);
 }
 
-float3 WorldDirToLocal(uint InstanceID, float3 WorldDir)
+float3 WorldDirToLocal(FGaussianSplatBatch Batch, float3 WorldDir)
 {
     return float3(
-        dot(WorldToLocalRow0.xyz, WorldDir),
-        dot(WorldToLocalRow1.xyz, WorldDir),
-        dot(WorldToLocalRow2.xyz, WorldDir));
+        dot(Batch.WorldToLocalRow0.xyz, WorldDir),
+        dot(Batch.WorldToLocalRow1.xyz, WorldDir),
+        dot(Batch.WorldToLocalRow2.xyz, WorldDir));
 }
 
 float3 UELocalDirToColmapLocal(float3 UELocalDir)
@@ -65,15 +86,15 @@ float3 UELocalDirToColmapLocal(float3 UELocalDir)
         UELocalDir.x);
 }
 
-float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
+float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS, FGaussianSplatBatch Batch)
 {
-    float3 Dir = -normalize(UELocalDirToColmapLocal(WorldDirToLocal(InstanceID, ViewDirWS)));
+    float3 Dir = -normalize(UELocalDirToColmapLocal(WorldDirToLocal(Batch, ViewDirWS)));
     float X = Dir.x;
     float Y = Dir.y;
     float Z = Dir.z;
 
     float3 Result = BaseColor;
-    if (HasSH == 0)
+    if (Batch.HasSH == 0)
     {
         // Degree-0 capture: the SH buffer holds one dummy element, not per-splat
         // data. Reading it would sample garbage.
@@ -81,7 +102,7 @@ float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
     }
 
     const uint SHBase = SplatSHIndexBuffer[InstanceID] * 45;
-    Result += SH_C1 * (-LoadSHCoeff(SHBase, 0) * Y + LoadSHCoeff(SHBase, 1) * Z - LoadSHCoeff(SHBase, 2) * X);
+    Result += SH_C1 * (-LoadSHCoeff(Batch.PaletteSlot, SHBase, 0) * Y + LoadSHCoeff(Batch.PaletteSlot, SHBase, 1) * Z - LoadSHCoeff(Batch.PaletteSlot, SHBase, 2) * X);
 
     float XX = X * X;
     float YY = Y * Y;
@@ -91,20 +112,20 @@ float3 EvaluateSH(float3 BaseColor, uint InstanceID, float3 ViewDirWS)
     float XZ = X * Z;
 
     Result +=
-        (SH_C2[0] * XY) * LoadSHCoeff(SHBase, 3) +
-        (SH_C2[1] * YZ) * LoadSHCoeff(SHBase, 4) +
-        (SH_C2[2] * (2.0 * ZZ - XX - YY)) * LoadSHCoeff(SHBase, 5) +
-        (SH_C2[3] * XZ) * LoadSHCoeff(SHBase, 6) +
-        (SH_C2[4] * (XX - YY)) * LoadSHCoeff(SHBase, 7);
+        (SH_C2[0] * XY) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 3) +
+        (SH_C2[1] * YZ) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 4) +
+        (SH_C2[2] * (2.0 * ZZ - XX - YY)) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 5) +
+        (SH_C2[3] * XZ) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 6) +
+        (SH_C2[4] * (XX - YY)) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 7);
 
     Result +=
-        (SH_C3[0] * Y * (3.0 * XX - YY)) * LoadSHCoeff(SHBase, 8) +
-        (SH_C3[1] * XY * Z) * LoadSHCoeff(SHBase, 9) +
-        (SH_C3[2] * Y * (4.0 * ZZ - XX - YY)) * LoadSHCoeff(SHBase, 10) +
-        (SH_C3[3] * Z * (2.0 * ZZ - 3.0 * XX - 3.0 * YY)) * LoadSHCoeff(SHBase, 11) +
-        (SH_C3[4] * X * (4.0 * ZZ - XX - YY)) * LoadSHCoeff(SHBase, 12) +
-        (SH_C3[5] * Z * (XX - YY)) * LoadSHCoeff(SHBase, 13) +
-        (SH_C3[6] * X * (XX - 3.0 * YY)) * LoadSHCoeff(SHBase, 14);
+        (SH_C3[0] * Y * (3.0 * XX - YY)) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 8) +
+        (SH_C3[1] * XY * Z) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 9) +
+        (SH_C3[2] * Y * (4.0 * ZZ - XX - YY)) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 10) +
+        (SH_C3[3] * Z * (2.0 * ZZ - 3.0 * XX - 3.0 * YY)) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 11) +
+        (SH_C3[4] * X * (4.0 * ZZ - XX - YY)) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 12) +
+        (SH_C3[5] * Z * (XX - YY)) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 13) +
+        (SH_C3[6] * X * (XX - 3.0 * YY)) * LoadSHCoeff(Batch.PaletteSlot, SHBase, 14);
 
     return max(Result, 0.0);
 }
@@ -126,9 +147,11 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     VSOutput Output = (VSOutput)0;
 
     const FSplatRef Splat = ResolveSplat(SplatOrderBuffer[InstanceID], Stride);
+    // Everything per asset comes from here, so one draw can span districts (D7).
+    const FGaussianSplatBatch Batch = SplatBatches[Splat.Batch];
     InstanceID = Splat.Index;
 
-    float3 CenterWS = mul(float4(DecodeSplatPosition(Splat.Index, Splat.Cell), 1.0), LocalToWorldMatrix).xyz;
+    float3 CenterWS = mul(float4(DecodeSplatPosition(Splat.Index, Splat.Cell), 1.0), Batch.LocalToWorld).xyz;
     float SafeClipW = 0.0;
     float DeviceZ = 0.0;
     float2 CenterPx = ProjectToPixel(CenterWS, SafeClipW, DeviceZ);
@@ -140,14 +163,14 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
 
     float3 Cov3D0;
     float3 Cov3D1;
-    DecodeSplatCovariance(Splat.Index, PointSize * 0.35, Cov3D0, Cov3D1);
+    DecodeSplatCovariance(Splat.Index, Batch.PointSize * 0.35, Cov3D0, Cov3D1);
 
     float2 DepthGradientPx;
     float3 Cov2D = CalcCovariance2DEx(
         CenterWS,
         Cov3D0,
         Cov3D1,
-        LocalToWorldMatrix,
+        Batch.LocalToWorld,
         ViewMatrix,
         ProjectionMatrix,
         ViewSize,
@@ -207,13 +230,14 @@ VSOutput MainVS(uint VertexID : SV_VertexID, uint InstanceID : SV_InstanceID)
     Output.QuadPos = QuadPos;
 
     float3 ViewDirWS = normalize(ViewWorldOrigin.xyz - CenterWS);
-    float4 BaseColor = DecodeSplatColor(InstanceID);
+    float4 BaseColor = DecodeSplatColor(InstanceID, Batch.ColorEncoding);
     Output.Color = float4(
         EvaluateSH(
             BaseColor.rgb,
             InstanceID,
-            ViewDirWS),
-        saturate(BaseColor.a * OpacityScale));
+            ViewDirWS,
+            Batch),
+        saturate(BaseColor.a * Batch.OpacityScale));
     return Output;
 }
 

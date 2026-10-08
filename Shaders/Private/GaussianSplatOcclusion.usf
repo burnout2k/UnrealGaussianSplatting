@@ -242,18 +242,21 @@ float2 OccProjectToPixel(float3 WorldPos, out float SafeClipW)
 bool IsRecomputedBoxHidden(uint DispatchIndex)
 {
     const FSplatRef Splat = ResolveSplat(DispatchIndex, Stride);
-    const float3 CenterWS = mul(float4(DecodeSplatPosition(Splat.Index, Splat.Cell), 1.0), LocalToWorldMatrix).xyz;
+    // Fix 5 Step 3 (review M3): the recompute path is per splat too, so it takes the
+    // asset's transform and point size from the batch table rather than a uniform.
+    const FGaussianSplatBatch Batch = SplatBatches[Splat.Batch];
+    const float3 CenterWS = mul(float4(DecodeSplatPosition(Splat.Index, Splat.Cell), 1.0), Batch.LocalToWorld).xyz;
     float SafeClipW = 0.0;
     const float2 CenterPx = OccProjectToPixel(CenterWS, SafeClipW);
 
     float3 Cov3D0;
     float3 Cov3D1;
-    DecodeSplatCovariance(Splat.Index, PointSize * 0.35, Cov3D0, Cov3D1);
+    DecodeSplatCovariance(Splat.Index, Batch.PointSize * 0.35, Cov3D0, Cov3D1);
     float3 Cov2D = CalcCovariance2D(
         CenterWS,
         Cov3D0,
         Cov3D1,
-        LocalToWorldMatrix,
+        Batch.LocalToWorld,
         ViewMatrix,
         ProjectionMatrix,
         ViewSize);

@@ -137,6 +137,26 @@ public:
     END_SHADER_PARAMETER_STRUCT()
 };
 
+// Fix 5 Step 3 (plan D7): the per-asset values a draw spanning several districts
+// needs, indexed by the batch id in SplatCellRanges[].w. MUST match struct
+// FGaussianSplatBatch in Shaders/Private/GaussianSplatCellLookup.ush field for
+// field -- 144 bytes, 16-byte aligned.
+struct FGaussianSplatBatchEntry
+{
+    FMatrix44f LocalToWorld = FMatrix44f::Identity;   // local to TRANSLATED world
+    FVector4f WorldToLocalRow0 = FVector4f(1, 0, 0, 0);
+    FVector4f WorldToLocalRow1 = FVector4f(0, 1, 0, 0);
+    FVector4f WorldToLocalRow2 = FVector4f(0, 0, 1, 0);
+    FVector2f ColorEncoding = FVector2f::ZeroVector;
+    float PointSize = 1.0f;
+    float OpacityScale = 1.0f;
+    uint32 HasSH = 0;
+    uint32 PaletteSlot = 0;
+    uint32 Stride = 1;
+    uint32 Pad = 0;
+};
+static_assert(sizeof(FGaussianSplatBatchEntry) == 144, "FGaussianSplatBatchEntry must match the HLSL struct");
+
 class FGaussianSplatBillboardsRasterVS final : public FGlobalShader
 {
 public:
@@ -168,7 +188,20 @@ public:
         SHADER_PARAMETER(float, MinScreenVariance)
         SHADER_PARAMETER(uint32, PerPixelDepth)
         SHADER_PARAMETER_SRV(StructuredBuffer<uint>, SplatSHIndexBuffer)
-        SHADER_PARAMETER_SRV(StructuredBuffer<float>, SplatSHPaletteBuffer)
+        // Fix 5 Step 3 (review M5): one palette per asset, chosen by the batch's slot.
+        // Eight NAMED parameters rather than an array: an HLSL array of structured
+        // buffers does not compile here. Keep this count and the shader's switch in
+        // step with FGaussianSplatPagePool::MaxSHPalettes.
+        SHADER_PARAMETER_SRV(StructuredBuffer<float>, SplatSHPalette0)
+        SHADER_PARAMETER_SRV(StructuredBuffer<float>, SplatSHPalette1)
+        SHADER_PARAMETER_SRV(StructuredBuffer<float>, SplatSHPalette2)
+        SHADER_PARAMETER_SRV(StructuredBuffer<float>, SplatSHPalette3)
+        SHADER_PARAMETER_SRV(StructuredBuffer<float>, SplatSHPalette4)
+        SHADER_PARAMETER_SRV(StructuredBuffer<float>, SplatSHPalette5)
+        SHADER_PARAMETER_SRV(StructuredBuffer<float>, SplatSHPalette6)
+        SHADER_PARAMETER_SRV(StructuredBuffer<float>, SplatSHPalette7)
+        // Per-asset values for a draw that may span several (plan D7).
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGaussianSplatBatchEntry>, SplatBatches)
     END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -406,6 +439,9 @@ BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatOcclusionParameters, )
     SHADER_PARAMETER(FMatrix44f, ProjectionMatrix)
     SHADER_PARAMETER(FMatrix44f, ViewProjectionMatrix)
     SHADER_PARAMETER(FMatrix44f, LocalToWorldMatrix)
+    // Fix 5 Step 3 (review M3): the recompute path is per splat, so it needs the
+    // same per-asset table the raster reads.
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGaussianSplatBatchEntry>, SplatBatches)
 END_SHADER_PARAMETER_STRUCT()
 
 // Vulkan only, like mode 2: the only platform the hidden-splat cull is validated on. The passes check that every
