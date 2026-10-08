@@ -2238,7 +2238,13 @@ namespace GaussianSplatPasses
         TShaderMapRef<FGaussianSplatBillboardsCullCS> BillboardsCullCS(GetGlobalShaderMap(GMaxRHIFeatureLevel), CullWithoutBox);
         TShaderMapRef<FGaussianSplatPointsRasterVS> PointsRasterVS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
         TShaderMapRef<FGaussianSplatPointsRasterPS> PointsRasterPS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-        TShaderMapRef<FGaussianSplatBillboardsRasterVS> BillboardsRasterVS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+        // One batch per draw until the single sort lands, so the cheap permutation is
+        // always the right one here. Landing 3 chooses it per draw, from whether the
+        // draw's batches actually use more than one palette.
+        FGaussianSplatBillboardsRasterVS::FPermutationDomain RasterPermutation;
+        RasterPermutation.Set<FGaussianSplatBillboardsRasterVS::FMultiPalette>(false);
+        TShaderMapRef<FGaussianSplatBillboardsRasterVS> BillboardsRasterVS(
+            GetGlobalShaderMap(GMaxRHIFeatureLevel), RasterPermutation);
         TShaderMapRef<FGaussianSplatBillboardsRasterPS> BillboardsRasterPS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
         bool bFirstBatch = true;
 
@@ -3024,19 +3030,14 @@ namespace GaussianSplatPasses
                     RasterParameters->HasSH = bSrcHasSH ? 1u : 0u;
                     RasterParameters->MinScreenVariance = GaussianSplatProfiling::GetMinScreenVariance();
                     RasterParameters->SplatSHIndexBuffer = SrcSHIndex;
-                    // Paged batches share the pool's slots; a legacy batch draws alone, so
-                    // its own palette goes in slot 0 and its table entry names slot 0.
+                    // This draw covers one batch, so it needs one palette and the cheap
+                    // permutation reads slot 0 whatever the table says. Binding the pool's
+                    // eight slots here instead would be correct and would also compile the
+                    // switch, which measured 3.52 ms on a degree-3 capture.
                     FRHIShaderResourceView* Palettes[FGaussianSplatPagePool::MaxSHPalettes] = {};
-                    if (bPaged)
+                    for (int32 Slot = 0; Slot < FGaussianSplatPagePool::MaxSHPalettes; ++Slot)
                     {
-                        Pool.GetSHPaletteSRVs(Palettes);
-                    }
-                    else
-                    {
-                        for (int32 Slot = 0; Slot < FGaussianSplatPagePool::MaxSHPalettes; ++Slot)
-                        {
-                            Palettes[Slot] = SrcSHPalette;
-                        }
+                        Palettes[Slot] = SrcSHPalette;
                     }
                     RasterParameters->SplatSHPalette0 = Palettes[0];
                     RasterParameters->SplatSHPalette1 = Palettes[1];

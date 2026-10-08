@@ -160,6 +160,13 @@ static_assert(sizeof(FGaussianSplatBatchEntry) == 144, "FGaussianSplatBatchEntry
 class FGaussianSplatBillboardsRasterVS final : public FGlobalShader
 {
 public:
+    // True only when one draw covers assets with DIFFERENT SH palettes. The switch it
+    // compiles in costs 3.52 ms on a dense degree-3 capture, so every draw that needs
+    // one palette is compiled without it (measured 2026-10-08).
+    class FMultiPalette : SHADER_PERMUTATION_BOOL("GAUSSIAN_SPLAT_MULTI_PALETTE");
+    using FPermutationDomain = TShaderPermutationDomain<FMultiPalette>;
+
+public:
     DECLARE_GLOBAL_SHADER(FGaussianSplatBillboardsRasterVS);
     SHADER_USE_PARAMETER_STRUCT(FGaussianSplatBillboardsRasterVS, FGlobalShader);
 

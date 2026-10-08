@@ -52,9 +52,17 @@ static const float SH_C1 = 0.4886025;
 static const float SH_C2[5] = { 1.0925484, -1.0925484, 0.3153916, -1.0925484, 0.5462742 };
 static const float SH_C3[7] = { -0.5900436, 2.8906114, -0.4570458, 0.3731763, -0.4570458, 1.4453057, -0.5900436 };
 
+// MEASURED: the eight-way switch costs 3.52 ms on Uno (20.9M splats, degree 3) and
+// nothing on a degree-0 scene -- 45.17 -> 48.69 ms, against a 0.13-0.34 ms repeat
+// spread, both builds in one machine state. This is called fifteen times per splat,
+// and the compiler cannot know the slot is uniform across a draw.
+//
+// So a draw that touches ONE palette compiles without the switch, which is every
+// draw until a single sort spans districts with different palettes.
 float3 LoadSHCoeff(uint Slot, uint SHBase, uint CoeffIndex)
 {
     const uint Offset = SHBase + CoeffIndex * 3;
+#if GAUSSIAN_SPLAT_MULTI_PALETTE
     #define GS_FETCH(N) case N: return float3(SplatSHPalette##N[Offset + 0], \
                                               SplatSHPalette##N[Offset + 1], \
                                               SplatSHPalette##N[Offset + 2])
@@ -65,6 +73,13 @@ float3 LoadSHCoeff(uint Slot, uint SHBase, uint CoeffIndex)
     }
     #undef GS_FETCH
     return float3(0.0, 0.0, 0.0);
+#else
+    // One palette in this draw: the pass binds it to slot 0 and the slot is ignored.
+    return float3(
+        SplatSHPalette0[Offset + 0],
+        SplatSHPalette0[Offset + 1],
+        SplatSHPalette0[Offset + 2]);
+#endif
 }
 
 float3 WorldDirToLocal(FGaussianSplatBatch Batch, float3 WorldDir)
