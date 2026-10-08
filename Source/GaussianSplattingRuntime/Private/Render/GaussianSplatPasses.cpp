@@ -1504,6 +1504,15 @@ namespace GaussianSplatLod
         TArray<FUintVector4> Ranges;
         uint32 CellCount = 0;
         uint32 TotalCount = 0;
+
+        // Fix 5 Step 3 (D7). CellBase turns this asset's own cell index into an index
+        // into the pool's ONE cell-bounds buffer, so ResolveSplat's
+        // SplatCellBounds[Cell * 2] is right whichever asset the splat came from.
+        // BatchId goes in .w, which was written 0 until now, and selects the batch
+        // table entry carrying this asset's transform, point size and palette slot.
+        // Both are 0 on the legacy path, which binds its own bounds and draws alone.
+        uint32 CellBase = 0;
+        uint32 BatchId = 0;
     };
 
     // Fix 5 probe (r.GaussianSplat.LodSplitRuns): how many entries a selection can need. One per cell, or with runs of
@@ -1532,14 +1541,15 @@ namespace GaussianSplatLod
     // order, only more entries for ResolveSplat to search.
     void AddRange(FSelection& Out, uint32 First, uint32 Prefix, uint32 CellIndex, uint32 Take, uint32 SplitRuns)
     {
+        const uint32 GlobalCell = Out.CellBase + CellIndex;
         if (SplitRuns == 0)
         {
-            Out.Ranges[Out.CellCount++] = FUintVector4(First, Prefix, CellIndex, 0u);
+            Out.Ranges[Out.CellCount++] = FUintVector4(First, Prefix, GlobalCell, Out.BatchId);
             return;
         }
         for (uint32 Offset = 0; Offset < Take; Offset += SplitRuns)
         {
-            Out.Ranges[Out.CellCount++] = FUintVector4(First + Offset, Prefix + Offset, CellIndex, 0u);
+            Out.Ranges[Out.CellCount++] = FUintVector4(First + Offset, Prefix + Offset, GlobalCell, Out.BatchId);
         }
     }
 
@@ -1563,7 +1573,7 @@ namespace GaussianSplatLod
             {
                 break;   // the capacity estimate was short; better a missing run than a write past the end
             }
-            Out.Ranges[Out.CellCount++] = FUintVector4(Run.FirstSlot, InOutPrefix, CellIndex, 0u);
+            Out.Ranges[Out.CellCount++] = FUintVector4(Run.FirstSlot, InOutPrefix, Out.CellBase + CellIndex, Out.BatchId);
             InOutPrefix += Run.Count;
         }
         return Covered;
@@ -2268,7 +2278,7 @@ namespace GaussianSplatPasses
             FRHIShaderResourceView* const SrcPackedB =
                 bPaged ? Pool.GetPackedBSRV() : Legacy->GetPackedBSRV().GetReference();
             FRHIShaderResourceView* const SrcCellBounds =
-                bPaged ? PagedResidency->GetCellBoundsSRV() : Legacy->GetCellBoundsSRV().GetReference();
+                bPaged ? Pool.GetCellBoundsSRV() : Legacy->GetCellBoundsSRV().GetReference();
             FRHIShaderResourceView* const SrcSHIndex =
                 bPaged ? Pool.GetSHIndexSRV() : Legacy->GetSHIndexSRV().GetReference();
             FRHIShaderResourceView* const SrcSHPalette =
@@ -2321,6 +2331,11 @@ namespace GaussianSplatPasses
             // an allocation. Sizing a pooled buffer from a per-frame count is
             // what exhausted VRAM and stuttered when it was tried before.
             GaussianSplatLod::FSelection Selection;
+            // Where this asset's cells start in the pool's shared bounds, and which
+            // batch-table entry its splats belong to. The legacy path leaves both 0:
+            // it binds its own cell bounds and is the only batch in its own draw.
+            Selection.CellBase = bPaged ? static_cast<uint32>(PagedResidency->CellBoundsBase) : 0u;
+            Selection.BatchId = static_cast<uint32>(BatchIndex);
             GaussianSplatProfiling::FLodStats LodStats;
             uint32 DispatchCount = RenderPointCount;
             if (bUseCells)

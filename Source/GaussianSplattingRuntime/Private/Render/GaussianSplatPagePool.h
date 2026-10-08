@@ -71,13 +71,24 @@ struct FGaussianSplatPoolResidency
 
     bool bComplete = false;    // every page of every cell is resident
 
-    // Per asset, not per pool, and never evicted (plan D3). Cell bounds are two
-    // float4 per cell -- tens of KB -- and the SH palette is the asset's own, so
-    // neither belongs in the slot space that streaming moves around.
-    TRefCountPtr<FRDGPooledBuffer> CellBounds;
+    // Fix 5 Step 3 (D7): where this asset's cells start in the pool's ONE cell-bounds
+    // buffer, in CELLS. A range entry writes base + local index, so ResolveSplat's
+    // SplatCellBounds[Cell * 2] needs no shader change when several assets draw in
+    // one pass. Tens of KB in total, so the buffer is simply rebuilt whenever an
+    // asset registers or unregisters -- that happens at level load, not per frame.
+    int32 CellBoundsBase = 0;
+
+    // Which of the pool's SH palette slots this asset's palette is bound to, or
+    // INDEX_NONE when it has no spherical harmonics (an SH0 asset consumes no slot).
+    int32 PaletteSlot = INDEX_NONE;
+
+    // The SH palette stays PER ASSET and is never evicted (plan D3). It is NOT
+    // concatenated with the others: FRHIBufferDesc::Size is a uint32, so one buffer
+    // caps at 4 GiB = 23.86M SH3 entries, and concatenating would apply that cap to
+    // the SUM across districts -- a single dense SH3 capture already approaches it.
+    // Bound as an SRV array instead, selected per splat by PaletteSlot (review M5).
     TRefCountPtr<FRDGPooledBuffer> SHPalette;
 
-    FRHIShaderResourceView* GetCellBoundsSRV() const { return CellBounds.IsValid() ? CellBounds->GetSRV() : nullptr; }
     FRHIShaderResourceView* GetSHPaletteSRV() const { return SHPalette.IsValid() ? SHPalette->GetSRV() : nullptr; }
 };
 
@@ -204,6 +215,21 @@ public:
     FRHIShaderResourceView* GetPackedBSRV() const { return PackedB.IsValid() ? PackedB->GetSRV() : nullptr; }
     FRHIShaderResourceView* GetSHIndexSRV() const { return SHIndex.IsValid() ? SHIndex->GetSRV() : nullptr; }
 
+    // The ONE cell-bounds buffer every paged asset's cells live in (D7).
+    FRHIShaderResourceView* GetCellBoundsSRV() const
+    {
+        return SharedCellBounds.IsValid() ? SharedCellBounds->GetSRV() : nullptr;
+    }
+
+    // Fills Out with the palette of each slot, and the one-float dummy for the slots
+    // no asset has taken, so every element of the shader's SRV array is bound.
+    void GetSHPaletteSRVs(FRHIShaderResourceView* Out[]) const;
+
+    // How many distinct SH palettes one world may hold. SH0 assets take no slot, so
+    // this is a limit on SH districts, not on districts. Raising it costs a
+    // descriptor and a case in the vertex shader's switch.
+    static constexpr int32 MaxSHPalettes = 8;
+
     static constexpr int64 SlotsPerPage = 4096;
     static constexpr int64 BytesPerSlot = 24;      // 16 + 4 + 4; the SH buffer is allocated even for SH0 captures
 
@@ -225,8 +251,12 @@ private:
     // unregisters, so they are taken from the front of the untouched space.
     int64 AllocateFloorRange(int64 Slots);
 
-    // The asset's own two small buffers, built once when it registers.
+    // The asset's own palette, built once when it registers, plus its palette slot.
     void BuildAssetBuffers(const UGaussianSplatPagedAsset& Asset, FGaussianSplatPoolResidency& Residency);
+
+    // Rebuilds the shared cell-bounds buffer from every registered asset and
+    // reassigns their bases. Called on register and unregister only.
+    void RebuildSharedCellBounds();
 
     void UploadRange(int64 FirstSlot, const uint8* SourceA, const uint8* SourceB, const uint8* SourceSH, int64 Slots);
 
@@ -242,6 +272,16 @@ private:
     TRefCountPtr<FRDGPooledBuffer> PackedA;
     TRefCountPtr<FRDGPooledBuffer> PackedB;
     TRefCountPtr<FRDGPooledBuffer> SHIndex;
+
+    // Every registered asset's cells, concatenated in registration order.
+    TRefCountPtr<FRDGPooledBuffer> SharedCellBounds;
+
+    // One float, bound to the palette slots nothing has taken. The shader must not
+    // sample it -- HasSH gates the read -- but the SRV has to exist.
+    TRefCountPtr<FRDGPooledBuffer> DummyPalette;
+
+    // Slot -> the asset holding it, so a slot is freed when its asset unregisters.
+    const UGaussianSplatPagedAsset* PaletteSlotOwner[MaxSHPalettes] = {};
 
     int64 TotalSlots = 0;
     int64 NextUnusedSlot = 0;      // everything past this has never been handed out

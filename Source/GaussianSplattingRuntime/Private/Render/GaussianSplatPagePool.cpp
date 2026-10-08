@@ -519,21 +519,51 @@ void FGaussianSplatPagePool::GetRegisteredAssets(TArray<const UGaussianSplatPage
     }
 }
 
-void FGaussianSplatPagePool::BuildAssetBuffers(
-    const UGaussianSplatPagedAsset& Asset,
-    FGaussianSplatPoolResidency& Residency)
+namespace
 {
-    // Cell bounds: origin.xyz then extent.xyz per cell, which is what the shader
-    // decodes a 16-bit position against. Built from the same CellExtent the
-    // importer packed with, so a one-splat-wide cell cannot divide by zero here
-    // and not there.
-    TArray<FVector4f> Bounds;
-    Bounds.Reserve(FMath::Max(2, Asset.Cells.Num() * 2));
-    for (const FGaussianSplatPagedCell& Cell : Asset.Cells)
+    // One structured buffer filled from Data, on the render thread.
+    void MakePooledBuffer(
+        FRHICommandListImmediate& RHICmdList,
+        const TCHAR* Name,
+        uint32 Stride,
+        const void* Data,
+        uint32 Count,
+        TRefCountPtr<FRDGPooledBuffer>& OutBuffer)
     {
-        const FVector3f Extent = GaussianSplatFormat::CellExtent(Cell.BoundsMin, Cell.BoundsMax);
-        Bounds.Add(FVector4f(Cell.BoundsMin.X, Cell.BoundsMin.Y, Cell.BoundsMin.Z, 0.0f));
-        Bounds.Add(FVector4f(Extent.X, Extent.Y, Extent.Z, 0.0f));
+        OutBuffer = AllocatePooledBuffer(FRDGBufferDesc::CreateStructuredDesc(Stride, Count), Name);
+        void* Dest = RHICmdList.LockBuffer(OutBuffer->GetRHI(), 0, Stride * Count, RLM_WriteOnly);
+        FMemory::Memcpy(Dest, Data, Stride * Count);
+        RHICmdList.UnlockBuffer(OutBuffer->GetRHI());
+    }
+}
+
+void FGaussianSplatPagePool::RebuildSharedCellBounds()
+{
+    // Fix 5 Step 3 (D7): every registered asset's cells in ONE buffer, so a single
+    // draw across districts can decode any splat's position from a global cell
+    // index. Rebuilt whole rather than patched: this runs when an asset registers
+    // or unregisters -- at level load -- and the whole thing is tens of KB
+    // (Lublin's ~10K cells are 320 KB), so the simple version is the right one.
+    TArray<FVector4f> Bounds;
+    int32 NextBase = 0;
+    for (TPair<const UGaussianSplatPagedAsset*, FGaussianSplatPoolResidency>& Pair : Residencies)
+    {
+        const UGaussianSplatPagedAsset* Asset = Pair.Key;
+        Pair.Value.CellBoundsBase = NextBase;
+        if (Asset == nullptr)
+        {
+            continue;
+        }
+        Bounds.Reserve(Bounds.Num() + Asset->Cells.Num() * 2);
+        for (const FGaussianSplatPagedCell& Cell : Asset->Cells)
+        {
+            // Built from the same CellExtent the importer packed with, so a
+            // one-splat-wide cell cannot divide by zero here and not there.
+            const FVector3f Extent = GaussianSplatFormat::CellExtent(Cell.BoundsMin, Cell.BoundsMax);
+            Bounds.Add(FVector4f(Cell.BoundsMin.X, Cell.BoundsMin.Y, Cell.BoundsMin.Z, 0.0f));
+            Bounds.Add(FVector4f(Extent.X, Extent.Y, Extent.Z, 0.0f));
+        }
+        NextBase += Asset->Cells.Num();
     }
     if (Bounds.IsEmpty())
     {
@@ -541,30 +571,90 @@ void FGaussianSplatPagePool::BuildAssetBuffers(
         Bounds.Add(FVector4f(ForceInitToZero));
     }
 
-    TArray<float> Palette = Asset.SHPalette;
-    if (Palette.IsEmpty())
+    FGaussianSplatPagePool* Self = this;
+    ENQUEUE_RENDER_COMMAND(GaussianSplatPoolCellBounds)(
+        [Self, Bounds = MoveTemp(Bounds)](FRHICommandListImmediate& RHICmdList)
+        {
+            MakePooledBuffer(RHICmdList, TEXT("GaussianSplat.PagedCellBounds"), sizeof(FVector4f),
+                             Bounds.GetData(), static_cast<uint32>(Bounds.Num()), Self->SharedCellBounds);
+        });
+}
+
+void FGaussianSplatPagePool::GetSHPaletteSRVs(FRHIShaderResourceView* Out[]) const
+{
+    FRHIShaderResourceView* const Dummy = DummyPalette.IsValid() ? DummyPalette->GetSRV() : nullptr;
+    for (int32 Slot = 0; Slot < MaxSHPalettes; ++Slot)
     {
-        Palette.Add(0.0f);   // a single dummy element: the shader must not sample it, but the SRV must exist
+        Out[Slot] = Dummy;
+    }
+    for (const TPair<const UGaussianSplatPagedAsset*, FGaussianSplatPoolResidency>& Pair : Residencies)
+    {
+        const int32 Slot = Pair.Value.PaletteSlot;
+        if (Slot >= 0 && Slot < MaxSHPalettes)
+        {
+            if (FRHIShaderResourceView* const SRV = Pair.Value.GetSHPaletteSRV())
+            {
+                Out[Slot] = SRV;
+            }
+        }
+    }
+}
+
+void FGaussianSplatPagePool::BuildAssetBuffers(
+    const UGaussianSplatPagedAsset& Asset,
+    FGaussianSplatPoolResidency& Residency)
+{
+    // An SH0 asset takes no palette slot at all: HasSH gates the read, so it never
+    // samples one (review M5).
+    if (!Asset.SHPalette.IsEmpty())
+    {
+        for (int32 Slot = 0; Slot < MaxSHPalettes; ++Slot)
+        {
+            if (PaletteSlotOwner[Slot] == nullptr || PaletteSlotOwner[Slot] == &Asset)
+            {
+                PaletteSlotOwner[Slot] = &Asset;
+                Residency.PaletteSlot = Slot;
+                break;
+            }
+        }
+        if (Residency.PaletteSlot == INDEX_NONE)
+        {
+            // Refused loudly rather than drawn with another asset's colours. Raising
+            // the limit is a constant here and a case in the vertex shader's switch.
+            UE_LOG(
+                LogGaussianSplatPool,
+                Error,
+                TEXT("%s has spherical harmonics but all %d SH palette slots are taken, so it will draw WITHOUT ")
+                TEXT("them. One world may hold %d assets with SH; SH0 assets take no slot."),
+                *Asset.GetName(),
+                MaxSHPalettes,
+                MaxSHPalettes);
+        }
     }
 
+    TArray<float> Palette = Asset.SHPalette;
+    const bool bHasPalette = !Palette.IsEmpty();
+    if (!bHasPalette)
+    {
+        Palette.Add(0.0f);
+    }
+
+    FGaussianSplatPagePool* Self = this;
     FGaussianSplatPoolResidency* Target = &Residency;
     ENQUEUE_RENDER_COMMAND(GaussianSplatPoolAssetBuffers)(
-        [Target, Bounds = MoveTemp(Bounds), Palette = MoveTemp(Palette)](FRHICommandListImmediate& RHICmdList)
+        [Self, Target, Palette = MoveTemp(Palette)](FRHICommandListImmediate& RHICmdList)
         {
-            const auto Make = [&RHICmdList](const TCHAR* Name, uint32 Stride, const void* Data, uint32 Count,
-                                            TRefCountPtr<FRDGPooledBuffer>& OutBuffer)
+            MakePooledBuffer(RHICmdList, TEXT("GaussianSplat.PagedSHPalette"), sizeof(float),
+                             Palette.GetData(), static_cast<uint32>(Palette.Num()), Target->SHPalette);
+            if (!Self->DummyPalette.IsValid())
             {
-                OutBuffer = AllocatePooledBuffer(FRDGBufferDesc::CreateStructuredDesc(Stride, Count), Name);
-                void* Dest = RHICmdList.LockBuffer(OutBuffer->GetRHI(), 0, Stride * Count, RLM_WriteOnly);
-                FMemory::Memcpy(Dest, Data, Stride * Count);
-                RHICmdList.UnlockBuffer(OutBuffer->GetRHI());
-            };
-
-            Make(TEXT("GaussianSplat.PagedCellBounds"), sizeof(FVector4f), Bounds.GetData(),
-                 static_cast<uint32>(Bounds.Num()), Target->CellBounds);
-            Make(TEXT("GaussianSplat.PagedSHPalette"), sizeof(float), Palette.GetData(),
-                 static_cast<uint32>(Palette.Num()), Target->SHPalette);
+                const float Zero = 0.0f;
+                MakePooledBuffer(RHICmdList, TEXT("GaussianSplat.PagedSHPaletteDummy"), sizeof(float),
+                                 &Zero, 1, Self->DummyPalette);
+            }
         });
+
+    RebuildSharedCellBounds();
 }
 
 void FGaussianSplatPagePool::UploadRange(
@@ -1134,10 +1224,21 @@ void FGaussianSplatPagePool::UnregisterAsset(const UGaussianSplatPagedAsset* Ass
     if (FGaussianSplatPoolResidency* Residency = Residencies.Find(Asset))
     {
         FreePagesOf(*Residency);
+        // The palette slot IS reclaimed, unlike the floor range below: slots are a
+        // hard limit of 8, so leaking one would refuse a later asset for no reason.
+        const int32 Slot = Residency->PaletteSlot;
+        if (Slot >= 0 && Slot < MaxSHPalettes && PaletteSlotOwner[Slot] == Asset)
+        {
+            PaletteSlotOwner[Slot] = nullptr;
+        }
         // Floor ranges are not reclaimed: they came from the untouched space and
         // giving them back would need a range allocator with coalescing, which
         // Step 1a has no use for (a level switch invalidates the table instead).
         Residencies.Remove(Asset);
+        // The remaining assets' bases shift, so the buffer and every base are redone
+        // together -- a base that outlived its buffer would decode positions against
+        // another asset's cells.
+        RebuildSharedCellBounds();
     }
 }
 
@@ -1151,4 +1252,10 @@ void FGaussianSplatPagePool::ReleaseRHI()
     PackedA.SafeRelease();
     PackedB.SafeRelease();
     SHIndex.SafeRelease();
+    SharedCellBounds.SafeRelease();
+    DummyPalette.SafeRelease();
+    for (int32 Slot = 0; Slot < MaxSHPalettes; ++Slot)
+    {
+        PaletteSlotOwner[Slot] = nullptr;
+    }
 }
