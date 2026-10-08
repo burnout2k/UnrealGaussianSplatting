@@ -555,6 +555,25 @@ namespace GaussianSplatProfiling
         TEXT("gets as deep as a pool of pages this size would make it."),
         ECVF_RenderThreadSafe);
 
+    // Fix 5 Step 3 gate G3b: turns the single sort OFF, back to a sort per district.
+    //
+    // It exists so the gate can show the BEFORE and the AFTER in one binary. Without
+    // it, "flipping the draw order changes nothing" is indistinguishable from a test
+    // that was never measuring anything -- districts that do not overlap in depth, or
+    // a switch that does nothing, give the same clean pass. With the merge off the two
+    // orders MUST differ, and that difference is critic C10.
+    static TAutoConsoleVariable<int32> CVarMergeDistricts(
+        TEXT("r.GaussianSplat.MergeDistricts"),
+        1,
+        TEXT("1 = one cull, sort and raster across a view's paged assets (plan D7). 0 = a sort per asset, blended ")
+        TEXT("in registration order, which is what gate G3b records as the 'before'."),
+        ECVF_RenderThreadSafe);
+
+    bool ShouldMergeDistricts()
+    {
+        return CVarMergeDistricts.GetValueOnRenderThread() != 0;
+    }
+
     static TAutoConsoleVariable<int32> CVarMaxRenderPointsOverride(
         TEXT("r.GaussianSplat.MaxRenderPointsOverride"),
         0,
@@ -2398,7 +2417,8 @@ namespace GaussianSplatPasses
         uint32 MergedBudget = 0;
         int32 MergedRepresentative = INDEX_NONE;
         const bool bMergePaged =
-            GaussianSplatProfiling::GetLodMode() == 1 && FGaussianSplatPagePool::ArePagedAssetsEnabled();
+            GaussianSplatProfiling::GetLodMode() == 1 && FGaussianSplatPagePool::ArePagedAssetsEnabled()
+            && GaussianSplatProfiling::ShouldMergeDistricts();
         if (bMergePaged && View.ViewMatrices.IsPerspectiveProjection())
         {
             FGaussianSplatPagePool& MergePool = FGaussianSplatPagePool::Get();
