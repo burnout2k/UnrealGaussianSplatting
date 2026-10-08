@@ -1767,6 +1767,11 @@ namespace GaussianSplatLod
         float SizeP99 = 0.0f;
         double ActorScale = 1.0;
 
+        // Fix 5 Step 4: this asset's d_full ceiling in METRES, 0 = none. Per asset, not
+        // per view: it exists because a drone capture's own median splat size reaches
+        // full detail hundreds of metres out while a street capture's does not.
+        float MaxFullDistanceM = 0.0f;
+
         // Set together, and only for a paged asset: the selection itself is unchanged
         // -- it still works on the asset's FULL cell counts, so a view's take does not
         // move when a page is evicted -- but the ranges it emits then address pool
@@ -1853,7 +1858,7 @@ namespace GaussianSplatLod
         // FullDistance, so the two modes compare identical doubles.
         // Shared with the settle gate (GaussianSplatLod), so the two cannot drift.
         Group.HalfFull = GaussianSplatLod::ComputeHalfFull(
-            In.FocalPx, Group.PointSize, Group.SizeRef, Group.ActorScale);
+            In.FocalPx, Group.PointSize, Group.SizeRef, Group.ActorScale, Group.MaxFullDistanceM);
 
         Candidates.Reserve(Candidates.Num() + Cells.Num());
         for (int32 CellIndex = 0; CellIndex < Cells.Num(); ++CellIndex)
@@ -2197,7 +2202,8 @@ namespace GaussianSplatLod
             : 1.0f;
     }
 
-    double ComputeHalfFull(double FocalPx, float PointSize, float SizeRef, double ActorScale)
+    double ComputeHalfFull(double FocalPx, float PointSize, float SizeRef, double ActorScale,
+                           float MaxFullDistanceM)
     {
         const float K = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodScreenK.GetValueOnAnyThread());
         const float MinFull = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodMinFullDistance.GetValueOnAnyThread());
@@ -2211,6 +2217,15 @@ namespace GaussianSplatLod
                 * static_cast<double>(SizeRef) * ActorScale);
         HalfFull = FMath::Max(HalfFull, 0.5 * static_cast<double>(MinFull));
         HalfFull = FMath::Max(HalfFull, 1.0);
+        // Fix 5 Step 4: the per-actor ceiling, in metres, applied BEFORE the budget
+        // multiplier (the caller does d_full = 2 x HalfFull x m). Centimetres here:
+        // d_full lives in world units, the property is metres because that is what
+        // anyone setting it is thinking in.
+        if (MaxFullDistanceM > 0.0f)
+        {
+            HalfFull = FMath::Min(HalfFull, 0.5 * static_cast<double>(MaxFullDistanceM) * 100.0);
+            HalfFull = FMath::Max(HalfFull, 1.0);
+        }
         return HalfFull;
     }
 
@@ -2438,6 +2453,7 @@ namespace GaussianSplatPasses
                 Group.SizeRef = Entry.PagedAsset->SizeRef;
                 Group.SizeP99 = Entry.PagedAsset->SizeP99;
                 Group.ActorScale = static_cast<double>(Entry.LocalToWorld.GetMaximumAxisScale());
+                Group.MaxFullDistanceM = Entry.LodMaxFullDistance;
                 Group.PagedAsset = Entry.PagedAsset;
                 Group.PagedResidency = Entry.PagedResidency;
                 Group.CellBase = static_cast<uint32>(Entry.PagedResidency->CellBoundsBase);
@@ -2645,6 +2661,7 @@ namespace GaussianSplatPasses
                     LodGroup.SizeRef = SrcSizeRef;
                     LodGroup.SizeP99 = SrcSizeP99;
                     LodGroup.ActorScale = LodInputs.ActorScale;
+                    LodGroup.MaxFullDistanceM = Batch.LodMaxFullDistance;
                     LodGroup.PagedAsset = bPaged ? PagedAsset : nullptr;
                     LodGroup.PagedResidency = bPaged ? PagedResidency : nullptr;
                     LodGroup.CellBase = Selection.CellBase;

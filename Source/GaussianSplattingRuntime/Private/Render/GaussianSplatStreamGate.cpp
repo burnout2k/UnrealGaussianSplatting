@@ -367,6 +367,12 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
         const FTransform WorldToLocal = LocalToWorld.Inverse();
         const double ActorScale = LocalToWorld.GetScale3D().GetAbsMax();
         const float PointSize = FMath::Clamp(Component->PointSize, 0.1f, 32.0f);
+        // Fix 5 Step 4 (review M5): the SAME per-actor d_full ceiling the selection uses.
+        // Capping only one of the two is worse than capping neither -- cap the selection
+        // alone and this gate keeps streaming pages nothing will draw; cap the gate alone
+        // and the selection asks for pages the gate deliberately did not fetch, which is
+        // a miss. GaussianSplatLod exists so the two cannot drift.
+        const float MaxFullDistanceM = FMath::Max(0.0f, Component->LodMaxFullDistance);
 
         // D9: the paged path clamps the LOD floor to the value the asset BAKED.
         // Asking for splats below the baked floor would make the picture depend on
@@ -378,7 +384,7 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
         for (const FGaussianSplatGateGroup& Group : Groups)
         {
             const double HalfFull = GaussianSplatLod::ComputeHalfFull(
-                Group.MaxFocalPx, PointSize, Asset->SizeRef, ActorScale);
+                Group.MaxFocalPx, PointSize, Asset->SizeRef, ActorScale, MaxFullDistanceM);
 
             // Beyond this distance every cell is floor-only, so there is nothing to
             // visit: keep > R_c needs 4 (HalfFull/d)^2 > MinFraction (review M4).

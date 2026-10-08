@@ -215,6 +215,7 @@ void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread(
             0.0f);
         Batch.PointSize = FMath::Clamp(Component->PointSize, 0.1f, 32.0f);
         Batch.OpacityScale = FMath::Clamp(Component->OpacityScale, 0.0f, 8.0f);
+        Batch.LodMaxFullDistance = FMath::Max(0.0f, Component->LodMaxFullDistance);
         Batch.AssetPointCount = static_cast<uint32>(GpuPointCount);
         Batch.Stride = static_cast<uint32>(Stride);
         Batch.MaxRenderPoints = static_cast<uint32>(LocalMax);

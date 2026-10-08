@@ -60,6 +60,20 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splat|Preview", meta = (ClampMin = "1000", ClampMax = "100000000"))
     int32 MaxRenderPoints = 250000;
 
+    // Fix 5 Step 4: a ceiling in METRES on this asset's full-detail distance, or 0 for none.
+    //
+    // d_full comes from the asset's own median splat size, so a drone capture reaches full detail far further out
+    // than a street one: Vuores' 180 mm splats give d_full 280 m at PointSize 3, against Uno's 13 mm. That makes a
+    // drone district ask for ~34M splats where a street district asks for ~20M, for detail nobody is close enough
+    // to see. Capping d_full thins it at distance without touching PointSize, so the splats keep their SIZE and
+    // only their density falls.
+    //
+    // It is applied to HalfFull BEFORE the budget multiplier, in both places that compute it -- the per-view
+    // selection and the settle gate. Capping one alone either streams pages nothing will draw or selects pages the
+    // gate never fetched.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splat|Preview", meta = (ClampMin = "0.0"))
+    float LodMaxFullDistance = 0.0f;
+
     // 选择具体显示方式。Billboards 是运行时的主要目标模式。
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Gaussian Splat|Preview")
     EGaussianPreviewRenderMode PreviewRenderMode = EGaussianPreviewRenderMode::Billboards;

@@ -41,6 +41,8 @@ struct FGaussianSplatRenderBatch
     FVector4f WorldToLocalRow2 = FVector4f(0, 0, 1, 0);
     float PointSize = 1.0f;
     float OpacityScale = 1.0f;
+    // Fix 5 Step 4: the component's d_full ceiling in metres, 0 = none.
+    float LodMaxFullDistance = 0.0f;
     uint32 AssetPointCount = 0;
     uint32 Stride = 1;
     uint32 MaxRenderPoints = TNumericLimits<uint32>::Max();
@@ -58,7 +60,13 @@ namespace GaussianSplatLod
 
     // F' = d_full / 2 at m = 1, including the debug override and the minimum
     // full distance. FocalPx is the view's; the rest are the component's.
-    double ComputeHalfFull(double FocalPx, float PointSize, float SizeRef, double ActorScale);
+    //
+    // MaxFullDistanceM caps d_full (0 = no cap), and is applied HERE, before the
+    // budget multiplier: d_full = 2 x ComputeHalfFull(...) x m. Capping after the
+    // multiplier would put the cap outside the bisection, so the budget would solve
+    // an m the cap then silently overrides and the two would fight.
+    double ComputeHalfFull(double FocalPx, float PointSize, float SizeRef, double ActorScale,
+                           float MaxFullDistanceM = 0.0f);
 
     // The selection's own take for one cell at a given full distance. Distance is
     // from the view origin (or, in the gate, from the group centre minus its

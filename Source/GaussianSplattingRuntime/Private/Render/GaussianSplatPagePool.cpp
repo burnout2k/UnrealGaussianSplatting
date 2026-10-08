@@ -623,9 +623,9 @@ void FGaussianSplatPagePool::BuildAssetBuffers(
             // the limit is a constant here and a case in the vertex shader's switch.
             UE_LOG(
                 LogGaussianSplatPool,
-                Error,
-                TEXT("%s has spherical harmonics but all %d SH palette slots are taken, so it will draw WITHOUT ")
-                TEXT("them. One world may hold %d assets with SH; SH0 assets take no slot."),
+                Warning,
+                TEXT("SH PALETTE SLOTS FULL: %s has spherical harmonics but all %d slots are taken, so it will draw ")
+                TEXT("WITHOUT them. One world may hold %d assets with SH; SH0 assets take no slot."),
                 *Asset.GetName(),
                 MaxSHPalettes,
                 MaxSHPalettes);
@@ -776,6 +776,29 @@ void FGaussianSplatPagePool::UploadPageBatch(
     // Split so no single render command carries more than the cap. A teleport's
     // ~1 GB fill becomes several bounded commands in the same tick, rather than
     // one that could sit on the render thread long enough to matter.
+    //
+    // This path had never actually run before Step 4: no single-district fill was
+    // large enough to exceed the cap, so every upload was one command. A districts
+    // teleport is the first that can split, and an untested path should say so the
+    // first time it runs rather than be assumed to work (review, Step 4).
+    const int32 CommandCount = FMath::DivideAndRoundUp(GlobalPages.Num(), PagesPerCommand);
+    if (CommandCount > 1)
+    {
+        static bool bLoggedSplit = false;
+        UE_LOG(
+            LogGaussianSplatPool,
+            Display,
+            TEXT("Upload SPLIT%s: %d pages (%.0f MiB) for %s across %d commands of at most %d pages (%d MiB cap)."),
+            bLoggedSplit ? TEXT("") : TEXT(" -- first time this path has run"),
+            GlobalPages.Num(),
+            GlobalPages.Num() * PageBytes / 1048576.0,
+            *Asset.GetName(),
+            CommandCount,
+            PagesPerCommand,
+            FMath::Max(1, CVarStreamMaxUploadMBPerCommand.GetValueOnAnyThread()));
+        bLoggedSplit = true;
+    }
+
     for (int32 First = 0; First < GlobalPages.Num(); First += PagesPerCommand)
     {
         const int32 Count = FMath::Min(PagesPerCommand, GlobalPages.Num() - First);
