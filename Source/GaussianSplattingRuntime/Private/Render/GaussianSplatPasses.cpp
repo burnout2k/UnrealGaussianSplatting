@@ -2369,10 +2369,115 @@ namespace GaussianSplatPasses
             }
         }
 
+        // Fix 5 Step 3 (plan D7): ONE cull, ONE sort, ONE raster for every paged
+        // billboard batch of this view.
+        //
+        // This is what fixes C10. Until now each batch was culled, sorted and rastered
+        // on its own and blended into the shared texture in registration order, and the
+        // blend is an under-blend -- a later batch is composited BEHIND an earlier one
+        // -- so a district registered second drew behind one registered first whatever
+        // their depths. Alpha compositing is order-dependent, and the only way to get
+        // the order right across assets is to sort them together.
+        //
+        // It is also where the memory goes: the four sort buffers are sized from the
+        // budget rather than the frame's visible count (they must be, or the RDG pool
+        // collects one buffer per distinct size until VRAM runs out), so N batches cost
+        // N x 381 MiB at a 25M budget. One sort costs it once.
+        //
+        // Everything it needs is already in place: range entries carry a global cell
+        // index and a batch id, every per-asset value is in the batch table that the
+        // cull, the raster and the occlusion recompute all read, and for paged assets
+        // the packed buffers and the cell bounds are the pool's and therefore identical
+        // across batches. Only LOD mode 1 merges: mode 0's selection is still per asset.
+        TArray<GaussianSplatLod::FScreenLodGroup> MergedGroups;
+        TArray<int32> MergedBatches;
+        GaussianSplatLod::FSelection MergedSelection;
+        GaussianSplatProfiling::FLodStats MergedStats;
+        uint64 MergedAssetPoints = 0;
+        uint32 MergedMisses = 0;
+        uint32 MergedBudget = 0;
+        int32 MergedRepresentative = INDEX_NONE;
+        const bool bMergePaged =
+            GaussianSplatProfiling::GetLodMode() == 1 && FGaussianSplatPagePool::ArePagedAssetsEnabled();
+        if (bMergePaged && View.ViewMatrices.IsPerspectiveProjection())
+        {
+            FGaussianSplatPagePool& MergePool = FGaussianSplatPagePool::Get();
+            for (int32 Index = 0; Index < Batches.Num(); ++Index)
+            {
+                const FGaussianSplatRenderBatch& Entry = Batches[Index];
+                if (Entry.PagedAsset == nullptr || Entry.PagedResidency == nullptr
+                    || Entry.RenderMode != EGaussianSplatRenderMode::Billboards
+                    || !MergePool.IsAllocated() || Entry.PagedAsset->Cells.IsEmpty())
+                {
+                    continue;   // the per-batch path below still handles it
+                }
+                GaussianSplatLod::FScreenLodGroup Group;
+                Group.Cells = &Entry.PagedAsset->SelectionCells;
+                Group.LocalToWorld = Entry.LocalToWorld;
+                Group.PointSize = Entry.PointSize;
+                Group.SizeRef = Entry.PagedAsset->SizeRef;
+                Group.SizeP99 = Entry.PagedAsset->SizeP99;
+                Group.ActorScale = static_cast<double>(Entry.LocalToWorld.GetMaximumAxisScale());
+                Group.PagedAsset = Entry.PagedAsset;
+                Group.PagedResidency = Entry.PagedResidency;
+                Group.CellBase = static_cast<uint32>(Entry.PagedResidency->CellBoundsBase);
+                Group.BatchId = static_cast<uint32>(Index);
+                MergedGroups.Add(Group);
+                MergedBatches.Add(Index);
+                MergedAssetPoints += static_cast<uint64>(Entry.AssetPointCount);
+            }
+        }
+        if (MergedGroups.Num() > 0)
+        {
+            MergedRepresentative = MergedBatches[0];
+            const uint32 Override = GaussianSplatProfiling::GetMaxRenderPointsOverride();
+            MergedBudget = static_cast<uint32>(FMath::Min<uint64>(
+                Override > 0 ? Override : ViewPagedBudget, MergedAssetPoints));
+
+            GaussianSplatLod::FScreenLodInputs LodInputs;
+            // focal = P[0][0] x width / 2 (PerspectiveMatrix.h).
+            LodInputs.FocalPx = ProjectionMatrixNoAAD.M[0][0] * 0.5 * static_cast<double>(ViewRect.Width());
+            LodInputs.bFullCells = false;
+            LodInputs.ViewKey = View.GetViewKey();
+            LodInputs.BatchIndex = MergedRepresentative;
+            LodInputs.ViewRect = ViewRect;
+            // Per-asset now, so these are only what the log line prints.
+            LodInputs.PointSize = MergedGroups[0].PointSize;
+            LodInputs.SizeRef = MergedGroups[0].SizeRef;
+            LodInputs.SizeP99 = MergedGroups[0].SizeP99;
+            LodInputs.ActorScale = MergedGroups[0].ActorScale;
+
+            // Once per view, not once per batch: the gate's required set is the view's.
+            if (FGaussianSplatPagePool::IsStreamingEnabled())
+            {
+                FGaussianSplatStreamGate::Get().StampView(
+                    View.ViewActor, View.ViewMatrices.GetViewOrigin(), LodInputs.FocalPx);
+            }
+
+            const uint64 SelectStart = FPlatformTime::Cycles64();
+            GaussianSplatLod::SelectCellsScreen(
+                MergedGroups, View, MergedBudget, LodInputs, MergedSelection, MergedStats);
+            MergedStats.SelectMicros = FPlatformTime::ToMilliseconds64(FPlatformTime::Cycles64() - SelectStart) * 1000.0;
+            for (const GaussianSplatLod::FScreenLodGroup& Group : MergedGroups)
+            {
+                MergedMisses += Group.Missed;
+            }
+        }
+
         for (int32 BatchIndex = 0; BatchIndex < Batches.Num(); ++BatchIndex)
         {
             const FGaussianSplatRenderBatch& Batch = Batches[BatchIndex];
             const FGaussianSplatRenderResources* Resources = Batch.Resources;
+
+            // The merged paged item is drawn ONCE, by the first batch it covers; the
+            // others contributed their cells to the union above and have nothing left
+            // to do here.
+            const bool bInMerge = MergedBatches.Contains(BatchIndex);
+            if (bInMerge && BatchIndex != MergedRepresentative)
+            {
+                continue;
+            }
+            const bool bMerged = bInMerge && MergedSelection.CellCount > 0;
 
             // The ONE cast (review M7). Built in double from the component's absolute
             // matrix, so the float the shaders get carries no accumulated error from
@@ -2447,10 +2552,12 @@ namespace GaussianSplatPasses
             // own, since it still gets its own sort and its own buffers.
             const uint32 OwnBudget = bPaged ? ViewPagedBudget : Batch.MaxRenderPoints;
             const uint32 MaxRenderPoints = BudgetOverride > 0 ? BudgetOverride : OwnBudget;
-            const uint32 RenderPointCount = bUseCells
-                ? FMath::Min(MaxRenderPoints, Batch.AssetPointCount)
-                : FMath::Min(MaxRenderPoints,
-                             FMath::DivideAndRoundUp(Batch.AssetPointCount, Stride));
+            const uint32 RenderPointCount = bMerged
+                ? MergedBudget
+                : (bUseCells
+                    ? FMath::Min(MaxRenderPoints, Batch.AssetPointCount)
+                    : FMath::Min(MaxRenderPoints,
+                                 FMath::DivideAndRoundUp(Batch.AssetPointCount, Stride)));
             if (RenderPointCount == 0)
             {
                 continue;
@@ -2468,7 +2575,15 @@ namespace GaussianSplatPasses
             Selection.BatchId = static_cast<uint32>(BatchIndex);
             GaussianSplatProfiling::FLodStats LodStats;
             uint32 DispatchCount = RenderPointCount;
-            if (bUseCells)
+            if (bMerged)
+            {
+                // Already solved for the whole view, under one multiplier (D7).
+                Selection = MoveTemp(MergedSelection);
+                LodStats = MergedStats;
+                PagedMisses = MergedMisses;
+                DispatchCount = Selection.TotalCount;
+            }
+            else if (bUseCells)
             {
                 const uint64 SelectStart = FPlatformTime::Cycles64();
                 if (GaussianSplatProfiling::GetLodMode() == 1)
