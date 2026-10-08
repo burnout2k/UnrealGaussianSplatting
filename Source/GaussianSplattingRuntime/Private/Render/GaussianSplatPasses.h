@@ -28,7 +28,14 @@ struct FGaussianSplatRenderBatch
     const class UGaussianSplatPagedAsset* PagedAsset = nullptr;
     const struct FGaussianSplatPoolResidency* PagedResidency = nullptr;
     EGaussianSplatRenderMode RenderMode = EGaussianSplatRenderMode::Billboards;
-    FMatrix44f LocalToWorld = FMatrix44f::Identity;
+
+    // Fix 5 Step 3 (D7, review M7): DOUBLE, and absolute. Every shader wants
+    // LocalToWorld x Translate(PreViewTranslation) -- the TRANSLATED matrix -- cast
+    // to float ONCE per view. Casting the absolute matrix here and leaving the
+    // translation to float arithmetic is what limited a district to a few km from
+    // the origin: float32 ulp is 0.0625 cm at 10 km but 1 cm at 100 km, which is
+    // ~11 px at 1 m. The CPU cull wants the double anyway -- it used to rebuild one.
+    FMatrix LocalToWorld = FMatrix::Identity;
     FVector4f WorldToLocalRow0 = FVector4f(1, 0, 0, 0);
     FVector4f WorldToLocalRow1 = FVector4f(0, 1, 0, 0);
     FVector4f WorldToLocalRow2 = FVector4f(0, 0, 1, 0);

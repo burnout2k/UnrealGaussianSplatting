@@ -1578,7 +1578,7 @@ namespace GaussianSplatLod
     // let each region answer for itself.
     void SelectCells(
         const TArray<FGaussianSplatCell>& Cells,
-        const FMatrix44f& LocalToWorld,
+        const FMatrix& LocalToWorld,
         const FSceneView& View,
         uint32 Budget,
         float& InOutBias,
@@ -1595,7 +1595,7 @@ namespace GaussianSplatLod
             return;
         }
 
-        const FMatrix ToWorld(LocalToWorld);
+        const FMatrix& ToWorld = LocalToWorld;   // already double (review M7)
         const FVector ViewOrigin = View.ViewMatrices.GetViewOrigin();
         const double FullDistance =
             FMath::Max(1.0f, GaussianSplatProfiling::CVarLodFullDistance.GetValueOnRenderThread());
@@ -1723,7 +1723,7 @@ namespace GaussianSplatLod
     // buffers hold only the budget, and the cull does not check).
     void SelectCellsScreen(
         const TArray<FGaussianSplatCell>& Cells,
-        const FMatrix44f& LocalToWorld,
+        const FMatrix& LocalToWorld,
         const FSceneView& View,
         uint32 Budget,
         const FScreenLodInputs& In,
@@ -1753,7 +1753,7 @@ namespace GaussianSplatLod
             return;
         }
 
-        const FMatrix ToWorld(LocalToWorld);
+        const FMatrix& ToWorld = LocalToWorld;   // already double (review M7)
         const FVector ViewOrigin = View.ViewMatrices.GetViewOrigin();
         const FVector ViewForward = View.GetViewDirection();
         // As mode 0: r.GaussianSplat.Lod 0 keeps every visible cell whole.
@@ -2159,7 +2159,22 @@ namespace GaussianSplatPasses
         }
 
         const FIntRect ViewRect = SceneColor.ViewRect;
-        const FMatrix ViewMatrixD = View.ViewMatrices.GetViewMatrix();
+
+        // Fix 5 Step 3 (D7, review M7): TRANSLATED world. Everything the shaders see
+        // is relative to the view origin, so a district 100 km out is as precise in
+        // float as one at the origin -- absolute float matrices lose 1 cm per ulp
+        // there, about 11 px at 1 m.
+        //
+        // NOT View.ViewMatrices.GetTranslatedViewProjectionMatrix(): SceneView.h:707
+        // builds that from GetProjectionMatrix(), the JITTERED projection, while this
+        // pass deliberately uses the no-AA one. Taking the accessor would fold TAA
+        // jitter into every splat and move every picture.
+        //
+        // PreViewTranslation is -ViewOrigin and TranslatedViewMatrix is the rotation
+        // alone (SceneView.cpp:683, :686-690), so the translated view origin is
+        // exactly (0,0,0) -- see TranslatedViewOrigin below.
+        const FVector PreViewTranslation = View.ViewMatrices.GetPreViewTranslation();
+        const FMatrix ViewMatrixD = View.ViewMatrices.GetTranslatedViewMatrix();
         const FMatrix ProjectionMatrixNoAAD = View.ViewMatrices.GetProjectionNoAAMatrix();
         const FMatrix ViewProjectionNoAAD = ViewMatrixD * ProjectionMatrixNoAAD;
         const FMatrix44f ViewMatrix = FMatrix44f(ViewMatrixD);
@@ -2221,6 +2236,14 @@ namespace GaussianSplatPasses
         {
             const FGaussianSplatRenderBatch& Batch = Batches[BatchIndex];
             const FGaussianSplatRenderResources* Resources = Batch.Resources;
+
+            // The ONE cast (review M7). Built in double from the component's absolute
+            // matrix, so the float the shaders get carries no accumulated error from
+            // the actor's distance to the origin. The CPU selection below keeps the
+            // ABSOLUTE double instead -- it measures cell boxes against the real view
+            // origin, and translating both would cancel out anyway.
+            const FMatrix44f LocalToTranslatedWorld =
+                FMatrix44f(Batch.LocalToWorld * FTranslationMatrix(PreViewTranslation));
 
             // Fix 5's seam. A paged batch draws from the process-wide pool and
             // carries no resources of its own; with r.GaussianSplat.PagedAssets 0
@@ -2623,7 +2646,10 @@ namespace GaussianSplatPasses
                 }
             };
 
-            const FVector3f ViewOrigin = static_cast<FVector3f>(View.ViewMatrices.GetViewOrigin());
+            // Zero by construction in translated world (PreViewTranslation = -ViewOrigin).
+            // The cull's Depth = dot(CenterWS - Origin, Forward) keeps its form, and the
+            // SH view direction is then just the splat centre, normalised.
+            const FVector3f ViewOrigin = FVector3f::ZeroVector;
             const FVector3f Forward = static_cast<FVector3f>(View.GetViewDirection());
             GaussianSplatProfiling::FOccReadback OccReadback;
 
@@ -2644,7 +2670,7 @@ namespace GaussianSplatPasses
                 InitSortParameters->ViewSize = FVector2f(static_cast<float>(ViewRect.Width()), static_cast<float>(ViewRect.Height()));
                 InitSortParameters->PointSize = Batch.PointSize;
                 InitSortParameters->ViewProjectionMatrix = ViewProjection;
-                InitSortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
+                InitSortParameters->LocalToWorldMatrix = LocalToTranslatedWorld;
                 InitSortParameters->SplatPackedA = SrcPackedA;
                 InitSortParameters->SplatPackedB = SrcPackedB;
                 InitSortParameters->SplatCellBounds = SrcCellBounds;
@@ -2688,7 +2714,7 @@ namespace GaussianSplatPasses
                             SortParameters->ViewSize = FVector2f::ZeroVector;
                             SortParameters->PointSize = 0.0f;
                             SortParameters->ViewProjectionMatrix = FMatrix44f::Identity;
-                            SortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
+                            SortParameters->LocalToWorldMatrix = LocalToTranslatedWorld;
                             SortParameters->SplatPackedA = SrcPackedA;
                             SortParameters->SplatPackedB = SrcPackedB;
                             SortParameters->SplatCellBounds = SrcCellBounds;
@@ -2717,7 +2743,7 @@ namespace GaussianSplatPasses
                 RasterParameters->Stride = Stride;
                 RasterParameters->SplatCellRanges = CellRangeSRV;
                 RasterParameters->SplatCellCount = Selection.CellCount;
-                RasterParameters->LocalToWorldMatrix = Batch.LocalToWorld;
+                RasterParameters->LocalToWorldMatrix = LocalToTranslatedWorld;
                 RasterParameters->ViewProjectionMatrix = ViewProjection;
                 RasterParameters->SplatOrderBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedOrderBuffer, PF_R32_UINT));
                 RasterParameters->SplatPackedA = SrcPackedA;
@@ -2824,7 +2850,7 @@ namespace GaussianSplatPasses
                 InitSortParameters->ViewMatrix = ViewMatrix;
                 InitSortParameters->ProjectionMatrix = ProjectionMatrix;
                 InitSortParameters->ViewProjectionMatrix = ViewProjection;
-                InitSortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
+                InitSortParameters->LocalToWorldMatrix = LocalToTranslatedWorld;
                 InitSortParameters->SplatPackedA = SrcPackedA;
                 InitSortParameters->SplatPackedB = SrcPackedB;
                 InitSortParameters->SplatCellBounds = SrcCellBounds;
@@ -2885,7 +2911,7 @@ namespace GaussianSplatPasses
                             SortParameters->ViewMatrix = FMatrix44f::Identity;
                             SortParameters->ProjectionMatrix = FMatrix44f::Identity;
                             SortParameters->ViewProjectionMatrix = FMatrix44f::Identity;
-                            SortParameters->LocalToWorldMatrix = Batch.LocalToWorld;
+                            SortParameters->LocalToWorldMatrix = LocalToTranslatedWorld;
                             SortParameters->SplatPackedA = SrcPackedA;
                             SortParameters->SplatPackedB = SrcPackedB;
                             SortParameters->SplatCellBounds = SrcCellBounds;
@@ -2925,7 +2951,7 @@ namespace GaussianSplatPasses
                     RasterParameters->SplatCellRanges = CellRangeSRV;
                     RasterParameters->SplatCellCount = Selection.CellCount;
                     RasterParameters->ViewMatrix = ViewMatrix;
-                    RasterParameters->LocalToWorldMatrix = Batch.LocalToWorld;
+                    RasterParameters->LocalToWorldMatrix = LocalToTranslatedWorld;
                     RasterParameters->ProjectionMatrix = ProjectionMatrix;
                     RasterParameters->ViewProjectionMatrix = ViewProjection;
                     RasterParameters->WorldToLocalRow0 = Batch.WorldToLocalRow0;
