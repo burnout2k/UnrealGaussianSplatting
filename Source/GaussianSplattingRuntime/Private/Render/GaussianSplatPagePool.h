@@ -82,14 +82,12 @@ struct FGaussianSplatPoolResidency
     // INDEX_NONE when it has no spherical harmonics (an SH0 asset consumes no slot).
     int32 PaletteSlot = INDEX_NONE;
 
-    // The SH palette stays PER ASSET and is never evicted (plan D3). It is NOT
-    // concatenated with the others: FRHIBufferDesc::Size is a uint32, so one buffer
-    // caps at 4 GiB = 23.86M SH3 entries, and concatenating would apply that cap to
-    // the SUM across districts -- a single dense SH3 capture already approaches it.
-    // Bound as an SRV array instead, selected per splat by PaletteSlot (review M5).
-    TRefCountPtr<FRDGPooledBuffer> SHPalette;
-
-    FRHIShaderResourceView* GetSHPaletteSRV() const { return SHPalette.IsValid() ? SHPalette->GetSRV() : nullptr; }
+    // The palette BUFFER itself lives on the pool, in PaletteBuffers[PaletteSlot],
+    // not here: a residency sits in a TMap, and a TMap reallocates its storage on a
+    // later Add, so the render command that fills the buffer cannot hold a pointer
+    // into one. That is not hypothetical -- it crashed every load of a five-district
+    // map (2026-10-09). The pool outlives every residency, and a slot already
+    // identifies an asset's palette uniquely, so the slot is the stable handle.
 };
 
 // One contiguous stretch of pool slots. A cell's take becomes a handful of these:
@@ -225,6 +223,16 @@ public:
     // no asset has taken, so every element of the shader's SRV array is bound.
     void GetSHPaletteSRVs(FRHIShaderResourceView* Out[]) const;
 
+    // One slot's palette, or null when that slot holds none. Null is the SH0 case and
+    // the slots-full case alike; the caller gates the read on HasSH either way, which
+    // is what the legacy path does with its own palette SRV.
+    FRHIShaderResourceView* GetSHPaletteSRV(int32 Slot) const
+    {
+        return (Slot >= 0 && Slot < MaxSHPalettes && PaletteBuffers[Slot].IsValid())
+            ? PaletteBuffers[Slot]->GetSRV()
+            : nullptr;
+    }
+
     // How many distinct SH palettes one world may hold. SH0 assets take no slot, so
     // this is a limit on SH districts, not on districts. Raising it costs a
     // descriptor and a case in the vertex shader's switch.
@@ -282,6 +290,15 @@ private:
 
     // Slot -> the asset holding it, so a slot is freed when its asset unregisters.
     const UGaussianSplatPagedAsset* PaletteSlotOwner[MaxSHPalettes] = {};
+
+    // Slot -> that asset's palette. The SH palette stays PER ASSET and is never
+    // evicted (plan D3). It is NOT concatenated with the others: FRHIBufferDesc::Size
+    // is a uint32, so one buffer caps at 4 GiB = 23.86M SH3 entries, and concatenating
+    // would apply that cap to the SUM across districts -- a single dense SH3 capture
+    // already approaches it. Bound as an SRV array instead, selected per splat by
+    // PaletteSlot (review M5). Written on the render thread, indexed by a slot the
+    // game thread assigned, so no pointer crosses the two.
+    TRefCountPtr<FRDGPooledBuffer> PaletteBuffers[MaxSHPalettes];
 
     int64 TotalSlots = 0;
     int64 NextUnusedSlot = 0;      // everything past this has never been handed out

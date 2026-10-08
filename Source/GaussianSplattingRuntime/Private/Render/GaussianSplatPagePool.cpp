@@ -587,15 +587,11 @@ void FGaussianSplatPagePool::GetSHPaletteSRVs(FRHIShaderResourceView* Out[]) con
     {
         Out[Slot] = Dummy;
     }
-    for (const TPair<const UGaussianSplatPagedAsset*, FGaussianSplatPoolResidency>& Pair : Residencies)
+    for (int32 Slot = 0; Slot < MaxSHPalettes; ++Slot)
     {
-        const int32 Slot = Pair.Value.PaletteSlot;
-        if (Slot >= 0 && Slot < MaxSHPalettes)
+        if (PaletteBuffers[Slot].IsValid())
         {
-            if (FRHIShaderResourceView* const SRV = Pair.Value.GetSHPaletteSRV())
-            {
-                Out[Slot] = SRV;
-            }
+            Out[Slot] = PaletteBuffers[Slot]->GetSRV();
         }
     }
 }
@@ -632,25 +628,31 @@ void FGaussianSplatPagePool::BuildAssetBuffers(
         }
     }
 
-    TArray<float> Palette = Asset.SHPalette;
-    const bool bHasPalette = !Palette.IsEmpty();
-    if (!bHasPalette)
-    {
-        Palette.Add(0.0f);
-    }
-
+    // By VALUE, and only the slot. Capturing &Residency here was a use-after-free:
+    // Residencies is a TMap, every later RegisterAsset Adds to it, and an Add
+    // reallocates -- so by the time the render thread drained this command the
+    // pointer could name freed memory. One asset never showed it; the five-district
+    // map crashed on every load, always on the fifth (2026-10-09). The pool is
+    // stable, so the buffer goes there and the slot is what crosses the threads.
     FGaussianSplatPagePool* Self = this;
-    FGaussianSplatPoolResidency* Target = &Residency;
+    const int32 Slot = Residency.PaletteSlot;
+    TArray<float> Palette = (Slot != INDEX_NONE) ? Asset.SHPalette : TArray<float>();
     ENQUEUE_RENDER_COMMAND(GaussianSplatPoolAssetBuffers)(
-        [Self, Target, Palette = MoveTemp(Palette)](FRHICommandListImmediate& RHICmdList)
+        [Self, Slot, Palette = MoveTemp(Palette)](FRHICommandListImmediate& RHICmdList)
         {
-            MakePooledBuffer(RHICmdList, TEXT("GaussianSplat.PagedSHPalette"), sizeof(float),
-                             Palette.GetData(), static_cast<uint32>(Palette.Num()), Target->SHPalette);
+            // Unconditionally, and FIRST: an all-SH0 world builds no palette at all,
+            // and every slot of the shader's SRV array still has to be bound.
             if (!Self->DummyPalette.IsValid())
             {
                 const float Zero = 0.0f;
                 MakePooledBuffer(RHICmdList, TEXT("GaussianSplat.PagedSHPaletteDummy"), sizeof(float),
                                  &Zero, 1, Self->DummyPalette);
+            }
+            if (Slot != INDEX_NONE && Palette.Num() > 0)
+            {
+                MakePooledBuffer(RHICmdList, TEXT("GaussianSplat.PagedSHPalette"), sizeof(float),
+                                 Palette.GetData(), static_cast<uint32>(Palette.Num()),
+                                 Self->PaletteBuffers[Slot]);
             }
         });
 
@@ -1253,6 +1255,7 @@ void FGaussianSplatPagePool::UnregisterAsset(const UGaussianSplatPagedAsset* Ass
         if (Slot >= 0 && Slot < MaxSHPalettes && PaletteSlotOwner[Slot] == Asset)
         {
             PaletteSlotOwner[Slot] = nullptr;
+            PaletteBuffers[Slot].SafeRelease();
         }
         // Floor ranges are not reclaimed: they came from the untouched space and
         // giving them back would need a range allocator with coalescing, which
@@ -1280,5 +1283,6 @@ void FGaussianSplatPagePool::ReleaseRHI()
     for (int32 Slot = 0; Slot < MaxSHPalettes; ++Slot)
     {
         PaletteSlotOwner[Slot] = nullptr;
+        PaletteBuffers[Slot].SafeRelease();
     }
 }

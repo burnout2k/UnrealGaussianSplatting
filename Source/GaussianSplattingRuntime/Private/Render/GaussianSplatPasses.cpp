@@ -2550,7 +2550,8 @@ namespace GaussianSplatPasses
             FRHIShaderResourceView* const SrcSHIndex =
                 bPaged ? Pool.GetSHIndexSRV() : Legacy->GetSHIndexSRV().GetReference();
             FRHIShaderResourceView* const SrcSHPalette =
-                bPaged ? PagedResidency->GetSHPaletteSRV() : Legacy->GetSHPaletteSRV().GetReference();
+                bPaged ? Pool.GetSHPaletteSRV(PagedResidency->PaletteSlot)
+                       : Legacy->GetSHPaletteSRV().GetReference();
             const FVector2f SrcColorEncoding = bPaged ? PagedAsset->ColorEncoding : Legacy->GetColorEncoding();
             const float SrcSizeRef = bPaged ? PagedAsset->SizeRef : Legacy->GetSizeRef();
             const float SrcSizeP99 = bPaged ? PagedAsset->SizeP99 : Legacy->GetSizeP99();
