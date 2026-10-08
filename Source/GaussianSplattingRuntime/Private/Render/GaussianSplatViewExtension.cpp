@@ -5,6 +5,7 @@
 
 #include "GaussianSplatAsset.h"
 #include "GaussianSplatComponent.h"
+#include "Algo/Reverse.h"
 #include "GaussianSplatWorldSubsystem.h"
 #include "PostProcess/PostProcessMaterialInputs.h"
 #include "Render/GaussianSplatPasses.h"
@@ -12,6 +13,22 @@
 #include "ScreenPass.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatViewExtension, Log, All);
+
+// Fix 5 Step 3 gate G3b, oracle 1. Reverses the order the view's splat components are
+// snapshotted in, which is the order they are blended in.
+//
+// It is a test of the thing Step 3 fixes, not a feature. The blend is an under-blend,
+// so a later batch composites BEHIND an earlier one: with a sort per batch the two
+// orders give different pictures wherever two districts interleave in depth, and that
+// difference IS critic C10. Once one sort covers them both, the order a component was
+// registered in stops meaning anything and the two pictures must agree within the
+// sort-tie noise floor.
+static TAutoConsoleVariable<int32> CVarReverseBatchOrder(
+    TEXT("r.GaussianSplat.ReverseBatchOrder"),
+    0,
+    TEXT("Gate G3b: 1 = snapshot the view's splat components in reverse registration order. With a sort per batch ")
+    TEXT("this changes the picture where districts overlap (that is the bug); with one sort it must not."),
+    ECVF_RenderThreadSafe);
 
 FGaussianSplatViewExtension::FGaussianSplatViewExtension(const FAutoRegister& AutoRegister)
     : FSceneViewExtensionBase(AutoRegister)
@@ -204,5 +221,9 @@ void FGaussianSplatViewExtension::BuildPointSnapshot_GameThread(
         NewPoints.Add(Batch);
     }
 
+    if (CVarReverseBatchOrder.GetValueOnGameThread() != 0)
+    {
+        Algo::Reverse(NewPoints);
+    }
     FamilyData->Batches = MoveTemp(NewPoints);
 }
