@@ -1731,39 +1731,69 @@ namespace GaussianSplatLod
     // lowers one multiplier m on d_full, which thins the far cells first; mode 0's uniform clamp stays behind it as
     // the last safety net, and drops the one-splat floor when there are more visible cells than budget (the sort
     // buffers hold only the budget, and the cull does not check).
+    // Fix 5 Step 3 (plan D7): one asset taking part in a view's selection. Several of
+    // these are solved TOGETHER, under one multiplier and one budget, so a single sort
+    // can cover a whole district map. With one group it is exactly what the per-asset
+    // call used to be, which is what lets the change land before the merged draw does.
+    struct FScreenLodGroup
+    {
+        const TArray<FGaussianSplatCell>* Cells = nullptr;
+        FMatrix LocalToWorld = FMatrix::Identity;   // absolute and double: cell boxes are measured against the real view origin
+
+        // Per asset, because d_full is: it comes from the asset's own median splat size
+        // and the actor's scale, so a drone capture and a street capture reach full
+        // detail at very different distances under the SAME multiplier.
+        float PointSize = 1.0f;
+        float SizeRef = 0.0f;
+        float SizeP99 = 0.0f;
+        double ActorScale = 1.0;
+
+        // Set together, and only for a paged asset: the selection itself is unchanged
+        // -- it still works on the asset's FULL cell counts, so a view's take does not
+        // move when a page is evicted -- but the ranges it emits then address pool
+        // slots, and anything the pool does not hold is counted as a miss rather than
+        // silently dropped.
+        const UGaussianSplatPagedAsset* PagedAsset = nullptr;
+        const FGaussianSplatPoolResidency* PagedResidency = nullptr;
+
+        uint32 CellBase = 0;      // where this asset's cells start in the pool's shared bounds
+        uint32 BatchId = 0;       // its entry in the per-batch table
+
+        double HalfFull = 0.0;    // computed below; kept so the stats line can report it
+        uint32 Missed = 0;        // out: splats selected that the pool does not hold
+    };
+
     void SelectCellsScreen(
-        const TArray<FGaussianSplatCell>& Cells,
-        const FMatrix& LocalToWorld,
+        TArrayView<FScreenLodGroup> Groups,
         const FSceneView& View,
         uint32 Budget,
         const FScreenLodInputs& In,
         FSelection& Out,
-        GaussianSplatProfiling::FLodStats& Stats,
-        // Set together, and only for a paged asset: the selection itself is
-        // unchanged -- it still works on the asset's FULL cell counts, so a view's
-        // take does not move when a page is evicted -- but the ranges it emits then
-        // address pool slots, and anything the pool does not hold is counted as a
-        // miss rather than silently dropped.
-        const UGaussianSplatPagedAsset* PagedAsset = nullptr,
-        const FGaussianSplatPoolResidency* PagedResidency = nullptr,
-        uint32* OutMissCount = nullptr)
+        GaussianSplatProfiling::FLodStats& Stats)
     {
-        const bool bPaged = PagedAsset != nullptr && PagedResidency != nullptr;
         const uint32 SplitRuns = GaussianSplatProfiling::GetLodSplitRuns();
+        int32 RangeSlots = 0;
+        for (const FScreenLodGroup& Group : Groups)
+        {
+            if (Group.Cells == nullptr)
+            {
+                continue;
+            }
+            RangeSlots += Group.PagedAsset != nullptr
+                ? FMath::Max(1, Group.Cells->Num() * static_cast<int32>(PagedRangesPerCell))
+                : static_cast<int32>(RangeCapacity(*Group.Cells, SplitRuns));
+        }
         Out.Ranges.Reset();
-        Out.Ranges.SetNumZeroed(bPaged
-            ? FMath::Max(1, Cells.Num() * static_cast<int32>(PagedRangesPerCell))
-            : static_cast<int32>(RangeCapacity(Cells, SplitRuns)));
+        Out.Ranges.SetNumZeroed(FMath::Max(1, RangeSlots));
         Out.CellCount = 0;
         Out.TotalCount = 0;
         Stats.Mode = 1;
 
-        if (Cells.IsEmpty() || Budget == 0)
+        if (Groups.IsEmpty() || Budget == 0)
         {
             return;
         }
 
-        const FMatrix& ToWorld = LocalToWorld;   // already double (review M7)
         const FVector ViewOrigin = View.ViewMatrices.GetViewOrigin();
         const FVector ViewForward = View.GetViewDirection();
         // As mode 0: r.GaussianSplat.Lod 0 keeps every visible cell whole.
@@ -1774,23 +1804,39 @@ namespace GaussianSplatLod
         const float K = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodScreenK.GetValueOnRenderThread());
         const float MinFull = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodMinFullDistance.GetValueOnRenderThread());
         const float DebugHalf = GaussianSplatProfiling::CVarLodDebugHalfFullDistance.GetValueOnRenderThread();
+        const float CullMargin = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodCullMargin.GetValueOnRenderThread());
+
+        struct FCandidate
+        {
+            int32 GroupIndex = 0;
+            int32 CellIndex = 0;
+            double Distance = 0.0;
+            // The group's F' = d_full / 2 at m = 1, carried per candidate because the
+            // bisection solves ONE multiplier across groups whose d_full differ.
+            double HalfFull = 0.0;
+        };
+        TArray<FCandidate> Candidates;
+
+        for (int32 GroupIndex = 0; GroupIndex < Groups.Num(); ++GroupIndex)
+        {
+        FScreenLodGroup& Group = Groups[GroupIndex];
+        if (Group.Cells == nullptr || Group.Cells->IsEmpty())
+        {
+            continue;
+        }
+        const TArray<FGaussianSplatCell>& Cells = *Group.Cells;
+        const FMatrix& ToWorld = Group.LocalToWorld;   // absolute and double (review M7)
         // Local (asset) units, like the cell bounds it grows.
-        const double Margin = static_cast<double>(FMath::Max(0.0f, GaussianSplatProfiling::CVarLodCullMargin.GetValueOnRenderThread()))
-            * 0.35 * static_cast<double>(In.PointSize) * static_cast<double>(In.SizeP99);
+        const double Margin = static_cast<double>(CullMargin)
+            * 0.35 * static_cast<double>(Group.PointSize) * static_cast<double>(Group.SizeP99);
 
         // F' = d_full / 2 at m = 1. The debug value goes through the same float Max and widening as mode 0's
         // FullDistance, so the two modes compare identical doubles.
         // Shared with the settle gate (GaussianSplatLod), so the two cannot drift.
-        double HalfFull = GaussianSplatLod::ComputeHalfFull(
-            In.FocalPx, In.PointSize, In.SizeRef, In.ActorScale);
+        Group.HalfFull = GaussianSplatLod::ComputeHalfFull(
+            In.FocalPx, Group.PointSize, Group.SizeRef, Group.ActorScale);
 
-        struct FCandidate
-        {
-            int32 CellIndex = 0;
-            double Distance = 0.0;
-        };
-        TArray<FCandidate> Candidates;
-        Candidates.Reserve(Cells.Num());
+        Candidates.Reserve(Candidates.Num() + Cells.Num());
         for (int32 CellIndex = 0; CellIndex < Cells.Num(); ++CellIndex)
         {
             const FGaussianSplatCell& Cell = Cells[CellIndex];
@@ -1815,36 +1861,41 @@ namespace GaussianSplatLod
             {
                 continue;
             }
-            Candidates.Add({CellIndex,
-                FMath::Sqrt(ComputeSquaredDistanceFromBoxToPoint(WorldBox.Min, WorldBox.Max, ViewOrigin))});
+            Candidates.Add({GroupIndex, CellIndex,
+                FMath::Sqrt(ComputeSquaredDistanceFromBoxToPoint(WorldBox.Min, WorldBox.Max, ViewOrigin)),
+                Group.HalfFull});
         }
+        }   // groups
 
-        const auto TakeAt = [&Cells, &In, MinFraction](const FCandidate& Candidate, double FullDistance) -> uint32
+        // The bisection's variable is the MULTIPLIER itself now, not d_full: each
+        // candidate scales its OWN group's d_full by it, so one m thins every district
+        // the same way in screen terms while respecting each asset's full distance.
+        const auto TakeAt = [&Groups, &In, MinFraction](const FCandidate& Candidate, double Multiplier) -> uint32
         {
-            const FGaussianSplatCell& Cell = Cells[Candidate.CellIndex];
+            const FGaussianSplatCell& Cell = (*Groups[Candidate.GroupIndex].Cells)[Candidate.CellIndex];
             if (In.bFullCells)
             {
                 return static_cast<uint32>(Cell.Count);
             }
             // Shared with the settle gate, so the gate's bound is the same arithmetic.
-            return GaussianSplatLod::TakeAt(Cell.Count, Candidate.Distance, FullDistance, MinFraction);
+            return GaussianSplatLod::TakeAt(Cell.Count, Candidate.Distance, Candidate.HalfFull * Multiplier, MinFraction);
         };
-        const auto TotalAt = [&Candidates, &TakeAt](double FullDistance) -> uint64
+        const auto TotalAt = [&Candidates, &TakeAt](double Multiplier) -> uint64
         {
             uint64 Sum = 0;
             for (const FCandidate& Candidate : Candidates)
             {
-                Sum += TakeAt(Candidate, FullDistance);
+                Sum += TakeAt(Candidate, Multiplier);
             }
             return Sum;
         };
 
         // Budget: the largest m (to 2^-20 in 20 halvings) whose selection fits.
         double Multiplier = 1.0;
-        if (!In.bFullCells && TotalAt(HalfFull) > Budget)
+        if (!In.bFullCells && TotalAt(1.0) > Budget)
         {
             constexpr double MinMultiplier = 1.0 / 1048576.0;
-            if (TotalAt(HalfFull * MinMultiplier) > Budget)
+            if (TotalAt(MinMultiplier) > Budget)
             {
                 Multiplier = MinMultiplier;
             }
@@ -1855,7 +1906,7 @@ namespace GaussianSplatLod
                 for (int32 Pass = 0; Pass < 20; ++Pass)
                 {
                     const double Mid = 0.5 * (Fits + Over);
-                    if (TotalAt(HalfFull * Mid) <= Budget)
+                    if (TotalAt(Mid) <= Budget)
                     {
                         Fits = Mid;
                     }
@@ -1875,7 +1926,12 @@ namespace GaussianSplatLod
         // and draw them as misses (measured: 1.9M at a 600 MiB cap). TakeAt is
         // monotone in the full distance, so clamping after the bisection still fits
         // the budget.
-        if (bPaged && FGaussianSplatPagePool::IsStreamingEnabled())
+        bool bAnyPaged = false;
+        for (const FScreenLodGroup& Group : Groups)
+        {
+            bAnyPaged = bAnyPaged || Group.PagedAsset != nullptr;
+        }
+        if (bAnyPaged && FGaussianSplatPagePool::IsStreamingEnabled())
         {
             Multiplier = FMath::Min(Multiplier, static_cast<double>(FGaussianSplatStreamGate::GetOverflowMultiplier()));
         }
@@ -1885,7 +1941,7 @@ namespace GaussianSplatLod
         uint64 Total = 0;
         for (const FCandidate& Candidate : Candidates)
         {
-            Takes.Add(TakeAt(Candidate, HalfFull * Multiplier));
+            Takes.Add(TakeAt(Candidate, Multiplier));
             Total += Takes.Last();
         }
 
@@ -1935,7 +1991,6 @@ namespace GaussianSplatLod
         }
 
         uint32 Prefix = 0;
-        uint32 Missed = 0;
         TArray<FGaussianSplatPoolRun> Runs;
         for (int32 Index = 0; Index < Takes.Num(); ++Index)
         {
@@ -1944,27 +1999,29 @@ namespace GaussianSplatLod
                 continue;
             }
             const uint32 CellIndex = static_cast<uint32>(Candidates[Index].CellIndex);
-            if (bPaged)
+            FScreenLodGroup& Group = Groups[Candidates[Index].GroupIndex];
+            // Each entry carries its own asset's cell base and batch id, so one sorted
+            // stream can hold splats from every district (D7).
+            Out.CellBase = Group.CellBase;
+            Out.BatchId = Group.BatchId;
+            if (Group.PagedAsset != nullptr && Group.PagedResidency != nullptr)
             {
                 // Prefix advances by what each run actually covers, so a partly
                 // resident cell leaves no hole in dispatch space.
-                Missed += Takes[Index] - AddPagedRange(Out, *PagedAsset, *PagedResidency, CellIndex, Takes[Index], Prefix, Runs);
+                Group.Missed += Takes[Index]
+                    - AddPagedRange(Out, *Group.PagedAsset, *Group.PagedResidency, CellIndex, Takes[Index], Prefix, Runs);
                 continue;
             }
-            const FGaussianSplatCell& Cell = Cells[Candidates[Index].CellIndex];
+            const FGaussianSplatCell& Cell = (*Group.Cells)[Candidates[Index].CellIndex];
             AddRange(Out, static_cast<uint32>(Cell.FirstIndex), Prefix, CellIndex, Takes[Index], SplitRuns);
             Prefix += Takes[Index];
         }
         Out.TotalCount = Prefix;
-        if (OutMissCount != nullptr)
-        {
-            *OutMissCount = Missed;
-        }
 
         Stats.K = K;
         Stats.Multiplier = Multiplier;
         Stats.FocalPx = In.FocalPx;
-        Stats.FullDistance = 2.0 * HalfFull * Multiplier;
+        Stats.FullDistance = 2.0 * (Groups.Num() > 0 ? Groups[0].HalfFull : 0.0) * Multiplier;
 
         // Debug logging. Render thread only, like the rest of this file's static state.
         static int32 LogNextValue = 0;
@@ -1994,14 +2051,14 @@ namespace GaussianSplatLod
                     In.ViewRect.Height(),
                     K,
                     In.FocalPx,
-                    In.PointSize,
-                    In.ActorScale,
-                    In.SizeRef,
-                    In.SizeP99,
+                    Groups[0].PointSize,
+                    Groups[0].ActorScale,
+                    Groups[0].SizeRef,
+                    Groups[0].SizeP99,
                     Stats.FullDistance,
                     MinFull,
                     Multiplier,
-                    Margin,
+                    static_cast<double>(CullMargin) * 0.35 * Groups[0].PointSize * Groups[0].SizeP99,
                     Out.TotalCount,
                     Budget,
                     Out.CellCount,
@@ -2032,7 +2089,8 @@ namespace GaussianSplatLod
                 Out.TotalCount);
             for (int32 Index = 0; Index < Candidates.Num(); ++Index)
             {
-                const FGaussianSplatCell& Cell = Cells[Candidates[Index].CellIndex];
+                const FGaussianSplatCell& Cell =
+                    (*Groups[Candidates[Index].GroupIndex].Cells)[Candidates[Index].CellIndex];
                 UE_LOG(
                     LogGaussianSplatProfile,
                     Display,
@@ -2442,17 +2500,28 @@ namespace GaussianSplatPasses
                     LodInputs.ViewKey = View.GetViewKey();
                     LodInputs.BatchIndex = BatchIndex;
                     LodInputs.ViewRect = ViewRect;
+                    // One group for now. The merged draw passes every paged batch of the
+                    // view here instead, and the bisection then solves ONE multiplier
+                    // across all of them against the shared budget (plan D7).
+                    GaussianSplatLod::FScreenLodGroup LodGroup;
+                    LodGroup.Cells = &SrcCells;
+                    LodGroup.LocalToWorld = Batch.LocalToWorld;
+                    LodGroup.PointSize = Batch.PointSize;
+                    LodGroup.SizeRef = SrcSizeRef;
+                    LodGroup.SizeP99 = SrcSizeP99;
+                    LodGroup.ActorScale = LodInputs.ActorScale;
+                    LodGroup.PagedAsset = bPaged ? PagedAsset : nullptr;
+                    LodGroup.PagedResidency = bPaged ? PagedResidency : nullptr;
+                    LodGroup.CellBase = Selection.CellBase;
+                    LodGroup.BatchId = Selection.BatchId;
                     GaussianSplatLod::SelectCellsScreen(
-                        SrcCells,
-                        Batch.LocalToWorld,
+                        MakeArrayView(&LodGroup, 1),
                         View,
                         RenderPointCount,
                         LodInputs,
                         Selection,
-                        LodStats,
-                        bPaged ? PagedAsset : nullptr,
-                        bPaged ? PagedResidency : nullptr,
-                        &PagedMisses);
+                        LodStats);
+                    PagedMisses = LodGroup.Missed;
                 }
                 else if (bPaged)
                 {
