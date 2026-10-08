@@ -69,7 +69,15 @@ float2 ProjectToPixel(float3 WorldPos, out float SafeClipW)
 
 bool IsSplatVisible(FSplatRef Splat, out float Depth)
 {
-    float3 CenterWS = mul(float4(DecodeSplatPosition(Splat.Index, Splat.Cell), 1.0), LocalToWorldMatrix).xyz;
+    // Fix 5 Step 3 (plan D7): per-asset values come from the batch table, so ONE cull
+    // dispatch can cover every district in the view. The plan's option (b) kept this
+    // shader untouched and dispatched per batch instead, but OccBoxUAV below is indexed
+    // by the dispatch index, so per-batch dispatches would collide there unless an
+    // index offset were threaded through anyway -- which is a change to this shader too.
+    // Reading the table is the smaller diff now that the raster and the occlusion
+    // recompute already do it.
+    const FGaussianSplatBatch Batch = SplatBatches[Splat.Batch];
+    float3 CenterWS = mul(float4(DecodeSplatPosition(Splat.Index, Splat.Cell), 1.0), Batch.LocalToWorld).xyz;
     Depth = dot(CenterWS - ViewWorldOrigin.xyz, ViewForward.xyz);
     if (Depth <= 0.0)
     {
@@ -87,7 +95,7 @@ bool IsSplatVisible(FSplatRef Splat, out float Depth)
     // of them stack into the milky veil that dense captures show. Rejecting it
     // here skips its whole rasterisation, not just its faint pixels.
     if (MinSplatOpacity > 0.0 &&
-        saturate(DecodeSplatColor(Splat.Index).w * OpacityScale) < MinSplatOpacity)
+        saturate(DecodeSplatColor(Splat.Index, Batch.ColorEncoding).w * Batch.OpacityScale) < MinSplatOpacity)
     {
         return false;
     }
@@ -101,13 +109,13 @@ bool IsSplatVisible(FSplatRef Splat, out float Depth)
 
     float3 Cov3D0;
     float3 Cov3D1;
-    DecodeSplatCovariance(Splat.Index, PointSize * 0.35, Cov3D0, Cov3D1);
+    DecodeSplatCovariance(Splat.Index, Batch.PointSize * 0.35, Cov3D0, Cov3D1);
 
     float3 Cov2D = CalcCovariance2D(
         CenterWS,
         Cov3D0,
         Cov3D1,
-        LocalToWorldMatrix,
+        Batch.LocalToWorld,
         ViewMatrix,
         ProjectionMatrix,
         ViewSize);

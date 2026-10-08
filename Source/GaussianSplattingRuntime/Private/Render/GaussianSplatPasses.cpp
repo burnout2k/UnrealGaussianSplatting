@@ -2291,6 +2291,26 @@ namespace GaussianSplatPasses
             BatchEntries.Num() * sizeof(FGaussianSplatBatchEntry));
         FRDGBufferSRVRef BatchTableSRV = GraphBuilder.CreateSRV(BatchTable);
 
+        // Fix 5 Step 3 (review M4): ONE draw budget for the view's paged batches, the
+        // MAX of their own. A single sort means one set of sort buffers, and those are
+        // sized from the budget, so the budget has to be the view's rather than each
+        // asset's -- five districts at 25M each would be five 381 MiB scratch sets.
+        //
+        // Max, not sum: with one paged asset it IS that asset's budget, so a
+        // single-asset scene is bit for bit what it was and G3a holds by construction.
+        // The distribution across districts is then the LOD rule itself -- near cells
+        // of any district keep more, far cells keep less -- which is what a frame-time
+        // budget is for. A per-batch budget would do the opposite and protect a far
+        // district's share against the one the car is actually in.
+        uint32 ViewPagedBudget = 0;
+        for (const FGaussianSplatRenderBatch& Entry : Batches)
+        {
+            if (Entry.PagedAsset != nullptr && Entry.PagedResidency != nullptr)
+            {
+                ViewPagedBudget = FMath::Max(ViewPagedBudget, Entry.MaxRenderPoints);
+            }
+        }
+
         for (int32 BatchIndex = 0; BatchIndex < Batches.Num(); ++BatchIndex)
         {
             const FGaussianSplatRenderBatch& Batch = Batches[BatchIndex];
@@ -2365,7 +2385,10 @@ namespace GaussianSplatPasses
             // frame to frame, and therefore what sizes the buffers.
             // r.GaussianSplat.MaxRenderPointsOverride (Fix 5 probe) replaces every component's budget.
             const uint32 BudgetOverride = GaussianSplatProfiling::GetMaxRenderPointsOverride();
-            const uint32 MaxRenderPoints = BudgetOverride > 0 ? BudgetOverride : Batch.MaxRenderPoints;
+            // A paged batch draws from the view's shared budget; a legacy one keeps its
+            // own, since it still gets its own sort and its own buffers.
+            const uint32 OwnBudget = bPaged ? ViewPagedBudget : Batch.MaxRenderPoints;
+            const uint32 MaxRenderPoints = BudgetOverride > 0 ? BudgetOverride : OwnBudget;
             const uint32 RenderPointCount = bUseCells
                 ? FMath::Min(MaxRenderPoints, Batch.AssetPointCount)
                 : FMath::Min(MaxRenderPoints,
@@ -2918,6 +2941,7 @@ namespace GaussianSplatPasses
                 InitSortParameters->SplatPackedA = SrcPackedA;
                 InitSortParameters->SplatPackedB = SrcPackedB;
                 InitSortParameters->SplatCellBounds = SrcCellBounds;
+                InitSortParameters->SplatBatches = BatchTableSRV;
                 InitSortParameters->SplatColorEncoding = SrcColorEncoding;
                 InitSortParameters->OpacityScale = Batch.OpacityScale;
                 InitSortParameters->MinSplatOpacity = GaussianSplatProfiling::GetMinSplatOpacity();
@@ -2979,6 +3003,7 @@ namespace GaussianSplatPasses
                             SortParameters->SplatPackedA = SrcPackedA;
                             SortParameters->SplatPackedB = SrcPackedB;
                             SortParameters->SplatCellBounds = SrcCellBounds;
+                            SortParameters->SplatBatches = BatchTableSRV;
                             SortParameters->SplatOrderBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(OrderBuffer, PF_R32_UINT));
                             SortParameters->SplatKeyBufferUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(KeyBuffer, PF_R32_UINT));
                             SortParameters->SplatIndirectArgsUAV = GraphBuilder.CreateUAV(FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));

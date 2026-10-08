@@ -62,6 +62,8 @@ public:
         SHADER_PARAMETER_SRV(StructuredBuffer<uint4>, SplatPackedA)
         SHADER_PARAMETER_SRV(StructuredBuffer<uint>, SplatPackedB)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, SplatCellBounds)
+        // Fix 5 Step 3: per-asset values, so one dispatch can cover every district (D7).
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGaussianSplatBatchEntry>, SplatBatches)
         SHADER_PARAMETER(FVector2f, SplatColorEncoding)
         SHADER_PARAMETER(uint32, SortK)
         SHADER_PARAMETER(uint32, SortJ)
