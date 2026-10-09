@@ -2465,6 +2465,30 @@ namespace GaussianSplatPasses
         }
         if (MergedGroups.Num() > 0)
         {
+            // Diagnostic for the eight-asset GPU hang (2026-10-09). Registration and the shared cell-bounds
+            // table are both provably correct at eight assets, so whatever is wrong is here, in what the draw
+            // is handed. Once per process, so a working seven-asset run and a hanging eight-asset one can be
+            // diffed line for line. Remove with the CELLBOUNDS log once the hang is understood.
+            static bool bLoggedMergeOnce = false;
+            if (!bLoggedMergeOnce)
+            {
+                bLoggedMergeOnce = true;
+                for (int32 G = 0; G < MergedGroups.Num(); ++G)
+                {
+                    const GaussianSplatLod::FScreenLodGroup& Grp = MergedGroups[G];
+                    UE_LOG(LogGaussianSplatProfile, Display,
+                           TEXT("MERGEDRAW group %2d batch %2d cellBase %7u cells %6d points %10u ")
+                           TEXT("paletteSlot %2d pointSize %.2f sizeRef %.4f maxFull %.1f"),
+                           G, Grp.BatchId, Grp.CellBase, Grp.Cells ? Grp.Cells->Num() : -1,
+                           Batches[MergedBatches[G]].AssetPointCount,
+                           Grp.PagedResidency ? Grp.PagedResidency->PaletteSlot : -2,
+                           Grp.PointSize, Grp.SizeRef, Grp.MaxFullDistanceM);
+                }
+                UE_LOG(LogGaussianSplatProfile, Display,
+                       TEXT("MERGEDRAW %d groups, assetPoints %llu, viewPagedBudget %u"),
+                       MergedGroups.Num(), static_cast<unsigned long long>(MergedAssetPoints), ViewPagedBudget);
+            }
+
             MergedRepresentative = MergedBatches[0];
             const uint32 Override = GaussianSplatProfiling::GetMaxRenderPointsOverride();
             MergedBudget = static_cast<uint32>(FMath::Min<uint64>(
