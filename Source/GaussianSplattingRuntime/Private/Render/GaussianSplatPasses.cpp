@@ -3325,6 +3325,21 @@ namespace GaussianSplatPasses
                     {
                         FGaussianSplatPagePool::Get().GetSHPaletteSRVs(Palettes);
                     }
+                    // SLOT 0 MUST BE THIS DRAW'S PALETTE, not the pool's slot 0. The cheap permutation
+                    // reads SplatSHPalette0 unconditionally, so filling purely from the pool made every
+                    // single-batch paged draw whose asset sits in pool slot >= 1 read slot 0's palette --
+                    // a regression I introduced in the null-palette fix, latent only because every map
+                    // today holds copies of ONE capture whose palettes are byte-identical. The code this
+                    // replaced bound SrcSHPalette everywhere and was right about this and wrong about null.
+                    //
+                    // The MERGED draw keeps the pool's slot 0: its batches span several assets, so there is
+                    // no single "own" palette, and picking the right one per batch needs the multi-palette
+                    // permutation that :2337 still hardcodes off. That remains wrong for two DIFFERENT SH3
+                    // captures in one view, and is the open bug -- this line does not pretend to fix it.
+                    if (!bMerged && SrcSHPalette != nullptr)
+                    {
+                        Palettes[0] = SrcSHPalette;
+                    }
                     for (int32 Slot = 0; Slot < FGaussianSplatPagePool::MaxSHPalettes; ++Slot)
                     {
                         if (Palettes[Slot] == nullptr)
