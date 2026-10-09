@@ -100,6 +100,22 @@ namespace
         TEXT("tick; steady driving needs 4.7-6.9 MiB and the worst 1/30 s is 12 MiB, so it rarely binds."),
         ECVF_RenderThreadSafe);
 
+    // D4 said the required prefix is uncapped: a camera frame must not draw a hole. Two
+    // runs on 2026-10-10 found the other side of that: a required set of 15,421 pages
+    // (1,205 MiB, r.GaussianSplat.Lod 0 with streaming on) uploaded in ONE tick lost the
+    // device -- Xid 109, CTX SWITCH TIMEOUT -- as 5 x 256 MiB commands and again as one
+    // 1,205 MiB command, each time on a single frame that never ended. A hole for a tick
+    // is recoverable and counted (stream "short"); a lost device is neither. No real tick
+    // has ever exceeded 256 MiB (the split path had never run before those two), so this
+    // default changes nothing measured; it bounds the pathological case.
+    TAutoConsoleVariable<int32> CVarStreamMaxRequiredUploadMB(
+        TEXT("r.GaussianSplat.Stream.MaxRequiredUploadMBPerTick"),
+        256,
+        TEXT("Byte cap per gate tick on REQUIRED uploads, MiB; what does not fit is deferred to the next tick\n")
+        TEXT("in prefix order and counted as short. 0 = uncapped (the pre-2026-10-10 behaviour, which lost the\n")
+        TEXT("device on a 1,205 MiB single-tick fill)."),
+        ECVF_RenderThreadSafe);
+
     // Debug, for the per-draw palette choice (36f230b). Every map on disk holds copies of one capture
     // whose palettes are byte-identical, so a draw reading the wrong slot looks right; flattening one
     // slot's palette makes the asset in it change colour if and only if its own slot is what gets read.
@@ -1200,11 +1216,16 @@ void FGaussianSplatPagePool::ApplyStreamPlan(FGaussianSplatStreamPlan&& Plan, in
         ++LastStreamStats.PagesEvicted;
     }
 
-    // ---- Then uploads. The required prefix is uncapped (D4): the pages are in
-    // RAM, so this costs memcpy and PCIe, never a wait on IO or the GPU.
+    // ---- Then uploads. The required prefix is uncapped in the sense D4 meant -- the
+    // pages are in RAM, so this costs memcpy and PCIe, never a wait on IO -- but it is
+    // bounded per tick (see CVarStreamMaxRequiredUploadMB): the GPU side of a 1.2 GB
+    // single-tick fill is a dispatch that never ends.
     const int64 PrefetchCapBytes = static_cast<int64>(FMath::Max(0, CVarStreamMaxUploadMB.GetValueOnAnyThread()))
         * 1024 * 1024;
     int64 PrefetchBytes = 0;
+    const int32 RequiredCapMB = FMath::Max(0, CVarStreamMaxRequiredUploadMB.GetValueOnAnyThread());
+    const int64 RequiredCapBytes = RequiredCapMB > 0 ? static_cast<int64>(RequiredCapMB) * 1024 * 1024 : MAX_int64;
+    int64 RequiredBytes = 0;
 
     // Batched per asset and flushed at the end: one staging buffer and one scatter
     // dispatch per asset rather than a lock per page (D5). HasSH is uniform inside
@@ -1248,7 +1269,27 @@ void FGaussianSplatPagePool::ApplyStreamPlan(FGaussianSplatStreamPlan&& Plan, in
         const int64 Bytes = SlotsPerPage * BytesPerSlot;
         if (!bRequired && PrefetchBytes + Bytes > PrefetchCapBytes)
         {
-            continue;   // prefetch stops at the cap; required pages never do
+            continue;   // prefetch stops at the cap
+        }
+        if (bRequired && RequiredBytes + Bytes > RequiredCapBytes)
+        {
+            // Deferred, not dropped: the gate re-emits every required page each tick in
+            // prefix order, so the fill completes over several ticks and the views draw
+            // misses meanwhile -- which the stats line shows as short > 0 and misses > 0.
+            static bool bWarnedRequiredCap = false;
+            if (!bWarnedRequiredCap)
+            {
+                bWarnedRequiredCap = true;
+                UE_LOG(
+                    LogGaussianSplatPool,
+                    Warning,
+                    TEXT("Required uploads this tick exceed r.GaussianSplat.Stream.MaxRequiredUploadMBPerTick (%d MiB); ")
+                    TEXT("the rest is deferred to later ticks and counted as short. A fill this large in one tick has ")
+                    TEXT("lost the device before (Xid 109); if this is a reference run, use r.GaussianSplat.Stream 0."),
+                    RequiredCapMB);
+            }
+            ++LastStreamStats.PagesRequiredNotUploaded;
+            continue;
         }
 
         const int32 Slot = AcquirePage();
@@ -1285,7 +1326,11 @@ void FGaussianSplatPagePool::ApplyStreamPlan(FGaussianSplatStreamPlan&& Plan, in
 
         ++LastStreamStats.PagesUploaded;
         LastStreamStats.UploadBytes += Bytes;
-        if (!bRequired)
+        if (bRequired)
+        {
+            RequiredBytes += Bytes;
+        }
+        else
         {
             PrefetchBytes += Bytes;
         }
