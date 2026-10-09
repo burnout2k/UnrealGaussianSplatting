@@ -238,7 +238,7 @@ namespace GaussianSplatProfiling
                 const FGaussianSplatGateStats& Gate = FGaussianSplatStreamGate::Get().GetLastStats();
                 StreamText = FString::Printf(
                     TEXT(" | stream req %d want %d resident %d | up %d (%.1f MiB) evict %d short %d thrash %d")
-                    TEXT(" | gate %.3f ms upload %.3f ms | m %.4f | cells %d | req# %llx"),
+                    TEXT(" | gate %.3f ms upload %.3f ms | m %.4f | cells %d | demand %d cap %d next %d @x%.1f | req# %llx"),
                     Gate.RequiredPages,
                     Gate.WantedPages,
                     Gate.ResidentPages,
@@ -251,6 +251,10 @@ namespace GaussianSplatProfiling
                     Up.UploadMs,
                     Gate.OverflowMultiplier,
                     Gate.CellsVisited,
+                    Gate.DemandPages,
+                    Gate.CapacityPages,
+                    Gate.DemandNextPages,
+                    Gate.ProbeStep,
                     Gate.RequiredHash);
             }
             UE_LOG(

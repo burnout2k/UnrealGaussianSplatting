@@ -41,6 +41,16 @@ namespace
         TEXT("least affordable. 0 restores pure velocity extrapolation."),
         ECVF_RenderThreadSafe);
 
+    // Fix 7 step 1: the d_full multiple at which the gate also prices the required set, so a
+    // controller can ask "would one step up fit?" before taking it. Over the cells already
+    // visited only -- one extra pass of PagesAt per tick, no second walk.
+    TAutoConsoleVariable<float> CVarProbeStep(
+        TEXT("r.GaussianSplat.Stream.ProbeStep"),
+        2.0f,
+        TEXT("d_full multiple the gate prices the required set at, beside the current one, as a lower bound\n")
+        TEXT("on the demand one detail step up. 1 disables the extra pass."),
+        ECVF_RenderThreadSafe);
+
     TAutoConsoleVariable<int32> CVarGateLog(
         TEXT("r.GaussianSplat.Stream.LogGate"),
         0,
@@ -647,8 +657,20 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     Stats.ResidentPages = static_cast<int32>(ResidentPages);
 
     const int64 Capacity = static_cast<int64>(Pool.GetFreePageCount()) + ResidentPages;
+    // The pre-fit demand is THE pressure signal (Fix 7): it is the only number here that keeps
+    // moving once the pool is full. It was always computed for the test below; now it is kept.
+    const int64 Demand = PagesAtMultiplier(1.0);
+    Stats.DemandPages = static_cast<int32>(FMath::Min<int64>(Demand, MAX_int32));
+    Stats.CapacityPages = static_cast<int32>(FMath::Min<int64>(Capacity, MAX_int32));
+    {
+        const float ProbeStep = FMath::Max(1.0f, CVarProbeStep.GetValueOnAnyThread());
+        Stats.ProbeStep = ProbeStep;
+        Stats.DemandNextPages = ProbeStep > 1.0f
+            ? static_cast<int32>(FMath::Min<int64>(PagesAtMultiplier(ProbeStep), MAX_int32))
+            : Stats.DemandPages;
+    }
     double Multiplier = 1.0;
-    if (PagesAtMultiplier(1.0) > Capacity)
+    if (Demand > Capacity)
     {
         constexpr double MinMultiplier = 1.0 / 1048576.0;
         if (PagesAtMultiplier(MinMultiplier) > Capacity)

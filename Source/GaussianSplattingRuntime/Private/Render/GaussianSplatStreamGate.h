@@ -89,6 +89,16 @@ struct FGaussianSplatGateStats
     int32 WantedPages = 0;
     int32 ResidentPages = 0;
     float OverflowMultiplier = 1.0f;
+    // Fix 7 step 1: the pressure signals a controller needs, which m and RequiredPages are
+    // not. DemandPages is the required set BEFORE the fit (PagesAtMultiplier(1.0)) -- m only
+    // moves once this exceeds the pool, and RequiredPages is counted AFTER the fit, so it
+    // saturates at capacity exactly when it is needed. DemandNextPages is the same set with
+    // d_full scaled by ProbeStep, over the cells this tick visited: a LOWER bound on what one
+    // step up would need (cells beyond the current walk radius are not in it).
+    int32 DemandPages = 0;
+    int32 CapacityPages = 0;
+    int32 DemandNextPages = 0;
+    float ProbeStep = 1.0f;
     double GateMs = 0.0;
 
     // Hash of the required set (asset, cell, page count) over every group. The
