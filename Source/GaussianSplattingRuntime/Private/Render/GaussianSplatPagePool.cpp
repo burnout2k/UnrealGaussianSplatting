@@ -100,6 +100,23 @@ namespace
         TEXT("tick; steady driving needs 4.7-6.9 MiB and the worst 1/30 s is 12 MiB, so it rarely binds."),
         ECVF_RenderThreadSafe);
 
+    // Debug, for the per-draw palette choice (36f230b). Every map on disk holds copies of one capture
+    // whose palettes are byte-identical, so a draw reading the wrong slot looks right; flattening one
+    // slot's palette makes the asset in it change colour if and only if its own slot is what gets read.
+    TAutoConsoleVariable<int32> CVarDebugFlattenPaletteSlot(
+        TEXT("r.GaussianSplat.Debug.FlattenPaletteSlot"),
+        -1,
+        TEXT("Debug: the asset that takes this SH palette slot uploads a palette of the same length with every\n")
+        TEXT("float set to r.GaussianSplat.Debug.FlattenPaletteValue instead of its own. -1 (default) = off. Read\n")
+        TEXT("when an asset registers, so set it before the map loads; the asset's own palette is never changed."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<float> CVarDebugFlattenPaletteValue(
+        TEXT("r.GaussianSplat.Debug.FlattenPaletteValue"),
+        1.0f,
+        TEXT("The value every float of the flattened palette takes. See r.GaussianSplat.Debug.FlattenPaletteSlot."),
+        ECVF_RenderThreadSafe);
+
     // UE's texture-eviction line, r.Vulkan.EvictionLimitPercentage.
     constexpr double EvictionLimitFraction = 0.70;
 
@@ -660,6 +677,22 @@ void FGaussianSplatPagePool::BuildAssetBuffers(
     FGaussianSplatPagePool* Self = this;
     const int32 Slot = Residency.PaletteSlot;
     TArray<float> Palette = (Slot != INDEX_NONE) ? Asset.SHPalette : TArray<float>();
+    // Game thread, like every other read in this file. The >= 0 test is what keeps the default off: an SH0
+    // asset's slot is INDEX_NONE, which is -1 too. Palette is a copy, so the asset's own stays as it is.
+    const int32 FlattenSlot = CVarDebugFlattenPaletteSlot.GetValueOnAnyThread();
+    if (FlattenSlot >= 0 && Slot == FlattenSlot)
+    {
+        const float FlattenValue = CVarDebugFlattenPaletteValue.GetValueOnAnyThread();
+        Palette.Init(FlattenValue, Palette.Num());
+        UE_LOG(
+            LogGaussianSplatPool,
+            Display,
+            TEXT("DEBUG: %s's SH palette in slot %d is FLATTENED to %g (%d floats), not its own."),
+            *Asset.GetName(),
+            Slot,
+            FlattenValue,
+            Palette.Num());
+    }
     ENQUEUE_RENDER_COMMAND(GaussianSplatPoolAssetBuffers)(
         [Self, Slot, Palette = MoveTemp(Palette)](FRHICommandListImmediate& RHICmdList)
         {

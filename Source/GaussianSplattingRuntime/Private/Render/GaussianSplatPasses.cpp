@@ -578,6 +578,22 @@ namespace GaussianSplatProfiling
         return CVarMergeDistricts.GetValueOnRenderThread() != 0;
     }
 
+    // Debug: puts back the bug 36f230b fixed, for the same reason MergeDistricts 0 exists -- so the
+    // palette test has a BEFORE in the same binary. With r.GaussianSplat.Debug.FlattenPaletteSlot 1 on a
+    // two-palette map, the flattened asset must change colour with this off and must not with it on.
+    static TAutoConsoleVariable<int32> CVarDebugForceSinglePalette(
+        TEXT("r.GaussianSplat.Debug.ForceSinglePalette"),
+        0,
+        TEXT("Debug: 1 = a merged draw whose selected cells span two or more SH palettes still takes the ")
+        TEXT("single-palette permutation, bound to the lowest slot, so every batch reads that slot's palette ")
+        TEXT("(the behaviour before 36f230b; wrong colours for the others). 0 (default) = off."),
+        ECVF_RenderThreadSafe);
+
+    bool ShouldForceSinglePalette()
+    {
+        return CVarDebugForceSinglePalette.GetValueOnRenderThread() != 0;
+    }
+
     static TAutoConsoleVariable<int32> CVarMaxRenderPointsOverride(
         TEXT("r.GaussianSplat.MaxRenderPointsOverride"),
         0,
@@ -2560,7 +2576,22 @@ namespace GaussianSplatPasses
                 MergedPaletteMask |= 1u << BatchEntries[EntryIndex].PaletteSlot;
             }
         }
-        const bool bMergedMultiPalette = FMath::CountBits(MergedPaletteMask) > 1;
+        bool bMergedMultiPalette = FMath::CountBits(MergedPaletteMask) > 1;
+        if (bMergedMultiPalette && GaussianSplatProfiling::ShouldForceSinglePalette())
+        {
+            // Said once, and only when it really overrides a multi-palette draw, so the line's absence
+            // means the test never put two palettes in one draw.
+            static bool bLoggedForceSingleOnce = false;
+            if (!bLoggedForceSingleOnce)
+            {
+                bLoggedForceSingleOnce = true;
+                UE_LOG(LogGaussianSplatProfile, Display,
+                       TEXT("DEBUG: r.GaussianSplat.Debug.ForceSinglePalette is on: a merged draw spanning palette ")
+                       TEXT("mask 0x%02x reads slot %d's palette for every SH batch."),
+                       MergedPaletteMask, static_cast<int32>(FMath::CountTrailingZeros(MergedPaletteMask)));
+            }
+            bMergedMultiPalette = false;
+        }
         const int32 MergedOnlyPalette =
             MergedPaletteMask != 0u ? FMath::CountTrailingZeros(MergedPaletteMask) : INDEX_NONE;
 
