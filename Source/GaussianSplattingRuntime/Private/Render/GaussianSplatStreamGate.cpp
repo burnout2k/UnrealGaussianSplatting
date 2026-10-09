@@ -388,9 +388,40 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
 
             // Beyond this distance every cell is floor-only, so there is nothing to
             // visit: keep > R_c needs 4 (HalfFull/d)^2 > MinFraction (review M4).
-            const double FloorRadius = MinFraction > 0.0f
+            //
+            // That holds ONLY while MinFraction equals the baked floor. TakeAt clamps the
+            // fraction from BELOW at MinFraction, so once MinFraction is raised above the
+            // floor (r.GaussianSplat.Lod 0, which asks for 1.0, or LodMinFraction set past
+            // the floor) every cell at EVERY distance needs more splats than the asset
+            // pinned -- the radius is unbounded, not merely larger. Deriving it from the
+            // raised MinFraction instead SHRINKS the walk towards d_full while the demand
+            // beyond it grows, and the selection, which reads the same CVar, then asks for
+            // tail pages this gate never fetched. Measured 2026-10-09: 26.5M misses on one
+            // view, 61.5M across the rig, with the run reporting a healthy m 1.0000 -- and
+            // the picture was quietly used as a "full detail" reference for a day.
+            const bool bAboveBakedFloor = MinFraction > BakedFloor + UE_SMALL_NUMBER;
+            const double FloorRadius = (MinFraction > 0.0f && !bAboveBakedFloor)
                 ? HalfFull * 2.0 / FMath::Sqrt(static_cast<double>(MinFraction))
                 : TNumericLimits<double>::Max() * 0.5;
+            // This path makes the gate walk the whole asset every tick, and on a scene larger
+            // than the pool the overflow multiplier will thin it. Both are visible in the
+            // stats -- which is the point; the silence is what cost a day. The condition is a
+            // CVar, so it applies to every asset equally and once per session is enough.
+            static bool bWarnedAboveFloor = false;
+            if (bAboveBakedFloor && !bWarnedAboveFloor)
+            {
+                bWarnedAboveFloor = true;
+                UE_LOG(
+                    LogGaussianSplatStream,
+                    Warning,
+                    TEXT("%s: LOD floor %.3f is above the asset's baked floor %.3f, so every cell needs tail ")
+                    TEXT("pages at every distance and the gate must walk the whole asset. Frame time and the ")
+                    TEXT("overflow multiplier are NOT comparable with a run at the baked floor. For a true ")
+                    TEXT("full-detail reference use r.GaussianSplat.Stream 0 on a scene that fits the pool."),
+                    *Asset->GetName(),
+                    MinFraction,
+                    BakedFloor);
+            }
 
             // The current pose is REQUIRED; the look-ahead poses are WANTED. Both
             // are built from this tick's state only, so the required set is a
