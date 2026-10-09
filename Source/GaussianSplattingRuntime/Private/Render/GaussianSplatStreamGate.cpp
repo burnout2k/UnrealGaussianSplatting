@@ -57,6 +57,100 @@ namespace
         TEXT("1: one line per gate tick with the group set, the required and wanted page counts and the timings."),
         ECVF_RenderThreadSafe);
 
+    // Fix 7: the detail controller (fix7-controller-plan.md v3, fix7-prototype-brief.md). One
+    // multiplier on d_full, raised while four limits allow and lowered when one binds. OFF by
+    // default, and off means the multiplier is 1.0 and the controller does not run, so the gate
+    // and the views compute exactly what they did before it existed (G7d).
+    TAutoConsoleVariable<int32> CVarCtlEnable(
+        TEXT("r.GaussianSplat.Ctl.Enable"),
+        0,
+        TEXT("1: the gate raises d_full by Ctl.Step while every limit is clear and lowers it on the windowed drop\n")
+        TEXT("rules, between Ctl.Min and Ctl.Max. 0 (default): the multiplier is 1.0 and none of it runs."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<float> CVarCtlMin(
+        TEXT("r.GaussianSplat.Ctl.Min"),
+        1.0f,
+        TEXT("Lower clamp on the detail multiplier. 1.0 = never below shipped detail."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<float> CVarCtlMax(
+        TEXT("r.GaussianSplat.Ctl.Max"),
+        4.0f,
+        TEXT("Upper clamp on the detail multiplier."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<float> CVarCtlStep(
+        TEXT("r.GaussianSplat.Ctl.Step"),
+        1.25f,
+        TEXT("Multiplicative step, up or down. While Ctl.Enable is on it also stands in for Stream.ProbeStep, so\n")
+        TEXT("the profile line's `next` prices exactly the step the controller would take."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarCtlDwellTicks(
+        TEXT("r.GaussianSplat.Ctl.DwellTicks"),
+        30,
+        TEXT("Consecutive gate ticks with every limit clear before one step up."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarCtlLockoutTicks(
+        TEXT("r.GaussianSplat.Ctl.LockoutTicks"),
+        60,
+        TEXT("Gate ticks after a step down during which no step up is taken."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<float> CVarCtlCycleTargetMs(
+        TEXT("r.GaussianSplat.Ctl.CycleTargetMs"),
+        85.0f,
+        TEXT("Raise only while the window's longest cycle is under this, milliseconds."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<float> CVarCtlCycleBarMs(
+        TEXT("r.GaussianSplat.Ctl.CycleBarMs"),
+        100.0f,
+        TEXT("The cycle bar, milliseconds: a step down once Ctl.DropCount of the window's cycles exceed it."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarCtlDropCount(
+        TEXT("r.GaussianSplat.Ctl.DropCount"),
+        3,
+        TEXT("Cycles over Ctl.CycleBarMs in the window that make a step down. More than one, so that a single\n")
+        TEXT("hitch never does (review M6a)."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarCtlWindowTicks(
+        TEXT("r.GaussianSplat.Ctl.WindowTicks"),
+        30,
+        TEXT("Gate ticks the drop rules, the cycle maximum and the budget limb are judged over."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<float> CVarCtlDemandCeiling(
+        TEXT("r.GaussianSplat.Ctl.DemandCeiling"),
+        0.90f,
+        TEXT("Raise only while the pre-fit demand one step up (the profile line's `next`) over the capacity is\n")
+        TEXT("under this."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarCtlPinnedDropCount(
+        TEXT("r.GaussianSplat.Ctl.PinnedDropCount"),
+        3,
+        TEXT("Step down once the gate's overflow multiplier m was below 1 on this many ticks of the window."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarCtlMaxCells(
+        TEXT("r.GaussianSplat.Ctl.MaxCells"),
+        2000,
+        TEXT("Raise only while the gate visits fewer cells than this. The gate-CPU limb, in cells rather than\n")
+        TEXT("ms because cells are deterministic and are what the ms are made of (review M7)."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarCtlUseCycleTime(
+        TEXT("r.GaussianSplat.Ctl.UseCycleTime"),
+        1,
+        TEXT("1 (default): the cycle-time limb votes. 0: it is off. It is the only non-deterministic limb, so a\n")
+        TEXT("same-route bracket with the controller on needs it 0 to pair tick for tick."),
+        ECVF_RenderThreadSafe);
+
     // A cell the look-ahead wants some tail of. Per cell for the same reason the
     // required set is: expanding to pages inside the walk was the gate's largest
     // single cost.
@@ -166,11 +260,280 @@ namespace
     // (render thread). Relaxed is enough: it is a hint that bounds a bisection, and
     // a tick of staleness costs at most one frame of slightly conservative LOD.
     std::atomic<float> GOverflowMultiplier{1.0f};
+
+    // Fix 7: the detail controller's multiplier, carried exactly like the overflow one. The gate
+    // publishes it at the START of its tick, before the required set is built, so the gate leads:
+    // this tick's pages and the views that render after this tick use the same value. A frame the
+    // render thread is still drawing when the gate publishes may read the new value against the
+    // old pages and draw misses for a tick after a raise -- accepted for the prototype, visible on
+    // the profile line, and v3 §4's gate-stamped ramp is the refinement.
+    std::atomic<float> GDetailMultiplier{1.0f};
+
+    // Fix 7: the views' feedback to the controller, counted per selection since the gate last
+    // drained it. It mirrors LastVisibleCount -> OccMinVisible (GaussianSplatPasses.cpp): the views
+    // produce the value, a later frame consumes it, and the last value holds until a newer one
+    // arrives (FDetailControl::BoundViews). That channel is per-view render-thread state; this one
+    // crosses to the game thread, so it is atomics, relaxed like GOverflowMultiplier -- a report
+    // that races the drain lands one tick later, which a window of ticks does not notice.
+    std::atomic<int32> GViewReportSelections{0};
+    std::atomic<int32> GViewReportBudgetBound{0};
+    std::atomic<int32> GViewReportMissed{0};
+
+    // Fix 7: the controller's state. Game thread only -- RunGate is its one reader and writer.
+    struct FDetailControl
+    {
+        float Multiplier = 1.0f;       // k, as the next tick will publish it
+        int32 Dwell = 0;               // consecutive ticks with every limit clear
+        int32 Lockout = 0;             // ticks left during which no step up is taken
+
+        // The views' last report, HELD across ticks on which no view drew: the rig renders on one
+        // gate tick in three, and the two between must not read as "nothing bound, nothing missed".
+        int32 BoundViews = 0;
+        int32 MissedViews = 0;
+
+        double LastTickStart = 0.0;    // the previous gate tick's start; 0 = nothing to measure from
+
+        // One slot per gate tick over the last WindowTicks, sharing one head, zero-filled so a
+        // window that is not full yet reads as clear.
+        TArray<float> TickMs;
+        TArray<uint8> Pinned;
+        TArray<int32> Bound;
+        int32 Head = 0;
+
+        void ResetWindow(int32 Window)
+        {
+            TickMs.Init(0.0f, Window);
+            Pinned.Init(0, Window);
+            Bound.Init(0, Window);
+            Head = 0;
+        }
+    };
+    FDetailControl GDetailControl;
+
+    void GetDetailLimits(float& OutMin, float& OutMax)
+    {
+        OutMin = FMath::Max(0.01f, CVarCtlMin.GetValueOnAnyThread());
+        OutMax = FMath::Max(OutMin, CVarCtlMax.GetValueOnAnyThread());
+    }
+
+    // Every tick, controller on or off, so the counts never pile up while it is off and a later
+    // Enable starts from one tick's worth.
+    void DrainViewReports(FDetailControl& Ctl)
+    {
+        const int32 Selections = GViewReportSelections.exchange(0, std::memory_order_relaxed);
+        const int32 Bound = GViewReportBudgetBound.exchange(0, std::memory_order_relaxed);
+        const int32 Missed = GViewReportMissed.exchange(0, std::memory_order_relaxed);
+        if (Selections > 0 || Bound > 0 || Missed > 0)
+        {
+            Ctl.BoundViews = Bound;
+            Ctl.MissedViews = Missed;
+        }
+    }
+
+    struct FCycleWindow
+    {
+        float MaxMs = 0.0f;     // the window's longest tick-to-tick wall clock
+        int32 OverBar = 0;      // ticks in the window over Ctl.CycleBarMs
+    };
+
+    // Fix 7, the cycle limb -- the ONLY non-deterministic one (review M7). Wall clock differs between
+    // two runs of the same route, so it lives here alone and r.GaussianSplat.Ctl.UseCycleTime 0 skips
+    // this function and nothing else.
+    //
+    // The gate runs on the game thread inside the sync tick, so the wall clock between two of its
+    // ticks is the server's view of the cycle. The rig renders on one tick in three (~75 ms; the other
+    // two ~0.5 ms), so a cycle is the max of the last three deltas, and the window's longest cycle is
+    // simply its longest delta. The drop rule counts DELTAS over the bar, not max-of-threes: one slow
+    // tick sits in three consecutive max-of-threes, which would let a single hitch reach DropCount 3 on
+    // its own -- the one-hitch drop the windowed rule exists to prevent (M6a).
+    FCycleWindow UpdateCycleLimb(FDetailControl& Ctl, double TickStart, int32 Slot, float BarMs)
+    {
+        Ctl.TickMs[Slot] = Ctl.LastTickStart > 0.0
+            ? static_cast<float>((TickStart - Ctl.LastTickStart) * 1000.0)
+            : 0.0f;
+        Ctl.LastTickStart = TickStart;
+
+        FCycleWindow Cycle;
+        for (const float Ms : Ctl.TickMs)
+        {
+            Cycle.MaxMs = FMath::Max(Cycle.MaxMs, Ms);
+            Cycle.OverBar += Ms > BarMs ? 1 : 0;
+        }
+        return Cycle;
+    }
+
+    // Fix 7: the law, once per gate tick, after the fit and with this tick's stats filled. Where
+    // each limit's number comes from: pre-fit demand one step up over capacity (DemandNextPages /
+    // CapacityPages, 4d9d3ad); the gate's walk (CellsVisited); the views' own budget
+    // (ReportViewSelection); the cycle (UpdateCycleLimb). The first three are functions of the
+    // pose history and reproduce on a same-route bracket; the cycle does not.
+    void RunDetailControl(FGaussianSplatGateStats& Stats, double TickStart, float Published)
+    {
+        FDetailControl& Ctl = GDetailControl;
+        const int32 Window = FMath::Clamp(CVarCtlWindowTicks.GetValueOnAnyThread(), 1, 3600);
+        if (Ctl.Pinned.Num() != Window)
+        {
+            Ctl.ResetWindow(Window);
+        }
+        DrainViewReports(Ctl);
+
+        const int32 Slot = Ctl.Head;
+        Ctl.Head = (Ctl.Head + 1) % Window;
+        Ctl.Pinned[Slot] = Stats.OverflowMultiplier < 1.0f ? 1 : 0;
+        Ctl.Bound[Slot] = Ctl.BoundViews;
+
+        const float BarMs = CVarCtlCycleBarMs.GetValueOnAnyThread();
+        const bool bUseCycle = CVarCtlUseCycleTime.GetValueOnAnyThread() != 0;
+        FCycleWindow Cycle;
+        if (bUseCycle)
+        {
+            Cycle = UpdateCycleLimb(Ctl, TickStart, Slot, BarMs);
+        }
+        else
+        {
+            // Off means off: nothing measured, and nothing stale left for when it comes back on.
+            Ctl.TickMs.Init(0.0f, Window);
+            Ctl.LastTickStart = 0.0;
+        }
+
+        int32 PinnedTicks = 0;
+        int32 BoundTicks = 0;
+        for (int32 Index = 0; Index < Window; ++Index)
+        {
+            PinnedTicks += Ctl.Pinned[Index];
+            BoundTicks += Ctl.Bound[Index] > 0 ? 1 : 0;
+        }
+
+        float MinK = 1.0f;
+        float MaxK = 1.0f;
+        GetDetailLimits(MinK, MaxK);
+        const float Step = FMath::Max(1.0f, CVarCtlStep.GetValueOnAnyThread());
+        const int32 DwellTicks = FMath::Max(0, CVarCtlDwellTicks.GetValueOnAnyThread());
+        const float TargetMs = CVarCtlCycleTargetMs.GetValueOnAnyThread();
+        const float Ceiling = CVarCtlDemandCeiling.GetValueOnAnyThread();
+        const int32 MaxCells = CVarCtlMaxCells.GetValueOnAnyThread();
+        const int32 DropCount = FMath::Max(1, CVarCtlDropCount.GetValueOnAnyThread());
+        const int32 PinnedDropCount = FMath::Max(1, CVarCtlPinnedDropCount.GetValueOnAnyThread());
+
+        // `next` is a LOWER bound on one step up's demand -- cells beyond this tick's walk are not in
+        // it -- and ProbeStep is Ctl.Step while the controller is on, so it prices that step.
+        const double DemandRatio = Stats.CapacityPages > 0
+            ? static_cast<double>(Stats.DemandNextPages) / static_cast<double>(Stats.CapacityPages)
+            : TNumericLimits<double>::Max();
+        const bool bCycleClear = !bUseCycle || Cycle.MaxMs < TargetMs;
+        const bool bDemandClear = DemandRatio < static_cast<double>(Ceiling);
+        const bool bCellsClear = Stats.CellsVisited < MaxCells;
+        const bool bBudgetClear = BoundTicks == 0;
+        const bool bClear = bCycleClear && bDemandClear && bCellsClear && bBudgetClear;
+
+        const bool bCycleDrop = bUseCycle && Cycle.OverBar >= DropCount;
+        const bool bPinnedDrop = PinnedTicks >= PinnedDropCount;
+
+        // Never step while a fill is in progress (a view missed, on the last frame any view drew), and
+        // never while no view draws: with nothing drawn every limit reads clear, and dwelling blind
+        // would walk k to Max before the first camera frame. Waiting neither counts nor resets dwell.
+        const bool bWait = Ctl.MissedViews > 0 || Stats.Views == 0;
+        const bool bLocked = Ctl.Lockout > 0;
+        const float Before = Ctl.Multiplier;
+        bool bDropRuleFired = false;
+        uint8 State = bLocked ? 5 : 1;
+
+        if (bWait)
+        {
+            // Hold. The windows above still advanced, so the evidence keeps accumulating.
+        }
+        else if (bCycleDrop || bPinnedDrop)
+        {
+            bDropRuleFired = true;
+            Ctl.Multiplier = FMath::Max(MinK, Before / Step);
+            Ctl.Dwell = 0;
+            Ctl.Lockout = FMath::Max(0, CVarCtlLockoutTicks.GetValueOnAnyThread());
+            // The window's evidence is spent on this step. Left in place it would fire again next
+            // tick, and the same three slow cycles would walk k all the way down to Min.
+            Ctl.ResetWindow(Window);
+            if (Ctl.Multiplier < Before)
+            {
+                State = 4;
+                FString Reason;
+                if (bCycleDrop)
+                {
+                    Reason = FString::Printf(TEXT("cycle over %.1f ms on %d of %d ticks (max %.1f ms)"),
+                        BarMs, Cycle.OverBar, Window, Cycle.MaxMs);
+                }
+                if (bPinnedDrop)
+                {
+                    Reason += FString::Printf(TEXT("%sgate m < 1 on %d of %d ticks"),
+                        Reason.IsEmpty() ? TEXT("") : TEXT(", "), PinnedTicks, Window);
+                }
+                UE_LOG(
+                    LogGaussianSplatStream,
+                    Display,
+                    TEXT("detail control: k %.3f -> %.3f DOWN, bound: %s; no step up for %d ticks"),
+                    Before, Ctl.Multiplier, *Reason, Ctl.Lockout);
+            }
+            else
+            {
+                // Already at Min: nothing to step, but the lockout still holds off a raise.
+                State = Ctl.Lockout > 0 ? 5 : 1;
+            }
+        }
+        else
+        {
+            Ctl.Dwell = bClear ? FMath::Min(Ctl.Dwell + 1, DwellTicks) : 0;
+            if (!bLocked && bClear && Ctl.Dwell >= DwellTicks && Before < MaxK)
+            {
+                Ctl.Multiplier = FMath::Min(MaxK, Before * Step);
+                Ctl.Dwell = 0;
+                State = 3;
+                const FString CycleText = bUseCycle
+                    ? FString::Printf(TEXT("cycle max %.1f < %.1f ms"), Cycle.MaxMs, TargetMs)
+                    : FString(TEXT("cycle limb off"));
+                UE_LOG(
+                    LogGaussianSplatStream,
+                    Display,
+                    TEXT("detail control: k %.3f -> %.3f UP, every limit clear for %d ticks: %s, next/cap %.3f < %.2f, ")
+                    TEXT("cells %d < %d, no budget-bound view in %d ticks"),
+                    Before, Ctl.Multiplier, DwellTicks, *CycleText, DemandRatio, Ceiling,
+                    Stats.CellsVisited, MaxCells, Window);
+            }
+            else if (!bLocked)
+            {
+                State = (bClear && Before < MaxK) ? 2 : 1;
+            }
+        }
+        if (!bDropRuleFired && Ctl.Lockout > 0)
+        {
+            --Ctl.Lockout;
+        }
+
+        Stats.CtlMultiplier = Published;
+        Stats.CtlCycleMs = Cycle.MaxMs;
+        Stats.CtlState = State;
+        Stats.CtlBudgetBoundViews = Ctl.BoundViews;
+    }
 }
 
 float FGaussianSplatStreamGate::GetOverflowMultiplier()
 {
     return GOverflowMultiplier.load(std::memory_order_relaxed);
+}
+
+float FGaussianSplatStreamGate::GetDetailMultiplier()
+{
+    return GDetailMultiplier.load(std::memory_order_relaxed);
+}
+
+void FGaussianSplatStreamGate::ReportViewSelection(bool bBudgetBound, bool bMissed)
+{
+    if (bBudgetBound)
+    {
+        GViewReportBudgetBound.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (bMissed)
+    {
+        GViewReportMissed.fetch_add(1, std::memory_order_relaxed);
+    }
+    GViewReportSelections.fetch_add(1, std::memory_order_relaxed);
 }
 
 FGaussianSplatStreamGate& FGaussianSplatStreamGate::Get()
@@ -231,6 +594,9 @@ void FGaussianSplatStreamGate::UnregisterWorld(UWorld* World)
         (*Found)->UnRegisterTickFunction();
         GTickFunctions.Remove(World);
     }
+
+    // Fix 7: a new map starts the detail controller from shipped, and a load is not a cycle.
+    GDetailControl = FDetailControl();
 
     FScopeLock Lock(&StampLock);
     StampedViews.Reset();
@@ -311,6 +677,7 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     {
         // Streaming off: no clamp, or a stale one would quietly thin every view.
         GOverflowMultiplier.store(1.0f, std::memory_order_relaxed);
+        GDetailMultiplier.store(1.0f, std::memory_order_relaxed);
         return;
     }
 
@@ -322,6 +689,22 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
 
     const double StartTime = FPlatformTime::Seconds();
     ++TickNumber;
+
+    // Fix 7: publish the detail multiplier FIRST, before the required set is built (see
+    // GDetailMultiplier for the ordering). With Ctl.Enable 0 it is 1.0, and HalfFull x 1.0 is
+    // exact in IEEE arithmetic, so every walk radius, take and page count below is bit-identical
+    // to the gate without the controller.
+    const bool bDetailControl = CVarCtlEnable.GetValueOnAnyThread() != 0;
+    float DetailMultiplier = 1.0f;
+    if (bDetailControl)
+    {
+        float MinK = 1.0f;
+        float MaxK = 1.0f;
+        GetDetailLimits(MinK, MaxK);
+        GDetailControl.Multiplier = FMath::Clamp(GDetailControl.Multiplier, MinK, MaxK);
+        DetailMultiplier = GDetailControl.Multiplier;
+    }
+    GDetailMultiplier.store(DetailMultiplier, std::memory_order_relaxed);
 
     FGaussianSplatGateStats Stats;
     TArray<FGaussianSplatGateGroup> Groups;
@@ -393,8 +776,12 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
 
         for (const FGaussianSplatGateGroup& Group : Groups)
         {
+            // Fix 7: times the detail multiplier, AFTER ComputeHalfFull's floor and per-actor cap --
+            // the same point the views apply it (SelectCellsScreen), and the side of the cap the
+            // overflow multiplier sits on. The walk radius, the required and wanted takes and
+            // PagesAt all derive from this one value, so scaling it here covers the whole gate.
             const double HalfFull = GaussianSplatLod::ComputeHalfFull(
-                Group.MaxFocalPx, PointSize, Asset->SizeRef, ActorScale, MaxFullDistanceM);
+                Group.MaxFocalPx, PointSize, Asset->SizeRef, ActorScale, MaxFullDistanceM) * DetailMultiplier;
 
             // Beyond this distance every cell is floor-only, so there is nothing to
             // visit: keep > R_c needs 4 (HalfFull/d)^2 > MinFraction (review M4).
@@ -663,7 +1050,10 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     Stats.DemandPages = static_cast<int32>(FMath::Min<int64>(Demand, MAX_int32));
     Stats.CapacityPages = static_cast<int32>(FMath::Min<int64>(Capacity, MAX_int32));
     {
-        const float ProbeStep = FMath::Max(1.0f, CVarProbeStep.GetValueOnAnyThread());
+        // Fix 7: with the controller on, the probe IS its step, so `next` prices exactly the
+        // candidate it would take. Off, this is the CVar as before.
+        const float ProbeStep = FMath::Max(
+            1.0f, bDetailControl ? CVarCtlStep.GetValueOnAnyThread() : CVarProbeStep.GetValueOnAnyThread());
         Stats.ProbeStep = ProbeStep;
         Stats.DemandNextPages = ProbeStep > 1.0f
             ? static_cast<int32>(FMath::Min<int64>(PagesAtMultiplier(ProbeStep), MAX_int32))
@@ -890,6 +1280,18 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     {
         Stats.RequiredHash = CityHash64WithSeed(
             reinterpret_cast<const char*>(&Page.GlobalPage), sizeof(Page.GlobalPage), Stats.RequiredHash);
+    }
+
+    // Fix 7: the controller, after the fit and with every stat above filled. Off, it only drains
+    // the views' reports and forgets its state, so a later Enable starts from shipped.
+    if (bDetailControl)
+    {
+        RunDetailControl(Stats, StartTime, DetailMultiplier);
+    }
+    else
+    {
+        GDetailControl = FDetailControl();
+        DrainViewReports(GDetailControl);
     }
 
     LastStats = Stats;

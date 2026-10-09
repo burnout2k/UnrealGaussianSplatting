@@ -99,6 +99,16 @@ struct FGaussianSplatGateStats
     int32 CapacityPages = 0;
     int32 DemandNextPages = 0;
     float ProbeStep = 1.0f;
+    // Fix 7: the detail controller (r.GaussianSplat.Ctl.*). CtlMultiplier is k, the d_full
+    // multiple THIS tick's required set was built with (1.0 = shipped); a step taken this tick
+    // applies from the next one, which is why state 3/4 print the k before the step. CtlCycleMs
+    // is the window's largest tick-to-tick wall clock (0 with Ctl.UseCycleTime 0). CtlState:
+    // 0 off, 1 hold, 2 dwell, 3 raised this tick, 4 dropped this tick, 5 lockout.
+    // CtlBudgetBoundViews: views whose OWN budget bisection bound, on the last frame any drew.
+    float CtlMultiplier = 1.0f;
+    float CtlCycleMs = 0.0f;
+    uint8 CtlState = 0;
+    int32 CtlBudgetBoundViews = 0;
     double GateMs = 0.0;
 
     // Hash of the required set (asset, cell, page count) over every group. The
@@ -139,6 +149,17 @@ public:
     // and the views then select at 1.0 and ask for the pages it deliberately did
     // not upload -- which is what 1.9M misses at a 600 MiB cap turned out to be.
     static float GetOverflowMultiplier();
+
+    // Fix 7: the detail controller's actuator, a second multiplier on d_full beside the
+    // overflow one and carried the same way -- solved by the gate on the game thread, read by
+    // the selection on the render thread. It scales HalfFull wherever HalfFull is formed, in
+    // the gate and in the views, so the two cannot drift. 1.0 unless r.GaussianSplat.Ctl.Enable.
+    static float GetDetailMultiplier();
+
+    // Fix 7: the views' half of the controller's feedback, once per selection the gate serves
+    // (render thread). Whether the view's OWN budget bisection bound -- before the gate's
+    // clamp, which the controller already sees as m -- and whether it drew a miss.
+    static void ReportViewSelection(bool bBudgetBound, bool bMissed);
 
 private:
     // The stamps, written on the render thread and drained on the game thread.

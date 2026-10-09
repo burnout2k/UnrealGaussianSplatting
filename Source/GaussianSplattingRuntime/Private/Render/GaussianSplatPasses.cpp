@@ -231,6 +231,9 @@ namespace GaussianSplatProfiling
             //               eviction; invisible in the picture and in the frame time (M5)
             //   req#        the required-set hash: the same pose reached forwards and
             //               backwards must print the same number (m7)
+            //   ctl         Fix 7's detail controller: k, the window's longest cycle, the
+            //               budget-bound views and its state (0 off ... 5 lockout). The
+            //               owner's parser reads this exact format.
             FString StreamText;
             if (bPaged && FGaussianSplatPagePool::IsStreamingEnabled())
             {
@@ -238,7 +241,8 @@ namespace GaussianSplatProfiling
                 const FGaussianSplatGateStats& Gate = FGaussianSplatStreamGate::Get().GetLastStats();
                 StreamText = FString::Printf(
                     TEXT(" | stream req %d want %d resident %d | up %d (%.1f MiB) evict %d short %d thrash %d")
-                    TEXT(" | gate %.3f ms upload %.3f ms | m %.4f | cells %d | demand %d cap %d next %d @x%.1f | req# %llx"),
+                    TEXT(" | gate %.3f ms upload %.3f ms | m %.4f | cells %d | demand %d cap %d next %d @x%.1f")
+                    TEXT(" | ctl k %.3f cycle %.1f ms bound %d state %d | req# %llx"),
                     Gate.RequiredPages,
                     Gate.WantedPages,
                     Gate.ResidentPages,
@@ -255,6 +259,10 @@ namespace GaussianSplatProfiling
                     Gate.CapacityPages,
                     Gate.DemandNextPages,
                     Gate.ProbeStep,
+                    Gate.CtlMultiplier,
+                    Gate.CtlCycleMs,
+                    Gate.CtlBudgetBoundViews,
+                    static_cast<int32>(Gate.CtlState),
                     Gate.RequiredHash);
             }
             UE_LOG(
@@ -1861,6 +1869,23 @@ namespace GaussianSplatLod
         };
         TArray<FCandidate> Candidates;
 
+        // Whether the settle gate serves this selection: decided once, here, because Fix 7's
+        // detail multiplier scales d_full BEFORE the bisection and the overflow clamp bounds it
+        // AFTER, and the two must hold under the same condition or they drift apart.
+        bool bAnyPaged = false;
+        for (const FScreenLodGroup& Group : Groups)
+        {
+            bAnyPaged = bAnyPaged || Group.PagedAsset != nullptr;
+        }
+        const bool bGateServed = bAnyPaged && FGaussianSplatPagePool::IsStreamingEnabled();
+
+        // Fix 7: the detail controller's multiplier, read ONCE so every group of this view sees one
+        // value. 1.0 unless r.GaussianSplat.Ctl.Enable, and x 1.0 is exact, so with the controller
+        // off every d_full here is bit-identical to the selection without it.
+        const double DetailMultiplier = bGateServed
+            ? static_cast<double>(FGaussianSplatStreamGate::GetDetailMultiplier())
+            : 1.0;
+
         for (int32 GroupIndex = 0; GroupIndex < Groups.Num(); ++GroupIndex)
         {
         FScreenLodGroup& Group = Groups[GroupIndex];
@@ -1877,8 +1902,9 @@ namespace GaussianSplatLod
         // F' = d_full / 2 at m = 1. The debug value goes through the same float Max and widening as mode 0's
         // FullDistance, so the two modes compare identical doubles.
         // Shared with the settle gate (GaussianSplatLod), so the two cannot drift.
+        // Fix 7: times the detail multiplier after ComputeHalfFull, exactly where the gate applies it.
         Group.HalfFull = GaussianSplatLod::ComputeHalfFull(
-            In.FocalPx, Group.PointSize, Group.SizeRef, Group.ActorScale, Group.MaxFullDistanceM);
+            In.FocalPx, Group.PointSize, Group.SizeRef, Group.ActorScale, Group.MaxFullDistanceM) * DetailMultiplier;
 
         Candidates.Reserve(Candidates.Num() + Cells.Num());
         for (int32 CellIndex = 0; CellIndex < Cells.Num(); ++CellIndex)
@@ -1963,6 +1989,11 @@ namespace GaussianSplatLod
             }
         }
 
+        // Fix 7's budget limb: whether this view's OWN bisection bound. Read here, before the
+        // gate's clamp below -- Stats.Multiplier is the clamped value, and a pinned gate already
+        // reaches the controller as its m.
+        const bool bBudgetBound = Multiplier < 1.0;
+
         // D4's overflow rule, second half: the gate's multiplier is the UPPER BOUND
         // of this view's. When the pool cannot hold what the current poses want, the
         // gate trims the required set and uploads exactly that; a view selecting
@@ -1970,12 +2001,7 @@ namespace GaussianSplatLod
         // and draw them as misses (measured: 1.9M at a 600 MiB cap). TakeAt is
         // monotone in the full distance, so clamping after the bisection still fits
         // the budget.
-        bool bAnyPaged = false;
-        for (const FScreenLodGroup& Group : Groups)
-        {
-            bAnyPaged = bAnyPaged || Group.PagedAsset != nullptr;
-        }
-        if (bAnyPaged && FGaussianSplatPagePool::IsStreamingEnabled())
+        if (bGateServed)
         {
             Multiplier = FMath::Min(Multiplier, static_cast<double>(FGaussianSplatStreamGate::GetOverflowMultiplier()));
         }
@@ -2066,6 +2092,19 @@ namespace GaussianSplatLod
         Stats.Multiplier = Multiplier;
         Stats.FocalPx = In.FocalPx;
         Stats.FullDistance = 2.0 * (Groups.Num() > 0 ? Groups[0].HalfFull : 0.0) * Multiplier;
+
+        // Fix 7: the controller's feedback, from exactly the views the gate serves -- the set
+        // StampView stamps (paged, streaming, not whole cells). A whole-cell view never
+        // bisects and misses by design, and would hold the controller forever.
+        if (bGateServed && !In.bFullCells)
+        {
+            bool bMissed = false;
+            for (const FScreenLodGroup& Group : Groups)
+            {
+                bMissed = bMissed || Group.Missed > 0;
+            }
+            FGaussianSplatStreamGate::ReportViewSelection(bBudgetBound, bMissed);
+        }
 
         // Debug logging. Render thread only, like the rest of this file's static state.
         static int32 LogNextValue = 0;
