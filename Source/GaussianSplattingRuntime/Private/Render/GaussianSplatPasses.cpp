@@ -2144,6 +2144,8 @@ static bool HasGaussianSplatShaders()
         && ShaderMap->HasShader(&FGaussianSplatPointsRasterVS::GetStaticType(), 0)
         && ShaderMap->HasShader(&FGaussianSplatPointsRasterPS::GetStaticType(), 0)
         && ShaderMap->HasShader(&FGaussianSplatBillboardsRasterVS::GetStaticType(), 0)
+        // The multi-palette permutation is picked per draw now, so it has to exist too.
+        && ShaderMap->HasShader(&FGaussianSplatBillboardsRasterVS::GetStaticType(), 1)
         && ShaderMap->HasShader(&FGaussianSplatBillboardsRasterPS::GetStaticType(), 0)
         && ShaderMap->HasShader(&FGaussianSplatCompositePS::GetStaticType(), 0);
     static bool bLoggedMissing = false;
@@ -2330,13 +2332,19 @@ namespace GaussianSplatPasses
         TShaderMapRef<FGaussianSplatBillboardsCullCS> BillboardsCullCS(GetGlobalShaderMap(GMaxRHIFeatureLevel), CullWithoutBox);
         TShaderMapRef<FGaussianSplatPointsRasterVS> PointsRasterVS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
         TShaderMapRef<FGaussianSplatPointsRasterPS> PointsRasterPS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-        // One batch per draw until the single sort lands, so the cheap permutation is
-        // always the right one here. Landing 3 chooses it per draw, from whether the
-        // draw's batches actually use more than one palette.
-        FGaussianSplatBillboardsRasterVS::FPermutationDomain RasterPermutation;
-        RasterPermutation.Set<FGaussianSplatBillboardsRasterVS::FMultiPalette>(false);
+        // BOTH permutations, picked per draw below. This used to be hardcoded false under a
+        // comment claiming landing 3 chose it; landing 3 never did, so every SH3 batch in a
+        // merged draw read slot 0's palette whatever its own slot said -- harmless only while
+        // every map held copies of ONE capture. The switch is not free (3.52 ms on a degree-3
+        // capture when it compiles), so the cheap permutation stays the default and the
+        // expensive one is used only when a view's SELECTED cells really span two palettes.
+        FGaussianSplatBillboardsRasterVS::FPermutationDomain SinglePalettePerm, MultiPalettePerm;
+        SinglePalettePerm.Set<FGaussianSplatBillboardsRasterVS::FMultiPalette>(false);
+        MultiPalettePerm.Set<FGaussianSplatBillboardsRasterVS::FMultiPalette>(true);
         TShaderMapRef<FGaussianSplatBillboardsRasterVS> BillboardsRasterVS(
-            GetGlobalShaderMap(GMaxRHIFeatureLevel), RasterPermutation);
+            GetGlobalShaderMap(GMaxRHIFeatureLevel), SinglePalettePerm);
+        TShaderMapRef<FGaussianSplatBillboardsRasterVS> BillboardsRasterVSMulti(
+            GetGlobalShaderMap(GMaxRHIFeatureLevel), MultiPalettePerm);
         TShaderMapRef<FGaussianSplatBillboardsRasterPS> BillboardsRasterPS(GetGlobalShaderMap(GMaxRHIFeatureLevel));
         bool bFirstBatch = true;
 
@@ -2363,9 +2371,18 @@ namespace GaussianSplatPasses
             if (bEntryPaged)
             {
                 Out.ColorEncoding = EntryPaged->ColorEncoding;
-                Out.HasSH = EntryPaged->HasSH() ? 1u : 0u;
-                // An SH0 asset has no slot; HasSH stops the read before the slot matters.
-                Out.PaletteSlot = static_cast<uint32>(FMath::Max(0, Entry.PagedResidency->PaletteSlot));
+                // HasSH needs a REAL slot, not just SH in the asset. A ninth SH3 asset is refused
+                // a slot (GaussianSplatPagePool.cpp: "SH PALETTE SLOTS FULL ... will draw WITHOUT
+                // them") but still answers HasSH() true, and Max(0, INDEX_NONE) used to send it to
+                // slot 0 -- reading another capture's palette with its own entry indices, past the
+                // end whenever its palette is the larger. Gate on the slot and the refusal keeps
+                // the promise its warning makes.
+                const bool bEntryHasSH =
+                    EntryPaged->HasSH() && Entry.PagedResidency->PaletteSlot != INDEX_NONE;
+                Out.HasSH = bEntryHasSH ? 1u : 0u;
+                Out.PaletteSlot = bEntryHasSH
+                    ? static_cast<uint32>(Entry.PagedResidency->PaletteSlot)
+                    : 0u;
             }
             else if (Entry.Resources != nullptr)
             {
@@ -2523,6 +2540,25 @@ namespace GaussianSplatPasses
                 MergedMisses += Group.Missed;
             }
         }
+
+        // Which SH palettes this view's merged draw really reads. Ranges[].W is the batch id and
+        // BatchEntries is indexed by it, so the selected cells name their own batches -- a few
+        // thousand entries at most. One palette (or none) keeps the cheap permutation; two or more
+        // need the switch, and then slot 0 must NOT be overridden because every slot is read.
+        uint32 MergedPaletteMask = 0;
+        for (uint32 RangeIndex = 0; RangeIndex < MergedSelection.CellCount; ++RangeIndex)
+        {
+            const uint32 EntryIndex = MergedSelection.Ranges[RangeIndex].W;
+            if (BatchEntries.IsValidIndex(static_cast<int32>(EntryIndex))
+                && BatchEntries[EntryIndex].HasSH != 0u
+                && BatchEntries[EntryIndex].PaletteSlot < FGaussianSplatPagePool::MaxSHPalettes)
+            {
+                MergedPaletteMask |= 1u << BatchEntries[EntryIndex].PaletteSlot;
+            }
+        }
+        const bool bMergedMultiPalette = FMath::CountBits(MergedPaletteMask) > 1;
+        const int32 MergedOnlyPalette =
+            MergedPaletteMask != 0u ? FMath::CountTrailingZeros(MergedPaletteMask) : INDEX_NONE;
 
         for (int32 BatchIndex = 0; BatchIndex < Batches.Num(); ++BatchIndex)
         {
@@ -3336,9 +3372,20 @@ namespace GaussianSplatPasses
                     // no single "own" palette, and picking the right one per batch needs the multi-palette
                     // permutation that :2337 still hardcodes off. That remains wrong for two DIFFERENT SH3
                     // captures in one view, and is the open bug -- this line does not pretend to fix it.
-                    if (!bMerged && SrcSHPalette != nullptr)
+                    const bool bDrawMultiPalette = bMerged && bMergedMultiPalette;
+                    if (!bDrawMultiPalette)
                     {
-                        Palettes[0] = SrcSHPalette;
+                        // The cheap permutation reads slot 0 only, so slot 0 must be the ONE palette
+                        // this draw reads: its own batch's when unmerged, and when merged the single
+                        // slot its selected cells named. Left alone when the switch is compiled,
+                        // because then every slot is addressed by Batch.PaletteSlot.
+                        FRHIShaderResourceView* const DrawPalette0 = bMerged
+                            ? FGaussianSplatPagePool::Get().GetSHPaletteSRV(MergedOnlyPalette)
+                            : SrcSHPalette;
+                        if (DrawPalette0 != nullptr)
+                        {
+                            Palettes[0] = DrawPalette0;
+                        }
                     }
                     for (int32 Slot = 0; Slot < FGaussianSplatPagePool::MaxSHPalettes; ++Slot)
                     {
@@ -3370,7 +3417,8 @@ namespace GaussianSplatPasses
                             : RDG_EVENT_NAME("GaussianSplatBillboardsRaster.DrawInstanced (occ phase %d)", Phase),
                         PassParameters,
                         ERDGPassFlags::Raster,
-                        [PassParameters, BillboardsRasterVS, BillboardsRasterPS, ViewRect, DrawArgs, DrawArgsOffset](FRHICommandList& RHICmdList)
+                        [PassParameters, DrawVS = bDrawMultiPalette ? BillboardsRasterVSMulti : BillboardsRasterVS,
+                         BillboardsRasterPS, ViewRect, DrawArgs, DrawArgsOffset](FRHICommandList& RHICmdList)
                         {
                             RHICmdList.SetViewport(
                                 static_cast<float>(ViewRect.Min.X),
@@ -3390,11 +3438,11 @@ namespace GaussianSplatPasses
                             GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
                             GraphicsPSOInit.PrimitiveType = PT_TriangleStrip;
                             GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
-                            GraphicsPSOInit.BoundShaderState.VertexShaderRHI = BillboardsRasterVS.GetVertexShader();
+                            GraphicsPSOInit.BoundShaderState.VertexShaderRHI = DrawVS.GetVertexShader();
                             GraphicsPSOInit.BoundShaderState.PixelShaderRHI = BillboardsRasterPS.GetPixelShader();
 
                             SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
-                            SetShaderParameters(RHICmdList, BillboardsRasterVS, BillboardsRasterVS.GetVertexShader(), PassParameters->VS);
+                            SetShaderParameters(RHICmdList, DrawVS, DrawVS.GetVertexShader(), PassParameters->VS);
                             SetShaderParameters(RHICmdList, BillboardsRasterPS, BillboardsRasterPS.GetPixelShader(), PassParameters->PS);
                             RHICmdList.DrawPrimitiveIndirect(DrawArgs->GetIndirectRHICallBuffer(), DrawArgsOffset);
                         });
