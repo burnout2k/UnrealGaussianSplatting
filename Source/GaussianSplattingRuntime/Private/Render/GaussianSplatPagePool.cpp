@@ -513,7 +513,7 @@ int32 FGaussianSplatPagePool::GetFreePageCount() const
 void FGaussianSplatPagePool::GetRegisteredAssets(TArray<const UGaussianSplatPagedAsset*>& Out) const
 {
     Out.Reset(Residencies.Num());
-    for (const TPair<const UGaussianSplatPagedAsset*, FGaussianSplatPoolResidency>& Pair : Residencies)
+    for (const TPair<const UGaussianSplatPagedAsset*, TUniquePtr<FGaussianSplatPoolResidency>>& Pair : Residencies)
     {
         Out.Add(Pair.Key);
     }
@@ -546,10 +546,10 @@ void FGaussianSplatPagePool::RebuildSharedCellBounds()
     // (Lublin's ~10K cells are 320 KB), so the simple version is the right one.
     TArray<FVector4f> Bounds;
     int32 NextBase = 0;
-    for (TPair<const UGaussianSplatPagedAsset*, FGaussianSplatPoolResidency>& Pair : Residencies)
+    for (TPair<const UGaussianSplatPagedAsset*, TUniquePtr<FGaussianSplatPoolResidency>>& Pair : Residencies)
     {
         const UGaussianSplatPagedAsset* Asset = Pair.Key;
-        Pair.Value.CellBoundsBase = NextBase;
+        Pair.Value->CellBoundsBase = NextBase;
         if (Asset == nullptr)
         {
             continue;
@@ -895,7 +895,8 @@ void FGaussianSplatPagePool::UploadPageBatch(
 
 const FGaussianSplatPoolResidency* FGaussianSplatPagePool::FindResidency(const UGaussianSplatPagedAsset* Asset) const
 {
-    return Residencies.Find(Asset);
+    const TUniquePtr<FGaussianSplatPoolResidency>* const Found = Residencies.Find(Asset);
+    return Found ? Found->Get() : nullptr;
 }
 
 const FGaussianSplatPoolResidency* FGaussianSplatPagePool::RegisterAsset(const UGaussianSplatPagedAsset* Asset)
@@ -904,9 +905,9 @@ const FGaussianSplatPoolResidency* FGaussianSplatPagePool::RegisterAsset(const U
     {
         return nullptr;
     }
-    if (const FGaussianSplatPoolResidency* Existing = Residencies.Find(Asset))
+    if (const TUniquePtr<FGaussianSplatPoolResidency>* const Existing = Residencies.Find(Asset))
     {
-        return Existing;
+        return Existing->Get();
     }
 
     EnsureAllocated();
@@ -986,7 +987,8 @@ const FGaussianSplatPoolResidency* FGaussianSplatPagePool::RegisterAsset(const U
         // cell bounds are what a 16-bit position decodes against and the palette
         // is what SH reads, so a streaming asset without them draws garbage with
         // no error. Returning early past it was a bug, found before it ever ran.
-        FGaussianSplatPoolResidency& StoredStreaming = Residencies.Add(Asset, MoveTemp(Residency));
+        FGaussianSplatPoolResidency& StoredStreaming =
+            *Residencies.Add(Asset, MakeUnique<FGaussianSplatPoolResidency>(MoveTemp(Residency)));
         BuildAssetBuffers(*Asset, StoredStreaming);
         return &StoredStreaming;
     }
@@ -1073,7 +1075,8 @@ const FGaussianSplatPoolResidency* FGaussianSplatPagePool::RegisterAsset(const U
             ToMiB(TotalSlots * BytesPerSlot));
     }
 
-    FGaussianSplatPoolResidency& Stored = Residencies.Add(Asset, MoveTemp(Residency));
+    FGaussianSplatPoolResidency& Stored =
+        *Residencies.Add(Asset, MakeUnique<FGaussianSplatPoolResidency>(MoveTemp(Residency)));
     BuildAssetBuffers(*Asset, Stored);
     return &Stored;
 }
@@ -1094,7 +1097,8 @@ void FGaussianSplatPagePool::ApplyStreamPlan(FGaussianSplatStreamPlan&& Plan, in
     // ---- Evictions first, so a tick that swaps pages needs no spare capacity.
     for (const FGaussianSplatStreamPage& Page : Plan.Evict)
     {
-        FGaussianSplatPoolResidency* Residency = Residencies.Find(Page.Asset);
+        const TUniquePtr<FGaussianSplatPoolResidency>* const ResidencySlot = Residencies.Find(Page.Asset);
+        FGaussianSplatPoolResidency* Residency = ResidencySlot ? ResidencySlot->Get() : nullptr;
         if (Residency == nullptr || !Residency->TailPageSlot.IsValidIndex(Page.GlobalPage))
         {
             continue;
@@ -1156,7 +1160,8 @@ void FGaussianSplatPagePool::ApplyStreamPlan(FGaussianSplatStreamPlan&& Plan, in
         const FGaussianSplatStreamPage& Page = Plan.Upload[Index];
         const bool bRequired = Index < Plan.RequiredUploads;
 
-        FGaussianSplatPoolResidency* Residency = Residencies.Find(Page.Asset);
+        const TUniquePtr<FGaussianSplatPoolResidency>* const ResidencySlot = Residencies.Find(Page.Asset);
+        FGaussianSplatPoolResidency* Residency = ResidencySlot ? ResidencySlot->Get() : nullptr;
         if (Residency == nullptr || !Residency->TailPageSlot.IsValidIndex(Page.GlobalPage)
             || Residency->TailPageSlot[Page.GlobalPage] != INDEX_NONE)
         {
@@ -1246,7 +1251,8 @@ void FGaussianSplatPagePool::ApplyStreamPlan(FGaussianSplatStreamPlan&& Plan, in
 
 void FGaussianSplatPagePool::UnregisterAsset(const UGaussianSplatPagedAsset* Asset)
 {
-    if (FGaussianSplatPoolResidency* Residency = Residencies.Find(Asset))
+    const TUniquePtr<FGaussianSplatPoolResidency>* const ResidencySlot = Residencies.Find(Asset);
+    if (FGaussianSplatPoolResidency* Residency = ResidencySlot ? ResidencySlot->Get() : nullptr)
     {
         FreePagesOf(*Residency);
         // The palette slot IS reclaimed, unlike the floor range below: slots are a

@@ -310,7 +310,12 @@ private:
     bool bSizingFailed = false;
     int32 FailedSettings = 0;
 
-    TMap<const UGaussianSplatPagedAsset*, FGaussianSplatPoolResidency> Residencies;
+    // Held BY POINTER so a residency's address never moves. RegisterAsset RETURNS a residency pointer and the
+    // render batches cache it (FGaussianSplatRenderBatch::PagedResidency), but a TMap reallocates its element
+    // storage on a later Add -- so registering asset N invalidated every pointer handed out for assets 1..N-1.
+    // Five districts survived it; sixteen tiles crashed in BuildPoolRuns off a dangling batch residency
+    // (2026-10-09). A TUniquePtr element keeps the map's own storage movable while the residency stays put.
+    TMap<const UGaussianSplatPagedAsset*, TUniquePtr<FGaussianSplatPoolResidency>> Residencies;
 
     FGaussianSplatStreamStats LastStreamStats;
 
