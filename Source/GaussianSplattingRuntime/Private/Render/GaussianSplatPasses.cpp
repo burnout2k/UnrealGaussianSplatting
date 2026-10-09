@@ -3388,9 +3388,9 @@ namespace GaussianSplatPasses
                     //
                     // The pool's accessor fills every slot and substitutes the one-float dummy for
                     // slots no asset owns, which is what the legacy path has always done
-                    // (GaussianSplatRenderResources.cpp:313-319). The cheap permutation still
-                    // reads slot 0, so a view with two DIFFERENT SH3 captures still reads the
-                    // wrong palette -- that is the separate FMultiPalette bug at :2337, not this.
+                    // (GaussianSplatRenderResources.cpp:313-319). Whether this draw takes the
+                    // cheap single-palette permutation or the multi-palette one is decided per
+                    // draw from the SELECTED cells (bMergedMultiPalette, 36f230b), not here.
                     FRHIShaderResourceView* Palettes[FGaussianSplatPagePool::MaxSHPalettes] = {};
                     if (bPaged)
                     {
@@ -3403,10 +3403,10 @@ namespace GaussianSplatPasses
                     // today holds copies of ONE capture whose palettes are byte-identical. The code this
                     // replaced bound SrcSHPalette everywhere and was right about this and wrong about null.
                     //
-                    // The MERGED draw keeps the pool's slot 0: its batches span several assets, so there is
-                    // no single "own" palette, and picking the right one per batch needs the multi-palette
-                    // permutation that :2337 still hardcodes off. That remains wrong for two DIFFERENT SH3
-                    // captures in one view, and is the open bug -- this line does not pretend to fix it.
+                    // The MERGED draw's batches span several assets, so there is no single "own" palette.
+                    // When the selected cells name more than one palette the multi-palette permutation is
+                    // taken and every batch reads its own slot (36f230b); when they name exactly one, the
+                    // cheap permutation is bound to THAT slot (c01364d), never blindly to slot 0.
                     const bool bDrawMultiPalette = bMerged && bMergedMultiPalette;
                     if (!bDrawMultiPalette)
                     {
