@@ -468,37 +468,47 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
             // times cost four times the grid lookups. The first measured run spent
             // 0.54-1.88 ms here against a 0.5 ms bar WITHOUT look-ahead running at
             // all; with velocity it would have been four times worse in CARLA.
+            // An unbounded reach means "every cell of this asset", which is a walk over the
+            // asset's own coordinate box -- NOT a probe box of unbounded half-width. Taking
+            // the probe path with Reach near DBL_MAX used to hit a `continue` here and walk
+            // NOTHING for the asset: req 0, floor-only, misses everywhere, while the log said
+            // the opposite. That is the whole-asset path the old comment asked for.
             const double Reach = FloorRadius + Group.Radius;
-            if (Reach >= TNumericLimits<double>::Max() * 0.25)
-            {
-                continue;   // a degenerate MinFraction; the whole-asset path would be the answer, not a walk
-            }
-            const double LocalReach = Reach / FMath::Max(ActorScale, UE_SMALL_NUMBER);
+            const bool bWholeAsset = bAboveBakedFloor || !(Reach < TNumericLimits<double>::Max() * 0.25);
 
             FIntVector Lo(MAX_int32, MAX_int32, MAX_int32);
             FIntVector Hi(MIN_int32, MIN_int32, MIN_int32);
-            for (const FProbe& Probe : Probes)
+            if (bWholeAsset)
             {
-                const FVector LocalCentre = WorldToLocal.TransformPosition(Probe.Centre);
-                const FIntVector BoxMin(
-                    FMath::FloorToInt((LocalCentre.X - LocalReach) / CellSize),
-                    FMath::FloorToInt((LocalCentre.Y - LocalReach) / CellSize),
-                    FMath::FloorToInt((LocalCentre.Z - LocalReach) / CellSize));
-                const FIntVector BoxMax(
-                    FMath::FloorToInt((LocalCentre.X + LocalReach) / CellSize),
-                    FMath::FloorToInt((LocalCentre.Y + LocalReach) / CellSize),
-                    FMath::FloorToInt((LocalCentre.Z + LocalReach) / CellSize));
-                Lo = FIntVector(FMath::Min(Lo.X, BoxMin.X), FMath::Min(Lo.Y, BoxMin.Y), FMath::Min(Lo.Z, BoxMin.Z));
-                Hi = FIntVector(FMath::Max(Hi.X, BoxMax.X), FMath::Max(Hi.Y, BoxMax.Y), FMath::Max(Hi.Z, BoxMax.Z));
+                Lo = Asset->GetCoordMin();
+                Hi = Asset->GetCoordMax();
             }
-            Lo = FIntVector(
-                FMath::Max(Lo.X, Asset->GetCoordMin().X),
-                FMath::Max(Lo.Y, Asset->GetCoordMin().Y),
-                FMath::Max(Lo.Z, Asset->GetCoordMin().Z));
-            Hi = FIntVector(
-                FMath::Min(Hi.X, Asset->GetCoordMax().X),
-                FMath::Min(Hi.Y, Asset->GetCoordMax().Y),
-                FMath::Min(Hi.Z, Asset->GetCoordMax().Z));
+            else
+            {
+                const double LocalReach = Reach / FMath::Max(ActorScale, UE_SMALL_NUMBER);
+                for (const FProbe& Probe : Probes)
+                {
+                    const FVector LocalCentre = WorldToLocal.TransformPosition(Probe.Centre);
+                    const FIntVector BoxMin(
+                        FMath::FloorToInt((LocalCentre.X - LocalReach) / CellSize),
+                        FMath::FloorToInt((LocalCentre.Y - LocalReach) / CellSize),
+                        FMath::FloorToInt((LocalCentre.Z - LocalReach) / CellSize));
+                    const FIntVector BoxMax(
+                        FMath::FloorToInt((LocalCentre.X + LocalReach) / CellSize),
+                        FMath::FloorToInt((LocalCentre.Y + LocalReach) / CellSize),
+                        FMath::FloorToInt((LocalCentre.Z + LocalReach) / CellSize));
+                    Lo = FIntVector(FMath::Min(Lo.X, BoxMin.X), FMath::Min(Lo.Y, BoxMin.Y), FMath::Min(Lo.Z, BoxMin.Z));
+                    Hi = FIntVector(FMath::Max(Hi.X, BoxMax.X), FMath::Max(Hi.Y, BoxMax.Y), FMath::Max(Hi.Z, BoxMax.Z));
+                }
+                Lo = FIntVector(
+                    FMath::Max(Lo.X, Asset->GetCoordMin().X),
+                    FMath::Max(Lo.Y, Asset->GetCoordMin().Y),
+                    FMath::Max(Lo.Z, Asset->GetCoordMin().Z));
+                Hi = FIntVector(
+                    FMath::Min(Hi.X, Asset->GetCoordMax().X),
+                    FMath::Min(Hi.Y, Asset->GetCoordMax().Y),
+                    FMath::Min(Hi.Z, Asset->GetCoordMax().Z));
+            }
 
             for (int32 X = Lo.X; X <= Hi.X; ++X)
             for (int32 Y = Lo.Y; Y <= Hi.Y; ++Y)
