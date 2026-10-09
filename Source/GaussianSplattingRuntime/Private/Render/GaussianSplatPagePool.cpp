@@ -571,6 +571,29 @@ void FGaussianSplatPagePool::RebuildSharedCellBounds()
         Bounds.Add(FVector4f(ForceInitToZero));
     }
 
+    // Diagnostic for the eight-asset GPU hang (2026-10-09): seven assets draw, eight hang, and sixteen
+    // IDENTICAL ones draw, which no count threshold explains. This table is the one structure that spans
+    // assets, so print what it actually contains -- per asset, and the total -- so a working run and a
+    // hanging one can be diffed line for line. Cheap and once per registration.
+    {
+        int32 Printed = 0;
+        for (const TPair<const UGaussianSplatPagedAsset*, TUniquePtr<FGaussianSplatPoolResidency>>& Pair : Residencies)
+        {
+            if (Pair.Key == nullptr || !Pair.Value.IsValid())
+            {
+                continue;
+            }
+            UE_LOG(LogGaussianSplatPool, Display,
+                   TEXT("CELLBOUNDS asset %2d %-24s cells %6d base %7d floorSlots %10lld tailPages %7d"),
+                   Printed, *Pair.Key->GetName(), Pair.Key->Cells.Num(), Pair.Value->CellBoundsBase,
+                   static_cast<long long>(Pair.Value->FloorSlots), Pair.Key->TailPages);
+            ++Printed;
+        }
+        UE_LOG(LogGaussianSplatPool, Display,
+               TEXT("CELLBOUNDS total %d assets, %d entries (%d bytes), NextBase %d"),
+               Printed, Bounds.Num(), Bounds.Num() * static_cast<int32>(sizeof(FVector4f)), NextBase);
+    }
+
     FGaussianSplatPagePool* Self = this;
     ENQUEUE_RENDER_COMMAND(GaussianSplatPoolCellBounds)(
         [Self, Bounds = MoveTemp(Bounds)](FRHICommandListImmediate& RHICmdList)
