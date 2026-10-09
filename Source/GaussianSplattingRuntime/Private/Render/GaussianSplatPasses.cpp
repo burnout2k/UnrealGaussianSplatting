@@ -3301,14 +3301,36 @@ namespace GaussianSplatPasses
                     RasterParameters->HasSH = bSrcHasSH ? 1u : 0u;
                     RasterParameters->MinScreenVariance = GaussianSplatProfiling::GetMinScreenVariance();
                     RasterParameters->SplatSHIndexBuffer = SrcSHIndex;
-                    // This draw covers one batch, so it needs one palette and the cheap
-                    // permutation reads slot 0 whatever the table says. Binding the pool's
-                    // eight slots here instead would be correct and would also compile the
-                    // switch, which measured 3.52 ms on a degree-3 capture.
+                    // NEVER BIND A NULL PALETTE. This used to copy the representative batch's
+                    // SRV into all eight slots, which was fine while a draw covered one batch.
+                    // The merged path broke that: the representative is MergedBatches[0], and an
+                    // SH0 asset has no palette slot, so GetSHPaletteSRV(INDEX_NONE) returned
+                    // nullptr and EVERY palette parameter of a draw containing SH3 batches was
+                    // null. In a Shipping bindless build a null SRV is simply never written into
+                    // the shader's packed globals (RHIShaderParametersShared.h), so the handle is
+                    // uninitialised heap and each SH3 splat dereferenced it 45 times -- an
+                    // undefined device read, which hung the GPU with Xid 109 (2026-10-09).
+                    //
+                    // It looked like an eight-asset threshold and was not: it depended on whether
+                    // the FIRST-registered component happened to be SH0, which is actor order.
+                    // 16 identical SH0 assets were immune because no batch ever read the handle.
+                    //
+                    // The pool's accessor fills every slot and substitutes the one-float dummy for
+                    // slots no asset owns, which is what the legacy path has always done
+                    // (GaussianSplatRenderResources.cpp:313-319). The cheap permutation still
+                    // reads slot 0, so a view with two DIFFERENT SH3 captures still reads the
+                    // wrong palette -- that is the separate FMultiPalette bug at :2337, not this.
                     FRHIShaderResourceView* Palettes[FGaussianSplatPagePool::MaxSHPalettes] = {};
+                    if (bPaged)
+                    {
+                        FGaussianSplatPagePool::Get().GetSHPaletteSRVs(Palettes);
+                    }
                     for (int32 Slot = 0; Slot < FGaussianSplatPagePool::MaxSHPalettes; ++Slot)
                     {
-                        Palettes[Slot] = SrcSHPalette;
+                        if (Palettes[Slot] == nullptr)
+                        {
+                            Palettes[Slot] = SrcSHPalette;      // the legacy path's own dummy
+                        }
                     }
                     RasterParameters->SplatSHPalette0 = Palettes[0];
                     RasterParameters->SplatSHPalette1 = Palettes[1];
