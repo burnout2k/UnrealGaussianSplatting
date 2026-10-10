@@ -199,7 +199,7 @@ namespace
 
     TAutoConsoleVariable<float> CVarCtlAheadDropRatio(
         TEXT("r.GaussianSplat.Ctl.AheadDropRatio"),
-        1.0f,
+        0.8f,
         TEXT("Step down early, before the gate pins, once the current k's demand around the furthest look-ahead\n")
         TEXT("pose (the profile line's `ahead` now) over the capacity reaches this. 1.0 = it would not fit the\n")
         TEXT("pool. Never inside a lockout. Logged as \"DOWN, ahead\"."),
