@@ -182,6 +182,29 @@ namespace
         TEXT("Gate ticks a drop record lives, so a long drive forgets. 0 = never."),
         ECVF_RenderThreadSafe);
 
+    // Fix 7 iteration 3 (fix7-lookahead-brief.md): price k where the ego is GOING. On the 1,097 MiB
+    // drive the controller climbed on open road and entered each dense spot at too high a k; the gate
+    // pinned and it dropped twice. Place memory never fired -- the route never revisits. The raise's
+    // only VRAM signal, `next`, is priced over the cells around the CURRENT pose, so a dense block a
+    // few seconds ahead read "fine" until the car was inside it. The gate already projects look-ahead
+    // probes for prefetch; the furthest of them is where the controller now looks too.
+    TAutoConsoleVariable<int32> CVarCtlLookAhead(
+        TEXT("r.GaussianSplat.Ctl.LookAhead"),
+        1,
+        TEXT("1 (default): the VRAM limb also prices k around the furthest look-ahead pose. A raise waits while\n")
+        TEXT("one step up would not fit there under Ctl.DemandCeiling, and a step down comes early once the\n")
+        TEXT("current k would not fit there (Ctl.AheadDropRatio). 0: iteration 2's limb, current pose only, for\n")
+        TEXT("A/B -- the profile line's `ahead` is still priced. Only acts while Ctl.Enable is on."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<float> CVarCtlAheadDropRatio(
+        TEXT("r.GaussianSplat.Ctl.AheadDropRatio"),
+        1.0f,
+        TEXT("Step down early, before the gate pins, once the current k's demand around the furthest look-ahead\n")
+        TEXT("pose (the profile line's `ahead` now) over the capacity reaches this. 1.0 = it would not fit the\n")
+        TEXT("pool. Never inside a lockout. Logged as \"DOWN, ahead\"."),
+        ECVF_RenderThreadSafe);
+
     // A cell the look-ahead wants some tail of. Per cell for the same reason the
     // required set is: expanding to pages inside the walk was the gate's largest
     // single cost.
@@ -220,6 +243,12 @@ namespace
                     static_cast<int32>(FMath::DivideAndRoundUp<int64>(Tail, GAUSSIAN_SPLAT_PAGE_SPLATS)));
         }
     };
+
+    // Fix 7 iteration 3: one cell around the FURTHEST look-ahead pose, for the controller's price of
+    // k there. The same record as a required cell with Distance measured to that probe instead of
+    // probe 0, so PagesAt prices it exactly as it prices the required set and `ahead` and `next`
+    // cannot disagree on what a cell costs. Its own list, never merged into RequiredCells (D9).
+    using FAheadCell = FRequiredCell;
 
     // One page of a cell, named the way the pool names it.
     struct FWantedPage
@@ -445,7 +474,8 @@ namespace
 
     // Fix 7: the law, once per gate tick, after the fit and with this tick's stats filled. Where
     // each limit's number comes from: pre-fit demand one step up over capacity (DemandNextPages /
-    // CapacityPages, 4d9d3ad); the gate's walk (CellsVisited); the views' own budget
+    // CapacityPages, 4d9d3ad) and, with Ctl.LookAhead, the same around the furthest look-ahead pose
+    // (DemandAheadPages, DemandAheadNowPages); the gate's walk (CellsVisited); the views' own budget
     // (ReportViewSelection); the cycle (UpdateCycleLimb). The first three are functions of the
     // pose history and reproduce on a same-route bracket; the cycle does not. Place memory
     // (HoldRaiseByMemory) is a function of the pose history too: Centre is where a drop is recorded
@@ -525,14 +555,30 @@ namespace
         const int32 MaxCells = CVarCtlMaxCells.GetValueOnAnyThread();
         const int32 DropCount = FMath::Max(1, CVarCtlDropCount.GetValueOnAnyThread());
         const int32 PinnedDropCount = FMath::Max(1, CVarCtlPinnedDropCount.GetValueOnAnyThread());
+        const bool bLookAhead = CVarCtlLookAhead.GetValueOnAnyThread() != 0;
+        const float AheadDropRatio = CVarCtlAheadDropRatio.GetValueOnAnyThread();
 
+        // Pages over the capacity; no capacity reads as "does not fit".
+        const auto OverCapacity = [&Stats](int32 Pages) -> double
+        {
+            return Stats.CapacityPages > 0
+                ? static_cast<double>(Pages) / static_cast<double>(Stats.CapacityPages)
+                : TNumericLimits<double>::Max();
+        };
         // `next` is a LOWER bound on one step up's demand -- cells beyond this tick's walk are not in
         // it -- and ProbeStep is Ctl.Step while the controller is on, so it prices that step.
-        const double DemandRatio = Stats.CapacityPages > 0
-            ? static_cast<double>(Stats.DemandNextPages) / static_cast<double>(Stats.CapacityPages)
-            : TNumericLimits<double>::Max();
+        const double DemandRatio = OverCapacity(Stats.DemandNextPages);
+        // Iteration 3: the same step priced around the furthest look-ahead pose, and the current k priced
+        // there. A raise needs room at BOTH poses, because the k it buys is still in force when the ego
+        // gets where it is looking -- and the dense blocks `next` could not see are exactly the ones the
+        // controller entered too high.
+        const double AheadRatio = OverCapacity(Stats.DemandAheadPages);
+        const double AheadNowRatio = OverCapacity(Stats.DemandAheadNowPages);
+        const double RaiseRatio = bLookAhead
+            ? OverCapacity(FMath::Max(Stats.DemandNextPages, Stats.DemandAheadPages))
+            : DemandRatio;
         const bool bCycleClear = !bUseCycle || Cycle.MaxMs < TargetMs;
-        const bool bDemandClear = DemandRatio < static_cast<double>(Ceiling);
+        const bool bDemandClear = RaiseRatio < static_cast<double>(Ceiling);
         const bool bCellsClear = Stats.CellsVisited < MaxCells;
         const bool bBudgetClear = BoundTicks == 0;
         const bool bClear = bCycleClear && bDemandClear && bCellsClear && bBudgetClear;
@@ -545,6 +591,11 @@ namespace
         // would walk k to Max before the first camera frame. Waiting neither counts nor resets dwell.
         const bool bWait = Ctl.MissedViews > 0 || Stats.Views == 0;
         const bool bLocked = Ctl.Lockout > 0;
+        // Iteration 3: an EARLY step down -- the current k will not fit where the ego is about to be.
+        // It is a prediction from a straight-line extrapolation, not evidence like the two rules above,
+        // so it waits out a lockout: at most one early step per lockout, with the pinning rule still the
+        // backstop when one step was not enough. A tick both would drop on is the evidence's drop.
+        const bool bAheadDrop = bLookAhead && !bLocked && AheadNowRatio >= static_cast<double>(AheadDropRatio);
         const float Before = Ctl.Multiplier;
         bool bDropRuleFired = false;
         uint8 State = bLocked ? 5 : 1;
@@ -553,7 +604,7 @@ namespace
         {
             // Hold. The windows above still advanced, so the evidence keeps accumulating.
         }
-        else if (bCycleDrop || bPinnedDrop)
+        else if (bCycleDrop || bPinnedDrop || bAheadDrop)
         {
             bDropRuleFired = true;
             Ctl.Multiplier = FMath::Max(MinK, Before / Step);
@@ -576,15 +627,27 @@ namespace
                     Reason += FString::Printf(TEXT("%sgate m < 1 on %d of %d ticks"),
                         Reason.IsEmpty() ? TEXT("") : TEXT(", "), PinnedTicks, Window);
                 }
+                // An early drop says "ahead", not "bound", so the step log tells a predicted drop from one
+                // the window's evidence forced. Still "detail control: k", which the owner's report counts
+                // as a step -- it is one.
+                const bool bAheadOnly = !bCycleDrop && !bPinnedDrop;
+                if (bAheadOnly)
+                {
+                    Reason = FString::Printf(
+                        TEXT("the current k needs %d of %d pages around the look-ahead pose (%.3f >= %.2f)"),
+                        Stats.DemandAheadNowPages, Stats.CapacityPages, AheadNowRatio, AheadDropRatio);
+                }
                 UE_LOG(
                     LogGaussianSplatStream,
                     Display,
-                    TEXT("detail control: k %.3f -> %.3f DOWN, bound: %s; no step up for %d ticks"),
-                    Before, Ctl.Multiplier, *Reason, Ctl.Lockout);
+                    TEXT("detail control: k %.3f -> %.3f DOWN, %s: %s; no step up for %d ticks"),
+                    Before, Ctl.Multiplier, bAheadOnly ? TEXT("ahead") : TEXT("bound"), *Reason, Ctl.Lockout);
 
                 // Place memory: only a PINNING drop is a fact about this place -- the pool could not
                 // hold its required set at Before here. A drop on the cycle rule alone is about the
                 // frame, and is not recorded. A drop at Min is not a step, and records nothing either.
+                // Nor does an early drop on the look-ahead alone: it is a prediction, about a place
+                // ahead of Where, and the pool has not failed anywhere yet.
                 if (bPinnedDrop && bMemory && MemorySlots > 0)
                 {
                     if (Ctl.Memory.Num() >= MemorySlots)
@@ -619,12 +682,17 @@ namespace
                 const FString CycleText = bUseCycle
                     ? FString::Printf(TEXT("cycle max %.1f < %.1f ms"), Cycle.MaxMs, TargetMs)
                     : FString(TEXT("cycle limb off"));
+                // With Ctl.LookAhead 0 this reads exactly as iteration 2's line did.
+                const FString DemandText = bLookAhead
+                    ? FString::Printf(TEXT("max(next, ahead)/cap %.3f < %.2f (next %.3f, ahead %.3f)"),
+                        RaiseRatio, Ceiling, DemandRatio, AheadRatio)
+                    : FString::Printf(TEXT("next/cap %.3f < %.2f"), DemandRatio, Ceiling);
                 UE_LOG(
                     LogGaussianSplatStream,
                     Display,
-                    TEXT("detail control: k %.3f -> %.3f UP, every limit clear for %d ticks: %s, next/cap %.3f < %.2f, ")
+                    TEXT("detail control: k %.3f -> %.3f UP, every limit clear for %d ticks: %s, %s, ")
                     TEXT("cells %d < %d, no budget-bound view in %d ticks"),
-                    Before, Ctl.Multiplier, DwellTicks, *CycleText, DemandRatio, Ceiling,
+                    Before, Ctl.Multiplier, DwellTicks, *CycleText, *DemandText,
                     Stats.CellsVisited, MaxCells, Window);
             }
             else if (!bLocked)
@@ -871,6 +939,10 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     // scan inside the cell walk: at 690 cells that is up to 238,000 comparisons
     // per tick, and it was most of the 1.88 ms the first measured run cost.
     TMap<uint64, int32> RequiredCellIndex;
+    // Fix 7 iteration 3: the cells the controller prices k at around the furthest look-ahead pose.
+    // Filled only while Ctl.Enable is on, and keyed like RequiredCellIndex for the same reason.
+    TArray<FAheadCell> AheadCells;
+    TMap<uint64, int32> AheadCellIndex;
 
     const auto PageKey = [](const UGaussianSplatPagedAsset* Asset, int32 GlobalPage) -> uint64
     {
@@ -958,7 +1030,9 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
             // are built from this tick's state only, so the required set is a
             // function of the current poses and nothing else (D9).
             // Probe 0 is the CURRENT pose and is the only one the required set
-            // may use. The rest are look-ahead and feed the wanted set only.
+            // may use. The rest are look-ahead and feed the wanted set -- and,
+            // while the controller runs, its price of k ahead (Fix 7 iteration 3),
+            // which is never this tick's required set either.
             struct FProbe { FVector Centre; };
             TArray<FProbe, TInlineAllocator<4>> Probes;
             Probes.Add({Group.Centre});
@@ -1104,6 +1178,39 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                     {
                         RequiredCellIndex.Add(CellKey, RequiredCells.Num());
                         RequiredCells.Add({Asset, CellIndex, RequiredDistance, HalfFull, MinFraction});
+                    }
+                }
+
+                // Fix 7 iteration 3: the cells around the FURTHEST look-ahead pose, for the controller
+                // to price k where the ego will be, not only where it is. Probes holds 4 entries or 1,
+                // so the last is probe 3, or probe 0 when there is no look-ahead (LookAheadSec 0, or no
+                // direction) -- whose distance is RequiredDistance. Inside the floor radius, the walk's
+                // own reach: beyond it a cell is floor-only at this k, and like `next` the step-up
+                // price is a lower bound. Skipped entirely with the controller off.
+                if (bDetailControl)
+                {
+                    const int32 AheadProbe = Probes.Num() - 1;
+                    const double AheadDistance =
+                        AheadProbe == 0 ? RequiredDistance : DistanceFrom(Probes[AheadProbe].Centre);
+                    if (AheadDistance < FloorRadius)
+                    {
+                        const uint64 CellKey = PageKey(Asset, CellIndex);
+                        if (const int32* Found = AheadCellIndex.Find(CellKey))
+                        {
+                            // As in the required set: a cell reached twice is priced once, at the
+                            // closer distance, which is the larger take.
+                            FAheadCell& Existing = AheadCells[*Found];
+                            if (AheadDistance < Existing.Distance)
+                            {
+                                Existing.Distance = AheadDistance;
+                                Existing.HalfFull = FMath::Max(Existing.HalfFull, HalfFull);
+                            }
+                        }
+                        else
+                        {
+                            AheadCellIndex.Add(CellKey, AheadCells.Num());
+                            AheadCells.Add({Asset, CellIndex, AheadDistance, HalfFull, MinFraction});
+                        }
                     }
                 }
 
@@ -1420,6 +1527,20 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     // the views' reports and forgets its state, so a later Enable starts from shipped.
     if (bDetailControl)
     {
+        // Iteration 3: price the look-ahead cells, here and only here, so off pays nothing. Both sums
+        // in one pass. The step is Stats.ProbeStep -- Ctl.Step while the controller runs -- the ratio
+        // `next` uses, so `ahead` and `next` price the same candidate k; 1.0 is the current k.
+        int64 AheadNow = 0;
+        int64 AheadNext = 0;
+        for (const FAheadCell& Cell : AheadCells)
+        {
+            const int32 Now = Cell.PagesAt(1.0);
+            AheadNow += Now;
+            AheadNext += Stats.ProbeStep > 1.0f ? Cell.PagesAt(Stats.ProbeStep) : Now;
+        }
+        Stats.DemandAheadNowPages = static_cast<int32>(FMath::Min<int64>(AheadNow, MAX_int32));
+        Stats.DemandAheadPages = static_cast<int32>(FMath::Min<int64>(AheadNext, MAX_int32));
+
         // Place memory locates a tick by ONE point, the first group's centre -- what the walk measures
         // from. With several egos that is the first one's only; one point is what a record can hold.
         // With no group there is no view, the controller waits, and the zero vector is never used.

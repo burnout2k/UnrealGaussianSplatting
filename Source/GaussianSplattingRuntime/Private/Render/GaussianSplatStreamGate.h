@@ -99,6 +99,13 @@ struct FGaussianSplatGateStats
     int32 CapacityPages = 0;
     int32 DemandNextPages = 0;
     float ProbeStep = 1.0f;
+    // Fix 7 iteration 3: the same prices around the FURTHEST look-ahead pose (probe 3; probe 0 when
+    // there is no look-ahead), over the cells within the floor radius of it -- where the ego will be,
+    // which DemandNextPages cannot see. DemandAheadPages is one step up (ProbeStep, as `next`),
+    // DemandAheadNowPages the current k. The step-up one is a lower bound for the reason `next` is.
+    // 0 unless r.GaussianSplat.Ctl.Enable: the cells are only collected while the controller runs.
+    int32 DemandAheadPages = 0;
+    int32 DemandAheadNowPages = 0;
     // Fix 7: the detail controller (r.GaussianSplat.Ctl.*). CtlMultiplier is k, the d_full
     // multiple THIS tick's required set was built with (1.0 = shipped); a step taken this tick
     // applies from the next one, which is why state 3/4 print the k before the step. CtlCycleMs

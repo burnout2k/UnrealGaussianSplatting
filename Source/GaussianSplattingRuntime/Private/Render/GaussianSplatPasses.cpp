@@ -233,8 +233,9 @@ namespace GaussianSplatProfiling
             //               backwards must print the same number (m7)
             //   ctl         Fix 7's detail controller: k, the window's longest cycle, the
             //               budget-bound views, its state (0 off ... 5 lockout, 6 held by
-            //               place memory) and the drop records it holds. The owner's
-            //               parser reads this exact format.
+            //               place memory), the drop records it holds, and the demand around
+            //               the furthest look-ahead pose as `ahead now/next` (0/0 while it is
+            //               off). The owner's parser reads this exact format.
             FString StreamText;
             if (bPaged && FGaussianSplatPagePool::IsStreamingEnabled())
             {
@@ -243,7 +244,7 @@ namespace GaussianSplatProfiling
                 StreamText = FString::Printf(
                     TEXT(" | stream req %d want %d resident %d | up %d (%.1f MiB) evict %d short %d thrash %d")
                     TEXT(" | gate %.3f ms upload %.3f ms | m %.4f | cells %d | demand %d cap %d next %d @x%.1f")
-                    TEXT(" | ctl k %.3f cycle %.1f ms bound %d state %d mem %d | req# %llx"),
+                    TEXT(" | ctl k %.3f cycle %.1f ms bound %d state %d mem %d ahead %d/%d | req# %llx"),
                     Gate.RequiredPages,
                     Gate.WantedPages,
                     Gate.ResidentPages,
@@ -265,6 +266,8 @@ namespace GaussianSplatProfiling
                     Gate.CtlBudgetBoundViews,
                     static_cast<int32>(Gate.CtlState),
                     Gate.CtlMemoryRecords,
+                    Gate.DemandAheadNowPages,
+                    Gate.DemandAheadPages,
                     Gate.RequiredHash);
             }
             UE_LOG(
