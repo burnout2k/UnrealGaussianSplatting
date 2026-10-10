@@ -783,9 +783,14 @@ namespace GaussianSplatProfiling
     // overlapping Gaussians accumulate into a milky veil that washes out the
     // scene; these three attack it from different angles. All default to
     // existing behaviour.
+    // Defaults moved 2026-10-10 (AlphaCutoff 1/255 -> 0.031, MinScreenVariance 1.0 -> 0.25): measured awake
+    // on five captures (San Juan, Perry, Uno, the mixed city, Lublin), the pair is the best frame time on
+    // every one (-6 to -17 %) and, judged by eye, better or equal on every one. MinScreenVariance 1.0 was
+    // inflating every thin splat to a 5.7 px minimum, so distant cables drew as fat strokes; 0.25 draws them
+    // nearer their true size. Record: splat-work/fix5-status.md, 2026-10-10.
     static TAutoConsoleVariable<float> CVarAlphaCutoff(
         TEXT("r.GaussianSplat.AlphaCutoff"),
-        1.0f / 255.0f,
+        0.031f,
         TEXT("Discard splat pixels below this alpha before blending (0-1). ")
         TEXT("Trims the faint outer tails of every Gaussian. Too high and ")
         TEXT("splats stop fading softly and thin structures go patchy."),
@@ -832,7 +837,7 @@ namespace GaussianSplatProfiling
     // absent low-pass. Lower means cheaper far field but thinner surfaces.
     static TAutoConsoleVariable<float> CVarMinScreenVariance(
         TEXT("r.GaussianSplat.MinScreenVariance"),
-        1.0f,
+        0.25f,
         TEXT("Floor on projected screen-space variance in px^2. 1.0 = historical ")
         TEXT("behaviour, 0.0 = reference 3DGS (the 0.3 low-pass alone). Lower cuts ")
         TEXT("overdraw sharply but can open holes in distant surfaces."),
