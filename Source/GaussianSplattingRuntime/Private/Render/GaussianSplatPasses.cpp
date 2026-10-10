@@ -22,6 +22,8 @@
 #include "DataDrivenShaderPlatformInfo.h"
 #include "ProfilingDebugging/RealtimeGPUProfiler.h"
 
+#include <atomic>
+
 DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplatProfile, Log, All);
 
 // Per-phase GPU timing for `stat GPU`. Without scopes the splat cost landed in whatever engine
@@ -106,6 +108,27 @@ namespace GaussianSplatProfiling
         return GVisibleCountByView.FindOrAdd(ViewKey);
     }
 
+    // Fix 7 trace (r.GaussianSplat.Ctl.TraceTicks): the last engine frame on which every view prints its
+    // profile line whatever the 60-frame cadence says. The gate writes it on the game thread when a
+    // controller step arms a trace; the line reads it here on the render thread. Relaxed, like the gate's
+    // multipliers: a frame of staleness only moves where the forced lines start or stop. 0 = never armed.
+    static std::atomic<uint64> GProfileForceUntilFrame{0};
+
+    void ForceProfileLineUntil(uint64 LastFrame)
+    {
+        GProfileForceUntilFrame.store(LastFrame, std::memory_order_relaxed);
+    }
+
+    // GFrameCounterRenderThread is the engine's render-side copy of GFrameCounter, set by a command enqueued
+    // at the end of each game frame, so it equals the GFrameCounter the gate saw while this frame's commands
+    // were recorded. NOT GFrameNumberRenderThread: that counts BeginFrame calls, starts at 1 and also
+    // advances for reflection captures and loading screens, so it drifts away from GFrameCounter.
+    bool IsProfileLineForced()
+    {
+        const uint64 Until = GProfileForceUntilFrame.load(std::memory_order_relaxed);
+        return Until != 0 && GFrameCounterRenderThread <= Until;
+    }
+
     void EnqueueVisibleCountReadback(
         FRDGBuilder& GraphBuilder,
         FRDGBufferRef IndirectArgsBuffer,
@@ -178,7 +201,10 @@ namespace GaussianSplatProfiling
         }
         State.WriteSlot = (State.WriteSlot + 1) % NumReadbackSlots;
 
-        if ((State.FrameCounter++ % 60) == 0 && State.LastVisibleCount > 0)
+        // Fix 7 trace: a controller step's window forces the line on every frame (IsProfileLineForced). The
+        // counter still advances exactly once per call, and first, so with no trace armed the 60-frame cadence
+        // -- which frames are sampled -- is unchanged. The line's content is not touched.
+        if (((State.FrameCounter++ % 60) == 0 || IsProfileLineForced()) && State.LastVisibleCount > 0)
         {
             const float VisiblePercent = 100.0f * static_cast<float>(State.LastVisibleCount) /
                 static_cast<float>(FMath::Max(1u, SelectedCount));
@@ -437,6 +463,20 @@ namespace GaussianSplatProfiling
         0,
         TEXT("Debug, LodMode 1: when set to a new value > 0, logs every selected cell's distance, fraction and take ")
         TEXT("for one frame, in every view and batch."),
+        ECVF_RenderThreadSafe);
+
+    // Fix 6 measurement (fix7-trace-brief.md B): what the far field costs. Applied inside
+    // GaussianSplatLod::TakeAt, so the views, the gate's required and wanted pages and the look-ahead
+    // pricing all see the same take -- in mode 1 the gate stops REQUESTING far tail pages too, not only
+    // the views stop drawing them. The baked floor pages stay pinned whatever this says.
+    static TAutoConsoleVariable<int32> CVarDebugFarField(
+        TEXT("r.GaussianSplat.Debug.FarField"),
+        0,
+        TEXT("Debug, LodMode 1: what a cell beyond its full-detail distance d_full takes, in the views and the gate ")
+        TEXT("alike. 0 (default) = the (d_full / d)^2 prefix, as shipped. 1 = nothing, so the cell neither draws ")
+        TEXT("nor asks for tail pages: the ceiling of what far-field work could save. 2 = the floor take ")
+        TEXT("(LodMinFraction) instead of the decaying prefix. Other values mean 0. Whole-cell views are not ")
+        TEXT("affected."),
         ECVF_RenderThreadSafe);
 
     int32 GetLodMode()
@@ -1867,6 +1907,8 @@ namespace GaussianSplatLod
         const float MinFull = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodMinFullDistance.GetValueOnRenderThread());
         const float DebugHalf = GaussianSplatProfiling::CVarLodDebugHalfFullDistance.GetValueOnRenderThread();
         const float CullMargin = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodCullMargin.GetValueOnRenderThread());
+        // Fix 6 measurement: once per selection, never per cell -- TakeAt runs per cell per bisection pass.
+        const int32 FarField = GaussianSplatProfiling::CVarDebugFarField.GetValueOnRenderThread();
 
         struct FCandidate
         {
@@ -1945,15 +1987,18 @@ namespace GaussianSplatLod
         // The bisection's variable is the MULTIPLIER itself now, not d_full: each
         // candidate scales its OWN group's d_full by it, so one m thins every district
         // the same way in screen terms while respecting each asset's full distance.
-        const auto TakeAt = [&Groups, &In, MinFraction](const FCandidate& Candidate, double Multiplier) -> uint32
+        const auto TakeAt = [&Groups, &In, MinFraction, FarField](const FCandidate& Candidate, double Multiplier) -> uint32
         {
             const FGaussianSplatCell& Cell = (*Groups[Candidate.GroupIndex].Cells)[Candidate.CellIndex];
             if (In.bFullCells)
             {
                 return static_cast<uint32>(Cell.Count);
             }
-            // Shared with the settle gate, so the gate's bound is the same arithmetic.
-            return GaussianSplatLod::TakeAt(Cell.Count, Candidate.Distance, Candidate.HalfFull * Multiplier, MinFraction);
+            // Shared with the settle gate, so the gate's bound is the same arithmetic. With Debug.FarField 1
+            // the take can be 0, and TakeAt stays monotone in the full distance (0, then the whole cell once
+            // d_full reaches it), so the bisection below and the overflow clamp still hold.
+            return GaussianSplatLod::TakeAt(
+                Cell.Count, Candidate.Distance, Candidate.HalfFull * Multiplier, MinFraction, FarField);
         };
         const auto TotalAt = [&Candidates, &TakeAt](double Multiplier) -> uint64
         {
@@ -2014,25 +2059,38 @@ namespace GaussianSplatLod
         TArray<uint32> Takes;
         Takes.Reserve(Candidates.Num());
         uint64 Total = 0;
+        // Cells whose take is not 0. Before Debug.FarField a take was never 0 (TakeAt's one-splat floor), so this
+        // is Takes.Num() unless that knob is 1, and the clamp below is bit-identical without it.
+        uint64 DrawingCells = 0;
         for (const FCandidate& Candidate : Candidates)
         {
             Takes.Add(TakeAt(Candidate, Multiplier));
             Total += Takes.Last();
+            DrawingCells += Takes.Last() > 0 ? 1 : 0;
         }
 
         // Mode 0's clamp, the last safety net. Only a selection that still overflows at the smallest m, or whole
-        // cells, gets here.
-        if (Total > Budget && static_cast<uint64>(Takes.Num()) <= Budget)
+        // cells, gets here. A 0 take (Debug.FarField 1) is a cell that draws nothing: it does not count against the
+        // one-splat floor, does not get one, and is never trimmed -- `Take - 1` on it would wrap to 4 billion.
+        if (Total > Budget && DrawingCells <= Budget)
         {
             const double Scale = static_cast<double>(Budget) / static_cast<double>(Total);
             Total = 0;
             for (uint32& Take : Takes)
             {
+                if (Take == 0)
+                {
+                    continue;
+                }
                 Take = static_cast<uint32>(FMath::Max<int64>(1, FMath::RoundToInt(Take * Scale)));
                 Total += Take;
             }
             for (int32 Index = Takes.Num() - 1; Index >= 0 && Total > Budget; --Index)
             {
+                if (Takes[Index] == 0)
+                {
+                    continue;
+                }
                 const uint32 Drop = static_cast<uint32>(FMath::Min<uint64>(Takes[Index] - 1, Total - Budget));
                 Takes[Index] -= Drop;
                 Total -= Drop;
@@ -2306,8 +2364,24 @@ namespace GaussianSplatLod
         return HalfFull;
     }
 
-    uint32 TakeAt(int32 CellCount, double Distance, double FullDistance, float MinFraction)
+    int32 GetFarFieldMode()
     {
+        return GaussianSplatProfiling::CVarDebugFarField.GetValueOnAnyThread();
+    }
+
+    uint32 TakeAt(int32 CellCount, double Distance, double FullDistance, float MinFraction, int32 FarField)
+    {
+        // Fix 6 measurement (r.GaussianSplat.Debug.FarField). FullDistance here is F' = d_full / 2, so
+        // Bias x Falloff below first drops under 1 -- the cell stops being whole -- at Distance > 2 x F' = d_full;
+        // that is the full-detail radius. Beyond it mode 1 takes nothing and mode 2 the floor take, the same
+        // expression the clamp below gives at the floor. Mode 0 never enters, so the shipped arithmetic is
+        // untouched, one-splat floor included.
+        if ((FarField == 1 || FarField == 2) && Distance > 2.0 * FullDistance)
+        {
+            return FarField == 1
+                ? 0u
+                : static_cast<uint32>(FMath::Clamp(FMath::RoundToInt(CellCount * MinFraction), 1, CellCount));
+        }
         constexpr float Bias = 4.0f;
         const double Clamped = FMath::Max(Distance, FullDistance);
         const double Falloff = (FullDistance / Clamped) * (FullDistance / Clamped);

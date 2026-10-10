@@ -116,6 +116,9 @@ struct FGaussianSplatGateStats
     // CtlMemoryRecords: the place-memory drop records held at the end of this tick.
     float CtlMultiplier = 1.0f;
     float CtlCycleMs = 0.0f;
+    // Fix 7 trace (r.GaussianSplat.Ctl.TraceTicks): THIS tick's own tick-to-tick wall clock, the per-tick
+    // value CtlCycleMs is the window maximum of. 0 with Ctl.UseCycleTime 0, or the controller off.
+    float CtlTickMs = 0.0f;
     uint8 CtlState = 0;
     int32 CtlBudgetBoundViews = 0;
     int32 CtlMemoryRecords = 0;

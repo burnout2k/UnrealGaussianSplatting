@@ -74,10 +74,34 @@ namespace GaussianSplatLod
     double ComputeHalfFull(double FocalPx, float PointSize, float SizeRef, double ActorScale,
                            float MaxFullDistanceM = 0.0f, bool bDetail = false);
 
+    // r.GaussianSplat.Debug.FarField (Fix 6 measurement), for the gate's game-thread read:
+    // once per gate tick, passed to every TakeAt of that tick. The selection reads the
+    // CVar itself on the render thread, once per build.
+    int32 GetFarFieldMode();
+
     // The selection's own take for one cell at a given full distance. Distance is
     // from the view origin (or, in the gate, from the group centre minus its
     // radius) to the cell's world box.
-    uint32 TakeAt(int32 CellCount, double Distance, double FullDistance, float MinFraction);
+    //
+    // FarField is r.GaussianSplat.Debug.FarField, read by the caller ONCE per gate tick
+    // or selection build, never per cell. 0 is the shipped take, and never 0 splats.
+    // 1 returns 0 beyond the full-detail radius -- a cell that neither draws nor asks
+    // for pages -- so every caller must treat a 0 take as "nothing", not as one splat.
+    uint32 TakeAt(int32 CellCount, double Distance, double FullDistance, float MinFraction, int32 FarField);
+}
+
+// Fix 7 trace (r.GaussianSplat.Ctl.TraceTicks): the profile line is sampled one frame
+// in 60 per view, which cannot resolve the one slow cycle after a controller step, so
+// the gate forces it on every frame of a step's window.
+namespace GaussianSplatProfiling
+{
+    // Game thread: print every view's profile line on each engine frame up to and
+    // including LastFrame, a GFrameCounter value.
+    void ForceProfileLineUntil(uint64 LastFrame);
+
+    // Render thread: whether the frame being rendered is inside that window. False
+    // until something forces it.
+    bool IsProfileLineForced();
 }
 
 namespace GaussianSplatPasses

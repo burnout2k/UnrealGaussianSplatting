@@ -8,6 +8,8 @@
 
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "RenderTimer.h"
+#include "RHIGlobals.h"
 
 #include <atomic>
 
@@ -205,6 +207,18 @@ namespace
         TEXT("pool. Never inside a lockout. Logged as \"DOWN, ahead\"."),
         ECVF_RenderThreadSafe);
 
+    // Fix 7 trace (fix7-trace-brief.md A). After EVERY step up, one cycle in the next ~12 frames costs
+    // 65-103 ms against ~45 ms steady, while the raise tick's uploads, `short`, gate ms and m are all
+    // quiet. The profile line samples one frame in 60 per view and cannot resolve one cycle; this makes
+    // the window after a step readable frame by frame. 0 arms nothing and prints nothing.
+    TAutoConsoleVariable<int32> CVarCtlTraceTicks(
+        TEXT("r.GaussianSplat.Ctl.TraceTicks"),
+        0,
+        TEXT("N > 0: every detail-controller step logs one detail-trace line per gate tick, for the step's own tick\n")
+        TEXT("and the next N, and forces every view's profile line on those frames. 0 (default): off. At most 3600.\n")
+        TEXT("The line: thread and GPU frame times, the tick's own cycle, gate ms, and that tick's uploads."),
+        ECVF_RenderThreadSafe);
+
     // A cell the look-ahead wants some tail of. Per cell for the same reason the
     // required set is: expanding to pages inside the walk was the gate's largest
     // single cost.
@@ -227,14 +241,16 @@ namespace
         double Distance = 0.0;      // group centre to the cell's world box, minus the radius
         double HalfFull = 1.0;
         float MinFraction = 0.02f;
+        int32 FarField = 0;         // r.GaussianSplat.Debug.FarField, read once per gate tick (Fix 6 measurement)
 
         // How many tail pages this cell needs at a given global multiplier. The
         // multiplier scales the full distance, exactly as a view's budget bisection
-        // does, so the gate thins the same way the selection would.
+        // does, so the gate thins the same way the selection would. A 0 take
+        // (Debug.FarField 1) is below the floor like any take under it: no tail pages.
         int32 PagesAt(double Multiplier) const
         {
             const FGaussianSplatPagedCell& Cell = Asset->Cells[CellIndex];
-            const uint32 Take = GaussianSplatLod::TakeAt(Cell.Count, Distance, HalfFull * Multiplier, MinFraction);
+            const uint32 Take = GaussianSplatLod::TakeAt(Cell.Count, Distance, HalfFull * Multiplier, MinFraction, FarField);
             const int64 Tail = static_cast<int64>(Take) - Cell.FloorCount;
             return Tail <= 0
                 ? 0
@@ -373,6 +389,11 @@ namespace
         TArray<FDropRecord> Memory;
         int32 Ticks = 0;               // controller ticks, the clock records age by
 
+        // Ctl.TraceTicks: the trace a step arms, logged at the end of RunGate. Here rather than beside the
+        // struct so the controller's off-means-off reset and a map change end a trace as well.
+        int32 TraceLeft = 0;           // gate ticks still to log, the current one included; 0 = not armed
+        int32 TraceSince = 0;          // gate ticks since the step that armed it: the line's step+N
+
         void ResetWindow(int32 Window)
         {
             TickMs.Init(0.0f, Window);
@@ -407,6 +428,7 @@ namespace
     {
         float MaxMs = 0.0f;     // the window's longest tick-to-tick wall clock
         int32 OverBar = 0;      // ticks in the window over Ctl.CycleBarMs
+        float TickMs = 0.0f;    // THIS tick's own delta, one of those MaxMs is the max of (the trace line's cycle)
     };
 
     // Fix 7, the cycle limb -- the ONLY non-deterministic one (review M7). Wall clock differs between
@@ -427,6 +449,8 @@ namespace
         Ctl.LastTickStart = TickStart;
 
         FCycleWindow Cycle;
+        // Taken here, because a step down resets the window -- TickMs included -- later in the same tick.
+        Cycle.TickMs = Ctl.TickMs[Slot];
         for (const float Ms : Ctl.TickMs)
         {
             Cycle.MaxMs = FMath::Max(Cycle.MaxMs, Ms);
@@ -470,6 +494,21 @@ namespace
             }
         }
         return bHold;
+    }
+
+    // Fix 7 trace: called on a step, after its "detail control: k" line. The step's own tick is step+0, so N
+    // ticks after it make N + 1 lines; the profile line is forced over the same engine frames, as the gate
+    // runs once per frame. A step inside an armed trace re-arms it from step+0.
+    void ArmDetailTrace(FDetailControl& Ctl)
+    {
+        const int32 TraceTicks = FMath::Min(CVarCtlTraceTicks.GetValueOnAnyThread(), 3600);
+        if (TraceTicks <= 0)
+        {
+            return;
+        }
+        Ctl.TraceLeft = TraceTicks + 1;
+        Ctl.TraceSince = 0;
+        GaussianSplatProfiling::ForceProfileLineUntil(GFrameCounter + static_cast<uint64>(TraceTicks));
     }
 
     // Fix 7: the law, once per gate tick, after the fit and with this tick's stats filled. Where
@@ -642,6 +681,7 @@ namespace
                     Display,
                     TEXT("detail control: k %.3f -> %.3f DOWN, %s: %s; no step up for %d ticks"),
                     Before, Ctl.Multiplier, bAheadOnly ? TEXT("ahead") : TEXT("bound"), *Reason, Ctl.Lockout);
+                ArmDetailTrace(Ctl);
 
                 // Place memory: only a PINNING drop is a fact about this place -- the pool could not
                 // hold its required set at Before here. A drop on the cycle rule alone is about the
@@ -694,6 +734,7 @@ namespace
                     TEXT("cells %d < %d, no budget-bound view in %d ticks"),
                     Before, Ctl.Multiplier, DwellTicks, *CycleText, *DemandText,
                     Stats.CellsVisited, MaxCells, Window);
+                ArmDetailTrace(Ctl);
             }
             else if (!bLocked)
             {
@@ -707,6 +748,7 @@ namespace
 
         Stats.CtlMultiplier = Published;
         Stats.CtlCycleMs = Cycle.MaxMs;
+        Stats.CtlTickMs = Cycle.TickMs;
         Stats.CtlState = State;
         Stats.CtlBudgetBoundViews = Ctl.BoundViews;
         Stats.CtlMemoryRecords = Ctl.Memory.Num();
@@ -928,6 +970,9 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     const float LookAheadSec = FMath::Max(0.0f, CVarLookAheadSec.GetValueOnAnyThread());
     const double MinLookAheadSpeed = FMath::Max(0.0f, CVarMinLookAheadSpeedCms.GetValueOnAnyThread());
     const float MinFractionCVar = GaussianSplatLod::GetMinFraction();
+    // Fix 6 measurement: once per tick, carried by every take below (PagesFor, FRequiredCell, FAheadCell) so
+    // the walk never reads a CVar per cell, and the gate requests exactly what the views will select.
+    const int32 FarField = GaussianSplatLod::GetFarFieldMode();
 
     // Required pages this tick, and the pages merely wanted by look-ahead. Both
     // keyed the way the pool names a page, so the plan needs no translation.
@@ -1145,9 +1190,11 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                         FMath::Sqrt(ComputeSquaredDistanceFromBoxToPoint(WorldBox.Min, WorldBox.Max, Centre))
                             - Group.Radius);
                 };
-                const auto PagesFor = [&Cell, HalfFull, MinFraction](double Distance) -> int32
+                const auto PagesFor = [&Cell, HalfFull, MinFraction, FarField](double Distance) -> int32
                 {
-                    const uint32 Take = GaussianSplatLod::TakeAt(Cell.Count, Distance, HalfFull, MinFraction);
+                    // A 0 take (Debug.FarField 1) is under the floor: no tail pages, so a far cell is neither
+                    // required nor wanted.
+                    const uint32 Take = GaussianSplatLod::TakeAt(Cell.Count, Distance, HalfFull, MinFraction, FarField);
                     const int64 TailNeeded = static_cast<int64>(Take) - Cell.FloorCount;
                     return TailNeeded <= 0
                         ? 0
@@ -1177,7 +1224,7 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                     else
                     {
                         RequiredCellIndex.Add(CellKey, RequiredCells.Num());
-                        RequiredCells.Add({Asset, CellIndex, RequiredDistance, HalfFull, MinFraction});
+                        RequiredCells.Add({Asset, CellIndex, RequiredDistance, HalfFull, MinFraction, FarField});
                     }
                 }
 
@@ -1209,7 +1256,7 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                         else
                         {
                             AheadCellIndex.Add(CellKey, AheadCells.Num());
-                            AheadCells.Add({Asset, CellIndex, AheadDistance, HalfFull, MinFraction});
+                            AheadCells.Add({Asset, CellIndex, AheadDistance, HalfFull, MinFraction, FarField});
                         }
                     }
                 }
@@ -1509,7 +1556,10 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
         }
     }
 
-    if (!Plan.IsEmpty())
+    // Kept for the trace line: an empty plan is never applied, and the pool's stream stats then still
+    // describe the last tick that applied one.
+    const bool bPlanApplied = !Plan.IsEmpty();
+    if (bPlanApplied)
     {
         Pool.ApplyStreamPlan(MoveTemp(Plan), TickNumber);
     }
@@ -1555,6 +1605,33 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
 
     LastStats = Stats;
     LastStats.GateMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+
+    // Fix 7 trace (Ctl.TraceTicks): one line per tick while a step's trace is armed, here so gate ms is this
+    // tick's whole cost. k is the k this tick's required set was built with, as on the profile line, so step+0
+    // still shows the k before the step. gt/rt/gpu/rhit are the engine's own last-frame measurements, as
+    // `stat unit` shows them (FViewport::Draw, the Slate renderer and the RHI write them). up/MiB/short/evict
+    // are the profile line's pool numbers, except that on a tick whose plan was empty they are 0 -- the pool's
+    // would still be the last applied tick's, which is not this tick.
+    FDetailControl& Ctl = GDetailControl;
+    if (Ctl.TraceLeft > 0)
+    {
+        const FGaussianSplatStreamStats Up =
+            bPlanApplied ? Pool.GetLastStreamStats() : FGaussianSplatStreamStats();
+        UE_LOG(
+            LogGaussianSplatStream,
+            Display,
+            TEXT("detail trace: tick %d step+%d k %.3f gt %.1f rt %.1f gpu %.1f rhit %.1f ms cycle %.1f ms ")
+            TEXT("gate %.2f ms up %d (%.1f MiB) short %d evict %d"),
+            TickNumber, Ctl.TraceSince, LastStats.CtlMultiplier,
+            FPlatformTime::ToMilliseconds(GGameThreadTime),
+            FPlatformTime::ToMilliseconds(GRenderThreadTime),
+            FPlatformTime::ToMilliseconds(GGPUFrameTime),
+            FPlatformTime::ToMilliseconds(GRHIThreadTime),
+            LastStats.CtlTickMs, LastStats.GateMs,
+            Up.PagesUploaded, Up.UploadBytes / (1024.0 * 1024.0), Up.PagesRequiredNotUploaded, Up.PagesEvicted);
+        --Ctl.TraceLeft;
+        ++Ctl.TraceSince;
+    }
 
     if (CVarGateLog.GetValueOnAnyThread() != 0)
     {
