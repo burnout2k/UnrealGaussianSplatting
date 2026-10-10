@@ -103,7 +103,7 @@ namespace
 
     TAutoConsoleVariable<float> CVarCtlCycleTargetMs(
         TEXT("r.GaussianSplat.Ctl.CycleTargetMs"),
-        85.0f,
+        70.0f,
         TEXT("Raise only while the window's longest cycle is under this, milliseconds."),
         ECVF_RenderThreadSafe);
 
@@ -128,7 +128,7 @@ namespace
 
     TAutoConsoleVariable<float> CVarCtlDemandCeiling(
         TEXT("r.GaussianSplat.Ctl.DemandCeiling"),
-        0.90f,
+        0.70f,
         TEXT("Raise only while the pre-fit demand one step up (the profile line's `next`) over the capacity is\n")
         TEXT("under this."),
         ECVF_RenderThreadSafe);
@@ -141,7 +141,7 @@ namespace
 
     TAutoConsoleVariable<int32> CVarCtlMaxCells(
         TEXT("r.GaussianSplat.Ctl.MaxCells"),
-        2000,
+        600,
         TEXT("Raise only while the gate visits fewer cells than this. The gate-CPU limb, in cells rather than\n")
         TEXT("ms because cells are deterministic and are what the ms are made of (review M7)."),
         ECVF_RenderThreadSafe);
