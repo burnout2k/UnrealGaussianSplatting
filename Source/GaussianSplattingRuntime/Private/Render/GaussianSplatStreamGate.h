@@ -103,12 +103,15 @@ struct FGaussianSplatGateStats
     // multiple THIS tick's required set was built with (1.0 = shipped); a step taken this tick
     // applies from the next one, which is why state 3/4 print the k before the step. CtlCycleMs
     // is the window's largest tick-to-tick wall clock (0 with Ctl.UseCycleTime 0). CtlState:
-    // 0 off, 1 hold, 2 dwell, 3 raised this tick, 4 dropped this tick, 5 lockout.
+    // 0 off, 1 hold, 2 dwell, 3 raised this tick, 4 dropped this tick, 5 lockout, 6 a due raise
+    // held by place memory (Ctl.Memory).
     // CtlBudgetBoundViews: views whose OWN budget bisection bound, on the last frame any drew.
+    // CtlMemoryRecords: the place-memory drop records held at the end of this tick.
     float CtlMultiplier = 1.0f;
     float CtlCycleMs = 0.0f;
     uint8 CtlState = 0;
     int32 CtlBudgetBoundViews = 0;
+    int32 CtlMemoryRecords = 0;
     double GateMs = 0.0;
 
     // Hash of the required set (asset, cell, page count) over every group. The
@@ -152,8 +155,9 @@ public:
 
     // Fix 7: the detail controller's actuator, a second multiplier on d_full beside the
     // overflow one and carried the same way -- solved by the gate on the game thread, read by
-    // the selection on the render thread. It scales HalfFull wherever HalfFull is formed, in
-    // the gate and in the views, so the two cannot drift. 1.0 unless r.GaussianSplat.Ctl.Enable.
+    // the selection on the render thread. GaussianSplatLod::ComputeHalfFull reads it and scales
+    // its formula term BEFORE the floor and the per-actor cap, so the gate and the views apply
+    // it in one place and cannot drift. 1.0 unless r.GaussianSplat.Ctl.Enable.
     static float GetDetailMultiplier();
 
     // Fix 7: the views' half of the controller's feedback, once per selection the gate serves

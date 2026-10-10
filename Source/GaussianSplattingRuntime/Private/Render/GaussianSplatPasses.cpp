@@ -232,8 +232,9 @@ namespace GaussianSplatProfiling
             //   req#        the required-set hash: the same pose reached forwards and
             //               backwards must print the same number (m7)
             //   ctl         Fix 7's detail controller: k, the window's longest cycle, the
-            //               budget-bound views and its state (0 off ... 5 lockout). The
-            //               owner's parser reads this exact format.
+            //               budget-bound views, its state (0 off ... 5 lockout, 6 held by
+            //               place memory) and the drop records it holds. The owner's
+            //               parser reads this exact format.
             FString StreamText;
             if (bPaged && FGaussianSplatPagePool::IsStreamingEnabled())
             {
@@ -242,7 +243,7 @@ namespace GaussianSplatProfiling
                 StreamText = FString::Printf(
                     TEXT(" | stream req %d want %d resident %d | up %d (%.1f MiB) evict %d short %d thrash %d")
                     TEXT(" | gate %.3f ms upload %.3f ms | m %.4f | cells %d | demand %d cap %d next %d @x%.1f")
-                    TEXT(" | ctl k %.3f cycle %.1f ms bound %d state %d | req# %llx"),
+                    TEXT(" | ctl k %.3f cycle %.1f ms bound %d state %d mem %d | req# %llx"),
                     Gate.RequiredPages,
                     Gate.WantedPages,
                     Gate.ResidentPages,
@@ -263,6 +264,7 @@ namespace GaussianSplatProfiling
                     Gate.CtlCycleMs,
                     Gate.CtlBudgetBoundViews,
                     static_cast<int32>(Gate.CtlState),
+                    Gate.CtlMemoryRecords,
                     Gate.RequiredHash);
             }
             UE_LOG(
@@ -1879,13 +1881,6 @@ namespace GaussianSplatLod
         }
         const bool bGateServed = bAnyPaged && FGaussianSplatPagePool::IsStreamingEnabled();
 
-        // Fix 7: the detail controller's multiplier, read ONCE so every group of this view sees one
-        // value. 1.0 unless r.GaussianSplat.Ctl.Enable, and x 1.0 is exact, so with the controller
-        // off every d_full here is bit-identical to the selection without it.
-        const double DetailMultiplier = bGateServed
-            ? static_cast<double>(FGaussianSplatStreamGate::GetDetailMultiplier())
-            : 1.0;
-
         for (int32 GroupIndex = 0; GroupIndex < Groups.Num(); ++GroupIndex)
         {
         FScreenLodGroup& Group = Groups[GroupIndex];
@@ -1902,9 +1897,11 @@ namespace GaussianSplatLod
         // F' = d_full / 2 at m = 1. The debug value goes through the same float Max and widening as mode 0's
         // FullDistance, so the two modes compare identical doubles.
         // Shared with the settle gate (GaussianSplatLod), so the two cannot drift.
-        // Fix 7: times the detail multiplier after ComputeHalfFull, exactly where the gate applies it.
+        // Fix 7: ComputeHalfFull applies the detail multiplier itself, before its floor and cap, when the
+        // gate serves this view. It reads the atomic once per group, so a view whose groups straddle a
+        // gate publish sees two k for one frame -- the one-frame staleness GDetailMultiplier documents.
         Group.HalfFull = GaussianSplatLod::ComputeHalfFull(
-            In.FocalPx, Group.PointSize, Group.SizeRef, Group.ActorScale, Group.MaxFullDistanceM) * DetailMultiplier;
+            In.FocalPx, Group.PointSize, Group.SizeRef, Group.ActorScale, Group.MaxFullDistanceM, bGateServed);
 
         Candidates.Reserve(Candidates.Num() + Cells.Num());
         for (int32 CellIndex = 0; CellIndex < Cells.Num(); ++CellIndex)
@@ -2264,7 +2261,7 @@ namespace GaussianSplatLod
     }
 
     double ComputeHalfFull(double FocalPx, float PointSize, float SizeRef, double ActorScale,
-                           float MaxFullDistanceM)
+                           float MaxFullDistanceM, bool bDetail)
     {
         const float K = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodScreenK.GetValueOnAnyThread());
         const float MinFull = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodMinFullDistance.GetValueOnAnyThread());
@@ -2276,12 +2273,23 @@ namespace GaussianSplatLod
             ? static_cast<double>(FMath::Max(1.0f, DebugHalf))
             : 0.5 * (static_cast<double>(K) * FocalPx * 0.35 * static_cast<double>(PointSize)
                 * static_cast<double>(SizeRef) * ActorScale);
+        // Fix 7: the detail multiplier, on the formula term and BEFORE the floor and the
+        // per-actor cap below, so k > 1 never takes d_full past LodMaxFullDistance (v3 §3).
+        // The floor then floors the RAISED value: on a floored scene a small k changes
+        // nothing until k x formula clears it -- the plan's known dead zone, not a bug.
+        // The debug override is scaled too, as it was when the multiply sat after this call.
+        // Ctl.Enable 0 publishes exactly 1.0f, and x 1.0 is exact in IEEE arithmetic, so the
+        // floor and the cap see the same double they did before the controller existed.
+        if (bDetail)
+        {
+            HalfFull *= static_cast<double>(FGaussianSplatStreamGate::GetDetailMultiplier());
+        }
         HalfFull = FMath::Max(HalfFull, 0.5 * static_cast<double>(MinFull));
         HalfFull = FMath::Max(HalfFull, 1.0);
-        // Fix 5 Step 4: the per-actor ceiling, in metres, applied BEFORE the budget
-        // multiplier (the caller does d_full = 2 x HalfFull x m). Centimetres here:
-        // d_full lives in world units, the property is metres because that is what
-        // anyone setting it is thinking in.
+        // Fix 5 Step 4: the per-actor ceiling, in metres, applied AFTER the detail
+        // multiplier and BEFORE the budget one (the caller does d_full = 2 x HalfFull x m).
+        // Centimetres here: d_full lives in world units, the property is metres because
+        // that is what anyone setting it is thinking in.
         if (MaxFullDistanceM > 0.0f)
         {
             HalfFull = FMath::Min(HalfFull, 0.5 * static_cast<double>(MaxFullDistanceM) * 100.0);

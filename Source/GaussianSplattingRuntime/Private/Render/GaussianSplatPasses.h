@@ -65,8 +65,14 @@ namespace GaussianSplatLod
     // budget multiplier: d_full = 2 x ComputeHalfFull(...) x m. Capping after the
     // multiplier would put the cap outside the bisection, so the budget would solve
     // an m the cap then silently overrides and the two would fight.
+    //
+    // Fix 7: bDetail scales the formula term by the detail controller's multiplier
+    // (FGaussianSplatStreamGate::GetDetailMultiplier), read HERE, before the floor and
+    // the cap, so a raise never passes a per-actor ceiling and the gate and the views
+    // cannot apply it differently. The gate passes true; a view passes whether the
+    // gate serves it, the condition its overflow clamp holds under.
     double ComputeHalfFull(double FocalPx, float PointSize, float SizeRef, double ActorScale,
-                           float MaxFullDistanceM = 0.0f);
+                           float MaxFullDistanceM = 0.0f, bool bDetail = false);
 
     // The selection's own take for one cell at a given full distance. Distance is
     // from the view origin (or, in the gate, from the group centre minus its

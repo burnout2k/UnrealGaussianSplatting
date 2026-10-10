@@ -151,6 +151,37 @@ namespace
         TEXT("same-route bracket with the controller on needs it 0 to pair tick for tick."),
         ECVF_RenderThreadSafe);
 
+    // Fix 7 iteration 2 (fix7-memory-brief.md): place memory. With the controller on, the 1,097 MiB
+    // drive dropped at a dense spot, left it, climbed again and re-entered the SAME spots at the same
+    // k -- every drop a pinning drop. `next/cap` is a lower bound over the cells already visited, so
+    // it under-prices exactly those spots, and the controller had no memory of where it was wrong.
+    TAutoConsoleVariable<int32> CVarCtlMemory(
+        TEXT("r.GaussianSplat.Ctl.Memory"),
+        1,
+        TEXT("1 (default): remember where the gate's pinning (m < 1) forced a step down and from which k, and\n")
+        TEXT("hold a raise back to that k while the ego is within Ctl.MemoryRadiusCm of it. 0: no memory, and\n")
+        TEXT("the records held are forgotten. Only acts while Ctl.Enable is on."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarCtlMemorySlots(
+        TEXT("r.GaussianSplat.Ctl.MemorySlots"),
+        32,
+        TEXT("Drop records kept; when a new one does not fit, the oldest goes."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<float> CVarCtlMemoryRadiusCm(
+        TEXT("r.GaussianSplat.Ctl.MemoryRadiusCm"),
+        15000.0f,
+        TEXT("World-XY distance from a drop record, centimetres, within which a raise to its k or above is held.\n")
+        TEXT("15000 = 150 m, the scale of the required set's radius at the shipped d_full."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarCtlMemoryTicks(
+        TEXT("r.GaussianSplat.Ctl.MemoryTicks"),
+        6000,
+        TEXT("Gate ticks a drop record lives, so a long drive forgets. 0 = never."),
+        ECVF_RenderThreadSafe);
+
     // A cell the look-ahead wants some tail of. Per cell for the same reason the
     // required set is: expanding to pages inside the walk was the gate's largest
     // single cost.
@@ -300,6 +331,19 @@ namespace
         TArray<int32> Bound;
         int32 Head = 0;
 
+        // Place memory: one record per pinning drop, oldest first, at most Ctl.MemorySlots -- a ring
+        // in effect, kept as a plain array because it is a few dozen entries scanned once per raise.
+        // NOT cleared by ResetWindow: a drop spends the window's evidence, not what it learned.
+        struct FDropRecord
+        {
+            FVector2D Where = FVector2D::ZeroVector;   // world XY of the first group's centre at the drop
+            float KFrom = 1.0f;                        // the multiplier the drop stepped down FROM
+            int32 Born = 0;                            // Ticks at the drop
+            bool bAnnounced = false;                   // its first hold has had its Display line
+        };
+        TArray<FDropRecord> Memory;
+        int32 Ticks = 0;               // controller ticks, the clock records age by
+
         void ResetWindow(int32 Window)
         {
             TickMs.Init(0.0f, Window);
@@ -362,12 +406,51 @@ namespace
         return Cycle;
     }
 
+    // Fix 7 place memory: whether a raise from Before to Next is held, because a pinning drop from Next
+    // or lower happened within RadiusCm (world XY) of Where. Each record that holds it says so once,
+    // the first time it does; after that only state 6 on the profile line shows the hold.
+    bool HoldRaiseByMemory(FDetailControl& Ctl, const FVector2D& Where, float Before, float Next, float RadiusCm)
+    {
+        // A record dropped from Next ITSELF must hold the raise back to Next, but k returns there through
+        // a divide and a multiply by Ctl.Step that float does not undo: 4.0 / 1.25 / 1.25 x 1.25 lands one
+        // ulp below 3.2f. Without the slack exactly the case this exists for slips through. 1e-4 is far
+        // below any step anyone would set.
+        constexpr float KSlack = 1.0e-4f;
+        const double RadiusSq = FMath::Square(static_cast<double>(RadiusCm));
+        bool bHold = false;
+        for (FDetailControl::FDropRecord& Record : Ctl.Memory)
+        {
+            const double DistSq = FVector2D::DistSquared(Record.Where, Where);
+            if (Record.KFrom > Next * (1.0f + KSlack) || DistSq > RadiusSq)
+            {
+                continue;
+            }
+            bHold = true;
+            if (!Record.bAnnounced)
+            {
+                Record.bAnnounced = true;
+                // Worded so that it never contains "detail control: k" -- the owner's report counts
+                // those lines as steps, and a held raise is not one.
+                UE_LOG(
+                    LogGaussianSplatStream,
+                    Display,
+                    TEXT("detail control: memory holds the raise k %.3f -> %.3f: a pinning drop from k %.3f at ")
+                    TEXT("(%.0f, %.0f) cm, %.0f m away (radius %.0f m), %d ticks ago; dwell kept"),
+                    Before, Next, Record.KFrom, Record.Where.X, Record.Where.Y, FMath::Sqrt(DistSq) / 100.0,
+                    RadiusCm / 100.0f, Ctl.Ticks - Record.Born);
+            }
+        }
+        return bHold;
+    }
+
     // Fix 7: the law, once per gate tick, after the fit and with this tick's stats filled. Where
     // each limit's number comes from: pre-fit demand one step up over capacity (DemandNextPages /
     // CapacityPages, 4d9d3ad); the gate's walk (CellsVisited); the views' own budget
     // (ReportViewSelection); the cycle (UpdateCycleLimb). The first three are functions of the
-    // pose history and reproduce on a same-route bracket; the cycle does not.
-    void RunDetailControl(FGaussianSplatGateStats& Stats, double TickStart, float Published)
+    // pose history and reproduce on a same-route bracket; the cycle does not. Place memory
+    // (HoldRaiseByMemory) is a function of the pose history too: Centre is where a drop is recorded
+    // and a raise is checked.
+    void RunDetailControl(FGaussianSplatGateStats& Stats, double TickStart, float Published, const FVector& Centre)
     {
         FDetailControl& Ctl = GDetailControl;
         const int32 Window = FMath::Clamp(CVarCtlWindowTicks.GetValueOnAnyThread(), 1, 3600);
@@ -376,6 +459,34 @@ namespace
             Ctl.ResetWindow(Window);
         }
         DrainViewReports(Ctl);
+
+        // Place memory upkeep, before anything reads the records. Off means off, like the cycle limb:
+        // nothing held, and nothing stale left for when it comes back on.
+        ++Ctl.Ticks;
+        const bool bMemory = CVarCtlMemory.GetValueOnAnyThread() != 0;
+        const int32 MemorySlots = FMath::Clamp(CVarCtlMemorySlots.GetValueOnAnyThread(), 0, 1024);
+        const int32 MemoryTicks = FMath::Max(0, CVarCtlMemoryTicks.GetValueOnAnyThread());
+        const float MemoryRadiusCm = FMath::Max(0.0f, CVarCtlMemoryRadiusCm.GetValueOnAnyThread());
+        if (!bMemory)
+        {
+            Ctl.Memory.Reset();
+        }
+        else
+        {
+            if (MemoryTicks > 0)
+            {
+                Ctl.Memory.RemoveAll([&Ctl, MemoryTicks](const FDetailControl::FDropRecord& Record)
+                {
+                    return Ctl.Ticks - Record.Born >= MemoryTicks;
+                });
+            }
+            // Ctl.MemorySlots lowered at run time: the oldest go (RemoveAll keeps the order).
+            if (Ctl.Memory.Num() > MemorySlots)
+            {
+                Ctl.Memory.RemoveAt(0, Ctl.Memory.Num() - MemorySlots);
+            }
+        }
+        const FVector2D Where(Centre.X, Centre.Y);
 
         const int32 Slot = Ctl.Head;
         Ctl.Head = (Ctl.Head + 1) % Window;
@@ -470,6 +581,18 @@ namespace
                     Display,
                     TEXT("detail control: k %.3f -> %.3f DOWN, bound: %s; no step up for %d ticks"),
                     Before, Ctl.Multiplier, *Reason, Ctl.Lockout);
+
+                // Place memory: only a PINNING drop is a fact about this place -- the pool could not
+                // hold its required set at Before here. A drop on the cycle rule alone is about the
+                // frame, and is not recorded. A drop at Min is not a step, and records nothing either.
+                if (bPinnedDrop && bMemory && MemorySlots > 0)
+                {
+                    if (Ctl.Memory.Num() >= MemorySlots)
+                    {
+                        Ctl.Memory.RemoveAt(0, Ctl.Memory.Num() - MemorySlots + 1);
+                    }
+                    Ctl.Memory.Add({Where, Before, Ctl.Ticks, false});
+                }
             }
             else
             {
@@ -480,9 +603,17 @@ namespace
         else
         {
             Ctl.Dwell = bClear ? FMath::Min(Ctl.Dwell + 1, DwellTicks) : 0;
-            if (!bLocked && bClear && Ctl.Dwell >= DwellTicks && Before < MaxK)
+            const bool bRaiseDue = !bLocked && bClear && Ctl.Dwell >= DwellTicks && Before < MaxK;
+            const float Next = FMath::Min(MaxK, Before * Step);
+            if (bRaiseDue && bMemory && HoldRaiseByMemory(Ctl, Where, Before, Next, MemoryRadiusCm))
             {
-                Ctl.Multiplier = FMath::Min(MaxK, Before * Step);
+                // Held. The dwell is NOT reset: it stays full, so the raise fires on the first tick the
+                // ego is outside every record that holds it -- if every limit is still clear then.
+                State = 6;
+            }
+            else if (bRaiseDue)
+            {
+                Ctl.Multiplier = Next;
                 Ctl.Dwell = 0;
                 State = 3;
                 const FString CycleText = bUseCycle
@@ -510,6 +641,7 @@ namespace
         Stats.CtlCycleMs = Cycle.MaxMs;
         Stats.CtlState = State;
         Stats.CtlBudgetBoundViews = Ctl.BoundViews;
+        Stats.CtlMemoryRecords = Ctl.Memory.Num();
     }
 }
 
@@ -595,7 +727,8 @@ void FGaussianSplatStreamGate::UnregisterWorld(UWorld* World)
         GTickFunctions.Remove(World);
     }
 
-    // Fix 7: a new map starts the detail controller from shipped, and a load is not a cycle.
+    // Fix 7: a new map starts the detail controller from shipped, with no place memory (the records
+    // are the old map's places), and a load is not a cycle.
     GDetailControl = FDetailControl();
 
     FScopeLock Lock(&StampLock);
@@ -691,9 +824,9 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     ++TickNumber;
 
     // Fix 7: publish the detail multiplier FIRST, before the required set is built (see
-    // GDetailMultiplier for the ordering). With Ctl.Enable 0 it is 1.0, and HalfFull x 1.0 is
-    // exact in IEEE arithmetic, so every walk radius, take and page count below is bit-identical
-    // to the gate without the controller.
+    // GDetailMultiplier for the ordering); ComputeHalfFull reads it back below, on this thread. With
+    // Ctl.Enable 0 it is 1.0, and the formula x 1.0 is exact in IEEE arithmetic, so every walk
+    // radius, take and page count below is bit-identical to the gate without the controller.
     const bool bDetailControl = CVarCtlEnable.GetValueOnAnyThread() != 0;
     float DetailMultiplier = 1.0f;
     if (bDetailControl)
@@ -776,12 +909,13 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
 
         for (const FGaussianSplatGateGroup& Group : Groups)
         {
-            // Fix 7: times the detail multiplier, AFTER ComputeHalfFull's floor and per-actor cap --
-            // the same point the views apply it (SelectCellsScreen), and the side of the cap the
-            // overflow multiplier sits on. The walk radius, the required and wanted takes and
-            // PagesAt all derive from this one value, so scaling it here covers the whole gate.
+            // Fix 7: ComputeHalfFull applies the detail multiplier itself (bDetail true: every
+            // component here is paged and streamed), before its floor and per-actor cap -- the one
+            // place the views apply it too (SelectCellsScreen), so a raise respects the cap in both.
+            // The walk radius, the required and wanted takes and PagesAt all derive from this one
+            // value, so it covers the whole gate.
             const double HalfFull = GaussianSplatLod::ComputeHalfFull(
-                Group.MaxFocalPx, PointSize, Asset->SizeRef, ActorScale, MaxFullDistanceM) * DetailMultiplier;
+                Group.MaxFocalPx, PointSize, Asset->SizeRef, ActorScale, MaxFullDistanceM, true);
 
             // Beyond this distance every cell is floor-only, so there is nothing to
             // visit: keep > R_c needs 4 (HalfFull/d)^2 > MinFraction (review M4).
@@ -1286,7 +1420,11 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     // the views' reports and forgets its state, so a later Enable starts from shipped.
     if (bDetailControl)
     {
-        RunDetailControl(Stats, StartTime, DetailMultiplier);
+        // Place memory locates a tick by ONE point, the first group's centre -- what the walk measures
+        // from. With several egos that is the first one's only; one point is what a record can hold.
+        // With no group there is no view, the controller waits, and the zero vector is never used.
+        const FVector MemoryCentre = Groups.IsEmpty() ? FVector::ZeroVector : Groups[0].Centre;
+        RunDetailControl(Stats, StartTime, DetailMultiplier, MemoryCentre);
     }
     else
     {
