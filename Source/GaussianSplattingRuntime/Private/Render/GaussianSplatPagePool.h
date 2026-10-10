@@ -135,6 +135,14 @@ struct FGaussianSplatStreamPlan
     TArray<FGaussianSplatStreamPage> Upload;
     int32 RequiredUploads = 0;
 
+    // Fix 7 iteration 4 (r.GaussianSplat.Ctl.PreRaise): the PreRaiseUploads entries right after the
+    // required ones are a pending raise's prefetch. They are wanted, not required -- they count
+    // against the prefetch cap like any wanted page, never against the required one, and are never
+    // `short` -- but they spend it first and stop at PreRaiseCapBytes, so the look-ahead that follows
+    // gets what is left. 0 = nothing pending, and the loop is exactly what it was.
+    int32 PreRaiseUploads = 0;
+    int64 PreRaiseCapBytes = 0;
+
     // The overflow multiplier the gate solved, for the stats line. 1.0 = the
     // required set fitted and the overflow path did not engage.
     float OverflowMultiplier = 1.0f;
@@ -155,6 +163,10 @@ struct FGaussianSplatStreamStats
     // shows up as upload time, never as a wrong picture, so nothing else would
     // report it (review M5).
     int32 ThrashCount = 0;
+
+    // Fix 7 iteration 4: of PagesUploaded, a pending raise's prefetch (Plan.PreRaiseUploads). The gate
+    // sums it over the pending ticks for the commit line.
+    int32 PagesPreRaiseUploaded = 0;
 
     // Carried through for the stats line; the pool does not act on it.
     float OverflowMultiplierUnused = 1.0f;
@@ -189,6 +201,11 @@ public:
 
     // How many pages are free right now, which is what the gate fits against.
     int32 GetFreePageCount() const;
+
+    // r.GaussianSplat.Stream.MaxUploadMBPerTick in bytes: the prefetch cap ApplyStreamPlan applies.
+    // Fix 7 iteration 4: public so the gate sizes the evictions a pending raise's prefetch needs
+    // against the cap the pool will actually apply, rather than a second copy of it.
+    static int64 GetPrefetchCapBytes();
 
     const FGaussianSplatStreamStats& GetLastStreamStats() const { return LastStreamStats; }
 

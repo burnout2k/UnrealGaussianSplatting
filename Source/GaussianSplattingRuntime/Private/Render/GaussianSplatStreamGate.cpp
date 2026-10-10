@@ -219,6 +219,35 @@ namespace
         TEXT("The line: thread and GPU frame times, the tick's own cycle, gate ms, and that tick's uploads."),
         ECVF_RenderThreadSafe);
 
+    // Fix 7 iteration 4 (fix7-preraise-brief.md): a raise prefetches first and commits when resident. With
+    // the trace on (ckptG-1011-0010, tr_on) every step up had one shape: the first gate tick at the new k
+    // required every tail page of the larger set at once -- 49.6-108.8 MiB, 1,160 pages at the worst, in ONE
+    // tick, bounded only by Stream.MaxRequiredUploadMBPerTick -- and the render thread paid for applying that
+    // burst a frame later (rt +10..+38 ms, gpu flat). Steps down upload nothing and cost nothing.
+    TAutoConsoleVariable<int32> CVarCtlPreRaise(
+        TEXT("r.GaussianSplat.Ctl.PreRaise"),
+        1,
+        TEXT("1 (default): a due raise first prefetches the pages the candidate k needs at the current pose, at\n")
+        TEXT("most Ctl.PreRaiseMBPerTick a tick, while the views keep drawing at the current k, and commits on the\n")
+        TEXT("first tick they are all resident and every limit is still clear. 0: commit the tick the raise is due,\n")
+        TEXT("as iteration 3 did, for A/B. Only acts while Ctl.Enable is on."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarCtlPreRaiseMBPerTick(
+        TEXT("r.GaussianSplat.Ctl.PreRaiseMBPerTick"),
+        16,
+        TEXT("Byte cap per gate tick on a pending raise's prefetch, MiB. It is spent first, out of\n")
+        TEXT("Stream.MaxUploadMBPerTick, and the look-ahead gets what is left. 32 MiB a tick saturated measured\n")
+        TEXT("+9.6 ms on the cycle; 16 is meant to keep a prefetch tick near +5. 0 = only Stream.MaxUploadMBPerTick."),
+        ECVF_RenderThreadSafe);
+
+    TAutoConsoleVariable<int32> CVarCtlPreRaiseMaxTicks(
+        TEXT("r.GaussianSplat.Ctl.PreRaiseMaxTicks"),
+        120,
+        TEXT("Gate ticks a pending raise may prefetch before it is abandoned (k unchanged, dwell restarted), and the\n")
+        TEXT("longest run of consecutive ticks it may wait through a fill. At least 1."),
+        ECVF_RenderThreadSafe);
+
     // A cell the look-ahead wants some tail of. Per cell for the same reason the
     // required set is: expanding to pages inside the walk was the gate's largest
     // single cost.
@@ -265,6 +294,19 @@ namespace
     // probe 0, so PagesAt prices it exactly as it prices the required set and `ahead` and `next`
     // cannot disagree on what a cell costs. Its own list, never merged into RequiredCells (D9).
     using FAheadCell = FRequiredCell;
+
+    // Fix 7 iteration 4: one cell a pending raise prefetches -- its tail pages [FromPage, Pages) at the
+    // CURRENT pose, past the ones the required set holds. Per cell, like the look-ahead, for the same
+    // reason, and expanded to pages once, after the walk.
+    struct FPreRaiseCell
+    {
+        const UGaussianSplatPagedAsset* Asset = nullptr;
+        int32 CellIndex = 0;
+        int32 FirstTailPage = 0;
+        int32 FromPage = 0;         // the required take's tail pages: where the candidate's extra starts
+        int32 Pages = 0;            // the candidate's tail pages
+        double Distance = 0.0;      // probe 0's, as the required set measures it; the prefetch order
+    };
 
     // One page of a cell, named the way the pool names it.
     struct FWantedPage
@@ -394,6 +436,15 @@ namespace
         int32 TraceLeft = 0;           // gate ticks still to log, the current one included; 0 = not armed
         int32 TraceSince = 0;          // gate ticks since the step that armed it: the line's step+N
 
+        // Ctl.PreRaise (iteration 4): a raise in flight. Pending is the candidate k while the gate prefetches
+        // its pages -- the walk prices it; the views and the required set stay at Multiplier -- and 0 when
+        // none is. Cleared by its commit, its abandon and every reset (a fresh struct has none).
+        float Pending = 0.0f;
+        int32 PendingSince = 0;        // Ticks on the tick it was set, so Ticks - PendingSince is its age
+        int32 PendingTicks = 0;        // pending ticks the law judged it on; waits are not counted, as for dwell
+        int32 PendingWaitTicks = 0;    // consecutive pending ticks spent waiting (a fill, or no view drawing)
+        int32 PendingUploaded = 0;     // pre-raise pages the pool uploaded since it was set
+
         void ResetWindow(int32 Window)
         {
             TickMs.Init(0.0f, Window);
@@ -511,6 +562,35 @@ namespace
         GaussianSplatProfiling::ForceProfileLineUntil(GFrameCounter + static_cast<uint64>(TraceTicks));
     }
 
+    // Fix 7 iteration 4: one tail page in MiB, for the pre-raise lines. The pool uploads a page whole.
+    constexpr double PreRaisePageMiB =
+        static_cast<double>(FGaussianSplatPagePool::SlotsPerPage * FGaussianSplatPagePool::BytesPerSlot)
+        / (1024.0 * 1024.0);
+
+    // Fix 7 iteration 4: forget a pending raise -- after its commit, or as the abandon below.
+    void ClearPreRaise(FDetailControl& Ctl)
+    {
+        Ctl.Pending = 0.0f;
+        Ctl.PendingSince = 0;
+        Ctl.PendingTicks = 0;
+        Ctl.PendingWaitTicks = 0;
+        Ctl.PendingUploaded = 0;
+    }
+
+    // Fix 7 iteration 4: give a pending raise up. k does not move and no lockout starts -- nothing failed
+    // at the published k -- but the dwell restarts, so another try needs a full clear window first. Worded
+    // so that it never contains "detail control: k", like the memory hold's line: it is not a step.
+    void AbandonPreRaise(FDetailControl& Ctl, const FString& Why)
+    {
+        UE_LOG(
+            LogGaussianSplatStream,
+            Display,
+            TEXT("detail control: pre-raise toward k %.3f abandoned after %d ticks: %s"),
+            Ctl.Pending, Ctl.Ticks - Ctl.PendingSince, *Why);
+        ClearPreRaise(Ctl);
+        Ctl.Dwell = 0;
+    }
+
     // Fix 7: the law, once per gate tick, after the fit and with this tick's stats filled. Where
     // each limit's number comes from: pre-fit demand one step up over capacity (DemandNextPages /
     // CapacityPages, 4d9d3ad) and, with Ctl.LookAhead, the same around the furthest look-ahead pose
@@ -518,8 +598,12 @@ namespace
     // (ReportViewSelection); the cycle (UpdateCycleLimb). The first three are functions of the
     // pose history and reproduce on a same-route bracket; the cycle does not. Place memory
     // (HoldRaiseByMemory) is a function of the pose history too: Centre is where a drop is recorded
-    // and a raise is checked.
-    void RunDetailControl(FGaussianSplatGateStats& Stats, double TickStart, float Published, const FVector& Centre)
+    // and a raise is checked. Iteration 4: bPreRaise is Ctl.PreRaise, read once by RunGate, and
+    // PreRaiseCapBytes the pending raise's per-tick prefetch cap, for its start line. A pending raise is
+    // judged on Stats.PreRaiseMissing, which this tick's walk priced at the candidate k.
+    void RunDetailControl(
+        FGaussianSplatGateStats& Stats, double TickStart, float Published, const FVector& Centre, bool bPreRaise,
+        int64 PreRaiseCapBytes)
     {
         FDetailControl& Ctl = GDetailControl;
         const int32 Window = FMath::Clamp(CVarCtlWindowTicks.GetValueOnAnyThread(), 1, 3600);
@@ -596,6 +680,8 @@ namespace
         const int32 PinnedDropCount = FMath::Max(1, CVarCtlPinnedDropCount.GetValueOnAnyThread());
         const bool bLookAhead = CVarCtlLookAhead.GetValueOnAnyThread() != 0;
         const float AheadDropRatio = CVarCtlAheadDropRatio.GetValueOnAnyThread();
+        // Iteration 4: at least 1, so a pending raise always gets one tick it can commit on.
+        const int32 PreRaiseMaxTicks = FMath::Max(1, CVarCtlPreRaiseMaxTicks.GetValueOnAnyThread());
 
         // Pages over the capacity; no capacity reads as "does not fit".
         const auto OverCapacity = [&Stats](int32 Pages) -> double
@@ -639,12 +725,44 @@ namespace
         bool bDropRuleFired = false;
         uint8 State = bLocked ? 5 : 1;
 
+        // Iteration 4: a pending raise's start line, on its first tick after the one that set it -- that
+        // tick's walk ran before the law did, so this is the first walk that priced the candidate. Logged
+        // ahead of the law, so it precedes whatever this tick decides about the raise.
+        if (Ctl.Pending > 0.0f && Ctl.Ticks - Ctl.PendingSince == 1)
+        {
+            UE_LOG(
+                LogGaussianSplatStream,
+                Display,
+                TEXT("detail control: pre-raise toward k %.3f from %.3f: %d pages (%.1f MiB) to prefetch at <= %d MiB ")
+                TEXT("per tick"),
+                Ctl.Pending, Before, Stats.PreRaiseMissing, Stats.PreRaiseMissing * PreRaisePageMiB,
+                static_cast<int32>(PreRaiseCapBytes / (1024 * 1024)));
+        }
+
         if (bWait)
         {
             // Hold. The windows above still advanced, so the evidence keeps accumulating.
+            // Iteration 4: a pending raise holds too, as the dwell does -- a fill is not evidence against
+            // it -- but not for ever: a run of waits longer than Ctl.PreRaiseMaxTicks abandons it.
+            if (Ctl.Pending > 0.0f)
+            {
+                ++Ctl.PendingWaitTicks;
+                if (Ctl.PendingWaitTicks > PreRaiseMaxTicks)
+                {
+                    AbandonPreRaise(Ctl, FString::Printf(TEXT("%s for %d consecutive ticks (Ctl.PreRaiseMaxTicks %d)"),
+                        Ctl.MissedViews > 0 ? TEXT("a fill in progress (a view missed)") : TEXT("no view drawing"),
+                        Ctl.PendingWaitTicks, PreRaiseMaxTicks));
+                }
+            }
         }
         else if (bCycleDrop || bPinnedDrop || bAheadDrop)
         {
+            // Iteration 4: a drop rule wins over a pending raise. Abandoned first, so its line precedes the
+            // step's; the step itself is exactly iteration 3's.
+            if (Ctl.Pending > 0.0f)
+            {
+                AbandonPreRaise(Ctl, TEXT("a drop rule fired"));
+            }
             bDropRuleFired = true;
             Ctl.Multiplier = FMath::Max(MinK, Before / Step);
             Ctl.Dwell = 0;
@@ -708,15 +826,121 @@ namespace
             Ctl.Dwell = bClear ? FMath::Min(Ctl.Dwell + 1, DwellTicks) : 0;
             const bool bRaiseDue = !bLocked && bClear && Ctl.Dwell >= DwellTicks && Before < MaxK;
             const float Next = FMath::Min(MaxK, Before * Step);
-            if (bRaiseDue && bMemory && HoldRaiseByMemory(Ctl, Where, Before, Next, MemoryRadiusCm))
+            // Iteration 4: the raise this tick takes, if any -- Next when it is taken the tick it is due
+            // (Ctl.PreRaise 0, iteration 3's rule), a pending raise's candidate when that commits -- and the
+            // clause the commit appends to the UP line. Empty, the line is iteration 3's to the character.
+            bool bTakeRaise = false;
+            float RaiseTo = Next;
+            FString CommitText;
+            if (Ctl.Pending > 0.0f)
+            {
+                // Phase 2: commit, prefetch on, or abandon. Still due is the entry rule without the dwell,
+                // which a clear tick keeps full anyway: every limit clear, no lockout, k below Ctl.Max and
+                // still below the candidate (both move only if a CVar does).
+                ++Ctl.PendingTicks;
+                Ctl.PendingWaitTicks = 0;
+                FString Why;
+                if (!bClear)
+                {
+                    FString Failed;
+                    const auto Fail = [&Failed](const FString& Limb)
+                    {
+                        if (!Failed.IsEmpty())
+                        {
+                            Failed += TEXT(", ");
+                        }
+                        Failed += Limb;
+                    };
+                    if (!bCycleClear)
+                    {
+                        Fail(FString::Printf(TEXT("cycle max %.1f >= %.1f ms"), Cycle.MaxMs, TargetMs));
+                    }
+                    if (!bDemandClear)
+                    {
+                        Fail(bLookAhead
+                            ? FString::Printf(TEXT("max(next, ahead)/cap %.3f >= %.2f"), RaiseRatio, Ceiling)
+                            : FString::Printf(TEXT("next/cap %.3f >= %.2f"), DemandRatio, Ceiling));
+                    }
+                    if (!bCellsClear)
+                    {
+                        Fail(FString::Printf(TEXT("cells %d >= %d"), Stats.CellsVisited, MaxCells));
+                    }
+                    if (!bBudgetClear)
+                    {
+                        Fail(FString::Printf(TEXT("a budget-bound view in %d of %d ticks"), BoundTicks, Window));
+                    }
+                    Why = FString::Printf(TEXT("a limit is no longer clear: %s"), *Failed);
+                }
+                else if (bLocked)
+                {
+                    Why = TEXT("a lockout began");
+                }
+                else if (Before >= MaxK || Ctl.Pending <= Before)
+                {
+                    Why = FString::Printf(TEXT("k %.3f is no longer below it (Ctl.Max %.3f)"), Before, MaxK);
+                }
+                else if (Stats.PreRaiseMissing == 0
+                    && !(bMemory && HoldRaiseByMemory(Ctl, Where, Before, Ctl.Pending, MemoryRadiusCm)))
+                {
+                    // Every page the candidate needs here is resident: the required set the commit makes is
+                    // already in the pool, so the first tick at the new k uploads only what one tick of
+                    // driving adds -- the burst this exists to remove.
+                    bTakeRaise = true;
+                    RaiseTo = Ctl.Pending;
+                    CommitText = FString::Printf(
+                        TEXT("; committed after %d ticks of prefetch (%d pages, %.1f MiB)"),
+                        Ctl.Ticks - Ctl.PendingSince, Ctl.PendingUploaded, Ctl.PendingUploaded * PreRaisePageMiB);
+                    ClearPreRaise(Ctl);
+                }
+                else if (Ctl.PendingTicks >= PreRaiseMaxTicks)
+                {
+                    Why = Stats.PreRaiseMissing > 0
+                        ? FString::Printf(
+                            TEXT("%d of %d pages still not resident after %d ticks of prefetch (Ctl.PreRaiseMaxTicks %d)"),
+                            Stats.PreRaiseMissing, Stats.PreRaisePages, Ctl.PendingTicks, PreRaiseMaxTicks)
+                        : FString::Printf(
+                            TEXT("place memory held the commit through %d ticks (Ctl.PreRaiseMaxTicks %d)"),
+                            Ctl.PendingTicks, PreRaiseMaxTicks);
+                }
+                if (!Why.IsEmpty())
+                {
+                    AbandonPreRaise(Ctl, Why);
+                    if (!bLocked)
+                    {
+                        State = (bClear && Before < MaxK) ? 2 : 1;
+                    }
+                }
+            }
+            else if (bRaiseDue && bMemory && HoldRaiseByMemory(Ctl, Where, Before, Next, MemoryRadiusCm))
             {
                 // Held. The dwell is NOT reset: it stays full, so the raise fires on the first tick the
                 // ego is outside every record that holds it -- if every limit is still clear then.
                 State = 6;
             }
+            else if (bRaiseDue && bPreRaise)
+            {
+                // Phase 1. k does not move: the next walks price Next as well, prefetch its extra pages at
+                // Ctl.PreRaiseMBPerTick, and Phase 2 commits once they are resident. Its line comes next
+                // tick, with that walk's numbers. The trace is armed here, so the prefetch is in its window.
+                Ctl.Pending = Next;
+                Ctl.PendingSince = Ctl.Ticks;
+                Ctl.PendingTicks = 0;
+                Ctl.PendingWaitTicks = 0;
+                Ctl.PendingUploaded = 0;
+                ArmDetailTrace(Ctl);
+            }
             else if (bRaiseDue)
             {
-                Ctl.Multiplier = Next;
+                bTakeRaise = true;
+            }
+            else if (!bLocked)
+            {
+                State = (bClear && Before < MaxK) ? 2 : 1;
+            }
+
+            if (bTakeRaise)
+            {
+                Ctl.Multiplier = RaiseTo;
                 Ctl.Dwell = 0;
                 State = 3;
                 const FString CycleText = bUseCycle
@@ -731,15 +955,17 @@ namespace
                     LogGaussianSplatStream,
                     Display,
                     TEXT("detail control: k %.3f -> %.3f UP, every limit clear for %d ticks: %s, %s, ")
-                    TEXT("cells %d < %d, no budget-bound view in %d ticks"),
+                    TEXT("cells %d < %d, no budget-bound view in %d ticks%s"),
                     Before, Ctl.Multiplier, DwellTicks, *CycleText, *DemandText,
-                    Stats.CellsVisited, MaxCells, Window);
+                    Stats.CellsVisited, MaxCells, Window, *CommitText);
                 ArmDetailTrace(Ctl);
             }
-            else if (!bLocked)
-            {
-                State = (bClear && Before < MaxK) ? 2 : 1;
-            }
+        }
+        // Iteration 4: a raise still pending at the end of the law -- set this tick, prefetching, or holding
+        // through a wait -- shows as 7, whatever the branch above left.
+        if (Ctl.Pending > 0.0f)
+        {
+            State = 7;
         }
         if (!bDropRuleFired && Ctl.Lockout > 0)
         {
@@ -838,7 +1064,12 @@ void FGaussianSplatStreamGate::UnregisterWorld(UWorld* World)
     }
 
     // Fix 7: a new map starts the detail controller from shipped, with no place memory (the records
-    // are the old map's places), and a load is not a cycle.
+    // are the old map's places), and a load is not a cycle. Iteration 4: a raise pending across it is
+    // abandoned with it, and said so; the fresh struct has none.
+    if (GDetailControl.Pending > 0.0f)
+    {
+        AbandonPreRaise(GDetailControl, TEXT("the world was torn down"));
+    }
     GDetailControl = FDetailControl();
 
     FScopeLock Lock(&StampLock);
@@ -934,11 +1165,20 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     ++TickNumber;
 
     // Fix 7: publish the detail multiplier FIRST, before the required set is built (see
-    // GDetailMultiplier for the ordering); ComputeHalfFull reads it back below, on this thread. With
-    // Ctl.Enable 0 it is 1.0, and the formula x 1.0 is exact in IEEE arithmetic, so every walk
-    // radius, take and page count below is bit-identical to the gate without the controller.
+    // GDetailMultiplier for the ordering); ComputeHalfFullAt is handed the same value below, on this
+    // thread. With Ctl.Enable 0 it is 1.0, and the formula x 1.0 is exact in IEEE arithmetic, so every
+    // walk radius, take and page count below is bit-identical to the gate without the controller.
     const bool bDetailControl = CVarCtlEnable.GetValueOnAnyThread() != 0;
     float DetailMultiplier = 1.0f;
+    // Fix 7 iteration 4 (Ctl.PreRaise): while a raise is pending, the WALK prices its candidate k as well,
+    // to prefetch the pages the commit will require; the views, the required set and every limb stay at
+    // the published k. bPreRaiseWalk false -- always, unless a raise is pending -- keeps every line below
+    // on iteration 3's path. Ctl.PreRaise and Ctl.PreRaiseMBPerTick are read here, once per tick and only
+    // while the controller runs; Ctl.PreRaiseMaxTicks by the law.
+    float WalkMultiplier = 1.0f;
+    bool bPreRaiseWalk = false;
+    bool bPreRaise = false;
+    int64 PreRaiseCapBytes = 0;
     if (bDetailControl)
     {
         float MinK = 1.0f;
@@ -946,6 +1186,26 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
         GetDetailLimits(MinK, MaxK);
         GDetailControl.Multiplier = FMath::Clamp(GDetailControl.Multiplier, MinK, MaxK);
         DetailMultiplier = GDetailControl.Multiplier;
+
+        bPreRaise = CVarCtlPreRaise.GetValueOnAnyThread() != 0;
+        if (GDetailControl.Pending > 0.0f && !bPreRaise)
+        {
+            // Switched to 0 mid-raise: iteration 3 from this tick on, with nothing pending carried into it.
+            AbandonPreRaise(GDetailControl, TEXT("Ctl.PreRaise is 0"));
+        }
+        else if (GDetailControl.Pending > 0.0f)
+        {
+            GDetailControl.Pending = FMath::Clamp(GDetailControl.Pending, MinK, MaxK);
+            WalkMultiplier = GDetailControl.Pending;
+            bPreRaiseWalk = WalkMultiplier > DetailMultiplier;
+            // Ctl.PreRaiseMBPerTick inside the pool's own prefetch cap, which ApplyStreamPlan applies too;
+            // this is the effective number the evictions below make room for and the start line prints.
+            const int64 PrefetchCapBytes = FGaussianSplatPagePool::GetPrefetchCapBytes();
+            const int32 PreRaiseMB = CVarCtlPreRaiseMBPerTick.GetValueOnAnyThread();
+            PreRaiseCapBytes = PreRaiseMB > 0
+                ? FMath::Min(PrefetchCapBytes, static_cast<int64>(PreRaiseMB) * 1024 * 1024)
+                : PrefetchCapBytes;
+        }
     }
     GDetailMultiplier.store(DetailMultiplier, std::memory_order_relaxed);
 
@@ -988,6 +1248,9 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     // Filled only while Ctl.Enable is on, and keyed like RequiredCellIndex for the same reason.
     TArray<FAheadCell> AheadCells;
     TMap<uint64, int32> AheadCellIndex;
+    // Fix 7 iteration 4: a pending raise's prefetch cells, keyed the same way. Empty unless one is pending.
+    TArray<FPreRaiseCell> PreRaiseCells;
+    TMap<uint64, int32> PreRaiseCellIndex;
 
     const auto PageKey = [](const UGaussianSplatPagedAsset* Asset, int32 GlobalPage) -> uint64
     {
@@ -1026,13 +1289,21 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
 
         for (const FGaussianSplatGateGroup& Group : Groups)
         {
-            // Fix 7: ComputeHalfFull applies the detail multiplier itself (bDetail true: every
+            // Fix 7: ComputeHalfFullAt applies the detail multiplier itself (the published k: every
             // component here is paged and streamed), before its floor and per-actor cap -- the one
             // place the views apply it too (SelectCellsScreen), so a raise respects the cap in both.
-            // The walk radius, the required and wanted takes and PagesAt all derive from this one
-            // value, so it covers the whole gate.
-            const double HalfFull = GaussianSplatLod::ComputeHalfFull(
-                Group.MaxFocalPx, PointSize, Asset->SizeRef, ActorScale, MaxFullDistanceM, true);
+            // The required and wanted takes, the look-ahead pricing and PagesAt all derive from this
+            // one value -- and, unless a raise is pending, the walk radius too.
+            const double HalfFullDraw = GaussianSplatLod::ComputeHalfFullAt(
+                Group.MaxFocalPx, PointSize, Asset->SizeRef, ActorScale, MaxFullDistanceM, DetailMultiplier);
+            // Fix 7 iteration 4: the pending raise's candidate, the same function at the candidate k. Only
+            // the walk's reach and the pre-raise pages use it. The function is monotone in k and the
+            // candidate is above the published k whenever bPreRaiseWalk, so the Max is a guard, not a
+            // clamp: the walk can never come out smaller than the published k's.
+            const double HalfFullWalk = bPreRaiseWalk
+                ? FMath::Max(HalfFullDraw, GaussianSplatLod::ComputeHalfFullAt(
+                    Group.MaxFocalPx, PointSize, Asset->SizeRef, ActorScale, MaxFullDistanceM, WalkMultiplier))
+                : HalfFullDraw;
 
             // Beyond this distance every cell is floor-only, so there is nothing to
             // visit: keep > R_c needs 4 (HalfFull/d)^2 > MinFraction (review M4).
@@ -1049,8 +1320,15 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
             // the picture was quietly used as a "full detail" reference for a day.
             const bool bAboveBakedFloor = MinFraction > BakedFloor + UE_SMALL_NUMBER;
             const double FloorRadius = (MinFraction > 0.0f && !bAboveBakedFloor)
-                ? HalfFull * 2.0 / FMath::Sqrt(static_cast<double>(MinFraction))
+                ? HalfFullDraw * 2.0 / FMath::Sqrt(static_cast<double>(MinFraction))
                 : TNumericLimits<double>::Max() * 0.5;
+            // Fix 7 iteration 4: the walk's floor radius, the same expression at HalfFullWalk -- FloorRadius
+            // itself unless a raise is pending. FloorRadius stays the published k's for the look-ahead price.
+            const double FloorRadiusWalk = !bPreRaiseWalk
+                ? FloorRadius
+                : (MinFraction > 0.0f && !bAboveBakedFloor)
+                    ? HalfFullWalk * 2.0 / FMath::Sqrt(static_cast<double>(MinFraction))
+                    : TNumericLimits<double>::Max() * 0.5;
             // This path makes the gate walk the whole asset every tick, and on a scene larger
             // than the pool the overflow multiplier will thin it. Both are visible in the
             // stats -- which is the point; the silence is what cost a day. The condition is a
@@ -1123,41 +1401,60 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
             // the probe path with Reach near DBL_MAX used to hit a `continue` here and walk
             // NOTHING for the asset: req 0, floor-only, misses everywhere, while the log said
             // the opposite. That is the whole-asset path the old comment asked for.
-            const double Reach = FloorRadius + Group.Radius;
-            const bool bWholeAsset = bAboveBakedFloor || !(Reach < TNumericLimits<double>::Max() * 0.25);
+            //
+            // Fix 7 iteration 4: a lambda, because a pending raise needs two boxes -- the walk's, at the
+            // candidate's floor radius, and the published k's, which is the walk itself otherwise. Only the
+            // pre-raise pages come from cells outside the second; every other count and set below is taken
+            // inside it, so they are exactly iteration 3's cells.
+            const auto WalkBox = [&](double Radius, FIntVector& OutLo, FIntVector& OutHi)
+            {
+                const double Reach = Radius + Group.Radius;
+                const bool bWholeAsset = bAboveBakedFloor || !(Reach < TNumericLimits<double>::Max() * 0.25);
 
-            FIntVector Lo(MAX_int32, MAX_int32, MAX_int32);
-            FIntVector Hi(MIN_int32, MIN_int32, MIN_int32);
-            if (bWholeAsset)
-            {
-                Lo = Asset->GetCoordMin();
-                Hi = Asset->GetCoordMax();
-            }
-            else
-            {
-                const double LocalReach = Reach / FMath::Max(ActorScale, UE_SMALL_NUMBER);
-                for (const FProbe& Probe : Probes)
+                OutLo = FIntVector(MAX_int32, MAX_int32, MAX_int32);
+                OutHi = FIntVector(MIN_int32, MIN_int32, MIN_int32);
+                if (bWholeAsset)
                 {
-                    const FVector LocalCentre = WorldToLocal.TransformPosition(Probe.Centre);
-                    const FIntVector BoxMin(
-                        FMath::FloorToInt((LocalCentre.X - LocalReach) / CellSize),
-                        FMath::FloorToInt((LocalCentre.Y - LocalReach) / CellSize),
-                        FMath::FloorToInt((LocalCentre.Z - LocalReach) / CellSize));
-                    const FIntVector BoxMax(
-                        FMath::FloorToInt((LocalCentre.X + LocalReach) / CellSize),
-                        FMath::FloorToInt((LocalCentre.Y + LocalReach) / CellSize),
-                        FMath::FloorToInt((LocalCentre.Z + LocalReach) / CellSize));
-                    Lo = FIntVector(FMath::Min(Lo.X, BoxMin.X), FMath::Min(Lo.Y, BoxMin.Y), FMath::Min(Lo.Z, BoxMin.Z));
-                    Hi = FIntVector(FMath::Max(Hi.X, BoxMax.X), FMath::Max(Hi.Y, BoxMax.Y), FMath::Max(Hi.Z, BoxMax.Z));
+                    OutLo = Asset->GetCoordMin();
+                    OutHi = Asset->GetCoordMax();
                 }
-                Lo = FIntVector(
-                    FMath::Max(Lo.X, Asset->GetCoordMin().X),
-                    FMath::Max(Lo.Y, Asset->GetCoordMin().Y),
-                    FMath::Max(Lo.Z, Asset->GetCoordMin().Z));
-                Hi = FIntVector(
-                    FMath::Min(Hi.X, Asset->GetCoordMax().X),
-                    FMath::Min(Hi.Y, Asset->GetCoordMax().Y),
-                    FMath::Min(Hi.Z, Asset->GetCoordMax().Z));
+                else
+                {
+                    const double LocalReach = Reach / FMath::Max(ActorScale, UE_SMALL_NUMBER);
+                    for (const FProbe& Probe : Probes)
+                    {
+                        const FVector LocalCentre = WorldToLocal.TransformPosition(Probe.Centre);
+                        const FIntVector BoxMin(
+                            FMath::FloorToInt((LocalCentre.X - LocalReach) / CellSize),
+                            FMath::FloorToInt((LocalCentre.Y - LocalReach) / CellSize),
+                            FMath::FloorToInt((LocalCentre.Z - LocalReach) / CellSize));
+                        const FIntVector BoxMax(
+                            FMath::FloorToInt((LocalCentre.X + LocalReach) / CellSize),
+                            FMath::FloorToInt((LocalCentre.Y + LocalReach) / CellSize),
+                            FMath::FloorToInt((LocalCentre.Z + LocalReach) / CellSize));
+                        OutLo = FIntVector(
+                            FMath::Min(OutLo.X, BoxMin.X), FMath::Min(OutLo.Y, BoxMin.Y), FMath::Min(OutLo.Z, BoxMin.Z));
+                        OutHi = FIntVector(
+                            FMath::Max(OutHi.X, BoxMax.X), FMath::Max(OutHi.Y, BoxMax.Y), FMath::Max(OutHi.Z, BoxMax.Z));
+                    }
+                    OutLo = FIntVector(
+                        FMath::Max(OutLo.X, Asset->GetCoordMin().X),
+                        FMath::Max(OutLo.Y, Asset->GetCoordMin().Y),
+                        FMath::Max(OutLo.Z, Asset->GetCoordMin().Z));
+                    OutHi = FIntVector(
+                        FMath::Min(OutHi.X, Asset->GetCoordMax().X),
+                        FMath::Min(OutHi.Y, Asset->GetCoordMax().Y),
+                        FMath::Min(OutHi.Z, Asset->GetCoordMax().Z));
+                }
+            };
+            FIntVector Lo;
+            FIntVector Hi;
+            WalkBox(FloorRadiusWalk, Lo, Hi);
+            FIntVector DrawLo = Lo;
+            FIntVector DrawHi = Hi;
+            if (bPreRaiseWalk)
+            {
+                WalkBox(FloorRadius, DrawLo, DrawHi);
             }
 
             for (int32 X = Lo.X; X <= Hi.X; ++X)
@@ -1169,7 +1466,17 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                 {
                     continue;   // most of a city's coordinate box is empty
                 }
-                ++Stats.CellsVisited;
+                // Fix 7 iteration 4: inside the published k's box -- always, unless a raise is pending. A
+                // cell outside it is walked only to price the candidate's pages: it is not counted (the
+                // cells limb and the profile line's `cells` stay the published k's, as every limb does) and
+                // joins no required, look-ahead or wanted set, which therefore do not grow before a commit.
+                const bool bDrawCell = !bPreRaiseWalk
+                    || (X >= DrawLo.X && X <= DrawHi.X && Y >= DrawLo.Y && Y <= DrawHi.Y
+                        && Z >= DrawLo.Z && Z <= DrawHi.Z);
+                if (bDrawCell)
+                {
+                    ++Stats.CellsVisited;
+                }
 
                 const FGaussianSplatPagedCell& Cell = Asset->Cells[CellIndex];
                 if (Cell.Count <= 0 || Cell.TailPageCount <= 0)
@@ -1190,11 +1497,11 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                         FMath::Sqrt(ComputeSquaredDistanceFromBoxToPoint(WorldBox.Min, WorldBox.Max, Centre))
                             - Group.Radius);
                 };
-                const auto PagesFor = [&Cell, HalfFull, MinFraction, FarField](double Distance) -> int32
+                const auto PagesFor = [&Cell, HalfFullDraw, MinFraction, FarField](double Distance) -> int32
                 {
                     // A 0 take (Debug.FarField 1) is under the floor: no tail pages, so a far cell is neither
                     // required nor wanted.
-                    const uint32 Take = GaussianSplatLod::TakeAt(Cell.Count, Distance, HalfFull, MinFraction, FarField);
+                    const uint32 Take = GaussianSplatLod::TakeAt(Cell.Count, Distance, HalfFullDraw, MinFraction, FarField);
                     const int64 TailNeeded = static_cast<int64>(Take) - Cell.FloorCount;
                     return TailNeeded <= 0
                         ? 0
@@ -1206,7 +1513,10 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                 // REQUIRED, from the current pose only (D9: the drawn set is a
                 // function of the current poses and nothing else).
                 const double RequiredDistance = DistanceFrom(Probes[0].Centre);
-                if (PagesFor(RequiredDistance) > 0)
+                // Fix 7 iteration 4: kept, because the pre-raise below wants only the pages past it. 0 outside
+                // the published k's box, where iteration 3 never looked.
+                const int32 RequiredTail = bDrawCell ? PagesFor(RequiredDistance) : 0;
+                if (RequiredTail > 0)
                 {
                     const uint64 CellKey = PageKey(Asset, CellIndex);
                     if (const int32* Found = RequiredCellIndex.Find(CellKey))
@@ -1218,14 +1528,48 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                         if (RequiredDistance < Existing.Distance)
                         {
                             Existing.Distance = RequiredDistance;
-                            Existing.HalfFull = FMath::Max(Existing.HalfFull, HalfFull);
+                            Existing.HalfFull = FMath::Max(Existing.HalfFull, HalfFullDraw);
                         }
                     }
                     else
                     {
                         RequiredCellIndex.Add(CellKey, RequiredCells.Num());
-                        RequiredCells.Add({Asset, CellIndex, RequiredDistance, HalfFull, MinFraction, FarField});
+                        RequiredCells.Add({Asset, CellIndex, RequiredDistance, HalfFullDraw, MinFraction, FarField});
                     }
+                }
+
+                // Fix 7 iteration 4: a pending raise's pages here -- the candidate's take at the CURRENT pose,
+                // which is what the required set holds the tick after the commit, past what it holds now.
+                // Priced by PagesAt itself on a record at HalfFullWalk (x 1.0 is exact), so the prefetch and
+                // the later required set cannot disagree on a page. Prefetch, never required: its own list,
+                // planned after the required pages and never counted among them.
+                if (bPreRaiseWalk)
+                {
+                    const FRequiredCell Candidate{Asset, CellIndex, RequiredDistance, HalfFullWalk, MinFraction, FarField};
+                    const int32 CandidateTail = Candidate.PagesAt(1.0);
+                    if (CandidateTail > RequiredTail)
+                    {
+                        const uint64 CellKey = PageKey(Asset, CellIndex);
+                        if (const int32* Found = PreRaiseCellIndex.Find(CellKey))
+                        {
+                            // A second group: the earlier start and the later end, at the closer distance. The
+                            // expansion drops whatever the required set holds, whichever group asked for it.
+                            FPreRaiseCell& Existing = PreRaiseCells[*Found];
+                            Existing.FromPage = FMath::Min(Existing.FromPage, RequiredTail);
+                            Existing.Pages = FMath::Max(Existing.Pages, CandidateTail);
+                            Existing.Distance = FMath::Min(Existing.Distance, RequiredDistance);
+                        }
+                        else
+                        {
+                            PreRaiseCellIndex.Add(CellKey, PreRaiseCells.Num());
+                            PreRaiseCells.Add(
+                                {Asset, CellIndex, Cell.FirstTailPage, RequiredTail, CandidateTail, RequiredDistance});
+                        }
+                    }
+                }
+                if (!bDrawCell)
+                {
+                    continue;   // the rest is iteration 3's, over iteration 3's cells
                 }
 
                 // Fix 7 iteration 3: the cells around the FURTHEST look-ahead pose, for the controller
@@ -1250,13 +1594,13 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                             if (AheadDistance < Existing.Distance)
                             {
                                 Existing.Distance = AheadDistance;
-                                Existing.HalfFull = FMath::Max(Existing.HalfFull, HalfFull);
+                                Existing.HalfFull = FMath::Max(Existing.HalfFull, HalfFullDraw);
                             }
                         }
                         else
                         {
                             AheadCellIndex.Add(CellKey, AheadCells.Num());
-                            AheadCells.Add({Asset, CellIndex, AheadDistance, HalfFull, MinFraction, FarField});
+                            AheadCells.Add({Asset, CellIndex, AheadDistance, HalfFullDraw, MinFraction, FarField});
                         }
                     }
                 }
@@ -1386,6 +1730,25 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
             Required.Add({Cell.Asset, Cell.CellIndex, PageInCell, GlobalPage, Cell.Distance});
         }
     }
+    // Fix 7 iteration 4: a pending raise's pages, from each cell's required take on, skipping anything
+    // already required (a page only the other group's take holds). Their own set, so the look-ahead below
+    // does not list a page twice and spend the prefetch cap on it a second time. Empty unless pending.
+    TArray<FWantedPage> PreRaise;
+    TSet<uint64> PreRaiseSeen;
+    for (const FPreRaiseCell& PCell : PreRaiseCells)
+    {
+        for (int32 PageInCell = PCell.FromPage; PageInCell < PCell.Pages; ++PageInCell)
+        {
+            const int32 GlobalPage = PCell.FirstTailPage + PageInCell;
+            const uint64 Key = PageKey(PCell.Asset, GlobalPage);
+            if (!RequiredSeen.Contains(Key))
+            {
+                PreRaiseSeen.Add(Key);
+                PreRaise.Add({PCell.Asset, PCell.CellIndex, PageInCell, GlobalPage, PCell.Distance});
+            }
+        }
+    }
+
     // Expand the wanted cells to pages ONCE, here, skipping anything already
     // required -- which is most of the saving, since the two sets overlap heavily
     // near the camera.
@@ -1394,7 +1757,8 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
         for (int32 PageInCell = 0; PageInCell < WCell.Pages; ++PageInCell)
         {
             const int32 GlobalPage = WCell.FirstTailPage + PageInCell;
-            if (!RequiredSeen.Contains(PageKey(WCell.Asset, GlobalPage)))
+            const uint64 Key = PageKey(WCell.Asset, GlobalPage);
+            if (!RequiredSeen.Contains(Key) && (PreRaiseSeen.IsEmpty() || !PreRaiseSeen.Contains(Key)))
             {
                 Wanted.Add({WCell.Asset, WCell.CellIndex, PageInCell, GlobalPage, WCell.Distance});
             }
@@ -1403,6 +1767,8 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
 
     Stats.RequiredPages = Required.Num();
     Stats.WantedPages = Wanted.Num();
+    // Fix 7 iteration 4: `want` stays the look-ahead's; a page both would fetch is counted once, under `pre`.
+    Stats.PreRaisePages = PreRaise.Num();
 
     // ONLY the required set is protected from eviction. A wanted page is prefetch:
     // D4 says it ranks BELOW a required page, and that has to mean it yields its
@@ -1419,6 +1785,9 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     {
         WantedSet.Add(PageKey(Page.Asset, Page.GlobalPage));
     }
+    // Fix 7 iteration 4: a pending raise's pages are wanted too -- ranked with the look-ahead's for
+    // eviction, never protected like a required page.
+    WantedSet.Append(PreRaiseSeen);
 
     // ---- The plan. Uploads first so the order is prefix-per-cell; evictions are
     // chosen only for what the uploads actually need.
@@ -1446,6 +1815,27 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     }
     Plan.RequiredUploads = Plan.Upload.Num();
 
+    // Fix 7 iteration 4: then a pending raise's pages, nearest first and ahead of the look-ahead -- the
+    // pool spends PreRaiseCapBytes of its prefetch cap on them before anything else. Ties go by page, so
+    // one cell's pages stay in prefix order (the pool skips a page that would leave a hole). Those not
+    // resident are PreRaiseMissing, and the raise commits on a tick where that is 0.
+    PreRaise.Sort([](const FWantedPage& A, const FWantedPage& B)
+    {
+        if (A.Distance != B.Distance) { return A.Distance < B.Distance; }
+        if (A.Asset != B.Asset) { return A.Asset < B.Asset; }
+        return A.GlobalPage < B.GlobalPage;
+    });
+    for (const FWantedPage& Page : PreRaise)
+    {
+        if (!IsResident(Page.Asset, Page.GlobalPage))
+        {
+            Plan.Upload.Add({Page.Asset, Page.GlobalPage, Page.CellIndex});
+        }
+    }
+    Plan.PreRaiseUploads = Plan.Upload.Num() - Plan.RequiredUploads;
+    Plan.PreRaiseCapBytes = PreRaiseCapBytes;
+    Stats.PreRaiseMissing = Plan.PreRaiseUploads;
+
     // Then the wanted pages, nearest first: prefetch that will be needed soonest.
     Wanted.Sort([](const FWantedPage& A, const FWantedPage& B) { return A.Distance < B.Distance; });
     for (const FWantedPage& Page : Wanted)
@@ -1462,7 +1852,19 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     // -- LRU is hysteresis except at 100%% occupancy, which is exactly the regime a
     // capped pool creates (review M5).
     const int32 NeedPages = Plan.RequiredUploads - Pool.GetFreePageCount();
-    if (NeedPages > 0)
+    // Fix 7 iteration 4: room for the pre-raise pages the pool will take THIS tick -- at most its cap's
+    // worth. Wanted pages get no room today: with the pool full (resident = cap through most of the
+    // measured drive) every slot an eviction frees goes to a required page, so a prefetch never lands, and
+    // a pre-raise would wait out Ctl.PreRaiseMaxTicks and never commit. That room comes only from cells
+    // nothing wants (see the loop), so it never costs a required, look-ahead or pre-raise page.
+    int32 NeedPreRaise = 0;
+    if (Plan.PreRaiseUploads > 0)
+    {
+        const int64 PageBytes = FGaussianSplatPagePool::SlotsPerPage * FGaussianSplatPagePool::BytesPerSlot;
+        NeedPreRaise = static_cast<int32>(FMath::Min<int64>(Plan.PreRaiseUploads, PreRaiseCapBytes / PageBytes));
+    }
+    const int32 NeedTotal = NeedPages + NeedPreRaise;
+    if (NeedTotal > 0)
     {
         // Candidates are ranked per CELL, not per page. Ranking pages by their own
         // LastNeededTick splits a cell apart -- a deeper page was needed less
@@ -1542,14 +1944,22 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
         int32 Freed = 0;
         for (const FCandidateCell& Cell : Candidates)
         {
+            // Fix 7 iteration 4: the pre-raise's share comes only from cells nothing wants, which sort
+            // first; a cell holding a wanted page yields only to required pages, as before. With nothing
+            // pending NeedTotal is NeedPages and this is the loop it was.
+            const int32 Need = Cell.bWanted ? NeedPages : NeedTotal;
+            if (Freed >= Need)
+            {
+                break;   // only wanted cells are left, and the required pages have their room
+            }
             // Deepest first, so each eviction is that cell's LAST resident page at
             // the moment the pool applies it, and residency stays a prefix.
-            for (int32 PageInCell = Cell.Deepest; PageInCell >= Cell.Shallowest && Freed < NeedPages; --PageInCell)
+            for (int32 PageInCell = Cell.Deepest; PageInCell >= Cell.Shallowest && Freed < Need; --PageInCell)
             {
                 Plan.Evict.Add({Cell.Asset, Cell.FirstTailPage + PageInCell, Cell.CellIndex});
                 ++Freed;
             }
-            if (Freed >= NeedPages)
+            if (Freed >= NeedTotal)
             {
                 break;
             }
@@ -1562,6 +1972,11 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
     if (bPlanApplied)
     {
         Pool.ApplyStreamPlan(MoveTemp(Plan), TickNumber);
+        // Fix 7 iteration 4: what the pool actually prefetched for the pending raise, for its commit line.
+        if (bPreRaiseWalk)
+        {
+            GDetailControl.PendingUploaded += Pool.GetLastStreamStats().PagesPreRaiseUploaded;
+        }
     }
 
     // The required set's hash, for the picture-free determinism check (review m7):
@@ -1595,10 +2010,15 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
         // from. With several egos that is the first one's only; one point is what a record can hold.
         // With no group there is no view, the controller waits, and the zero vector is never used.
         const FVector MemoryCentre = Groups.IsEmpty() ? FVector::ZeroVector : Groups[0].Centre;
-        RunDetailControl(Stats, StartTime, DetailMultiplier, MemoryCentre);
+        RunDetailControl(Stats, StartTime, DetailMultiplier, MemoryCentre, bPreRaise, PreRaiseCapBytes);
     }
     else
     {
+        // Fix 7 iteration 4: switched off mid-raise -- said once, here; the fresh struct has no Pending.
+        if (GDetailControl.Pending > 0.0f)
+        {
+            AbandonPreRaise(GDetailControl, TEXT("the controller was switched off (Ctl.Enable 0)"));
+        }
         GDetailControl = FDetailControl();
         DrainViewReports(GDetailControl);
     }

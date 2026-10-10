@@ -509,6 +509,11 @@ bool FGaussianSplatPagePool::IsStreamingEnabled()
     return ArePagedAssetsEnabled() && CVarStream.GetValueOnAnyThread() != 0;
 }
 
+int64 FGaussianSplatPagePool::GetPrefetchCapBytes()
+{
+    return static_cast<int64>(FMath::Max(0, CVarStreamMaxUploadMB.GetValueOnAnyThread())) * 1024 * 1024;
+}
+
 int32 FGaussianSplatPagePool::AcquirePage()
 {
     if (FreePages.Num() > 0)
@@ -1220,9 +1225,10 @@ void FGaussianSplatPagePool::ApplyStreamPlan(FGaussianSplatStreamPlan&& Plan, in
     // pages are in RAM, so this costs memcpy and PCIe, never a wait on IO -- but it is
     // bounded per tick (see CVarStreamMaxRequiredUploadMB): the GPU side of a 1.2 GB
     // single-tick fill is a dispatch that never ends.
-    const int64 PrefetchCapBytes = static_cast<int64>(FMath::Max(0, CVarStreamMaxUploadMB.GetValueOnAnyThread()))
-        * 1024 * 1024;
+    const int64 PrefetchCapBytes = GetPrefetchCapBytes();
     int64 PrefetchBytes = 0;
+    // Fix 7 iteration 4: the pending raise's share of PrefetchBytes, against Plan.PreRaiseCapBytes.
+    int64 PreRaiseBytes = 0;
     const int32 RequiredCapMB = FMath::Max(0, CVarStreamMaxRequiredUploadMB.GetValueOnAnyThread());
     const int64 RequiredCapBytes = RequiredCapMB > 0 ? static_cast<int64>(RequiredCapMB) * 1024 * 1024 : MAX_int64;
     int64 RequiredBytes = 0;
@@ -1236,6 +1242,9 @@ void FGaussianSplatPagePool::ApplyStreamPlan(FGaussianSplatStreamPlan&& Plan, in
     {
         const FGaussianSplatStreamPage& Page = Plan.Upload[Index];
         const bool bRequired = Index < Plan.RequiredUploads;
+        // Fix 7 iteration 4: a pending raise's prefetch sits between the required pages and the
+        // look-ahead. With PreRaiseUploads 0 nothing is one, and every test below is as before.
+        const bool bPreRaise = !bRequired && Index < Plan.RequiredUploads + Plan.PreRaiseUploads;
 
         const TUniquePtr<FGaussianSplatPoolResidency>* const ResidencySlot = Residencies.Find(Page.Asset);
         FGaussianSplatPoolResidency* Residency = ResidencySlot ? ResidencySlot->Get() : nullptr;
@@ -1270,6 +1279,12 @@ void FGaussianSplatPagePool::ApplyStreamPlan(FGaussianSplatStreamPlan&& Plan, in
         if (!bRequired && PrefetchBytes + Bytes > PrefetchCapBytes)
         {
             continue;   // prefetch stops at the cap
+        }
+        if (bPreRaise && PreRaiseBytes + Bytes > Plan.PreRaiseCapBytes)
+        {
+            // The smaller cap, spent first: the measured raise burst was 49.6-108.8 MiB applied in one
+            // frame, and a pre-raise exists to spread it. What does not fit is re-planned next tick.
+            continue;
         }
         if (bRequired && RequiredBytes + Bytes > RequiredCapBytes)
         {
@@ -1333,6 +1348,11 @@ void FGaussianSplatPagePool::ApplyStreamPlan(FGaussianSplatStreamPlan&& Plan, in
         else
         {
             PrefetchBytes += Bytes;
+            if (bPreRaise)
+            {
+                PreRaiseBytes += Bytes;
+                ++LastStreamStats.PagesPreRaiseUploaded;
+            }
         }
     }
 

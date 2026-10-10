@@ -259,9 +259,12 @@ namespace GaussianSplatProfiling
             //               backwards must print the same number (m7)
             //   ctl         Fix 7's detail controller: k, the window's longest cycle, the
             //               budget-bound views, its state (0 off ... 5 lockout, 6 held by
-            //               place memory), the drop records it holds, and the demand around
-            //               the furthest look-ahead pose as `ahead now/next` (0/0 while it is
-            //               off). The owner's parser reads this exact format.
+            //               place memory, 7 a raise pending), the drop records it holds, and the
+            //               demand around the furthest look-ahead pose as `ahead now/next` (0/0
+            //               while it is off). Fix 7 iteration 4 appends `pre pages/missing`: a
+            //               pending raise's prefetch pages and how many of them were not resident
+            //               when the gate planned (0/0 when nothing is pending; it commits on a
+            //               tick with missing 0). The owner's parser reads this exact format.
             FString StreamText;
             if (bPaged && FGaussianSplatPagePool::IsStreamingEnabled())
             {
@@ -270,7 +273,7 @@ namespace GaussianSplatProfiling
                 StreamText = FString::Printf(
                     TEXT(" | stream req %d want %d resident %d | up %d (%.1f MiB) evict %d short %d thrash %d")
                     TEXT(" | gate %.3f ms upload %.3f ms | m %.4f | cells %d | demand %d cap %d next %d @x%.1f")
-                    TEXT(" | ctl k %.3f cycle %.1f ms bound %d state %d mem %d ahead %d/%d | req# %llx"),
+                    TEXT(" | ctl k %.3f cycle %.1f ms bound %d state %d mem %d ahead %d/%d pre %d/%d | req# %llx"),
                     Gate.RequiredPages,
                     Gate.WantedPages,
                     Gate.ResidentPages,
@@ -294,6 +297,8 @@ namespace GaussianSplatProfiling
                     Gate.CtlMemoryRecords,
                     Gate.DemandAheadNowPages,
                     Gate.DemandAheadPages,
+                    Gate.PreRaisePages,
+                    Gate.PreRaiseMissing,
                     Gate.RequiredHash);
             }
             UE_LOG(
@@ -2329,6 +2334,15 @@ namespace GaussianSplatLod
     double ComputeHalfFull(double FocalPx, float PointSize, float SizeRef, double ActorScale,
                            float MaxFullDistanceM, bool bDetail)
     {
+        // Fix 7 iteration 4: a view's call. Ungated, the multiplier is 1.0f, and x 1.0 is exact in IEEE
+        // arithmetic, so its F' is the double it was while the multiply sat behind `if (bDetail)`.
+        return ComputeHalfFullAt(FocalPx, PointSize, SizeRef, ActorScale, MaxFullDistanceM,
+            bDetail ? FGaussianSplatStreamGate::GetDetailMultiplier() : 1.0f);
+    }
+
+    double ComputeHalfFullAt(double FocalPx, float PointSize, float SizeRef, double ActorScale,
+                             float MaxFullDistanceM, float DetailMultiplier)
+    {
         const float K = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodScreenK.GetValueOnAnyThread());
         const float MinFull = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodMinFullDistance.GetValueOnAnyThread());
         const float DebugHalf = GaussianSplatProfiling::CVarLodDebugHalfFullDistance.GetValueOnAnyThread();
@@ -2346,10 +2360,9 @@ namespace GaussianSplatLod
         // The debug override is scaled too, as it was when the multiply sat after this call.
         // Ctl.Enable 0 publishes exactly 1.0f, and x 1.0 is exact in IEEE arithmetic, so the
         // floor and the cap see the same double they did before the controller existed.
-        if (bDetail)
-        {
-            HalfFull *= static_cast<double>(FGaussianSplatStreamGate::GetDetailMultiplier());
-        }
+        // Iteration 4: the value is the caller's -- the published k for the gate's required set and
+        // a gated view, a pending raise's candidate for the gate's walk, 1.0f for an ungated view.
+        HalfFull *= static_cast<double>(DetailMultiplier);
         HalfFull = FMath::Max(HalfFull, 0.5 * static_cast<double>(MinFull));
         HalfFull = FMath::Max(HalfFull, 1.0);
         // Fix 5 Step 4: the per-actor ceiling, in metres, applied AFTER the detail

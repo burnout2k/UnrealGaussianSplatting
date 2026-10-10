@@ -111,7 +111,9 @@ struct FGaussianSplatGateStats
     // applies from the next one, which is why state 3/4 print the k before the step. CtlCycleMs
     // is the window's largest tick-to-tick wall clock (0 with Ctl.UseCycleTime 0). CtlState:
     // 0 off, 1 hold, 2 dwell, 3 raised this tick, 4 dropped this tick, 5 lockout, 6 a due raise
-    // held by place memory (Ctl.Memory).
+    // held by place memory (Ctl.Memory), 7 a raise pending: its pages are being prefetched while the
+    // views draw at the current k (Ctl.PreRaise). A pending raise commits as 3, so 3 still prints
+    // the k before the step.
     // CtlBudgetBoundViews: views whose OWN budget bisection bound, on the last frame any drew.
     // CtlMemoryRecords: the place-memory drop records held at the end of this tick.
     float CtlMultiplier = 1.0f;
@@ -122,6 +124,12 @@ struct FGaussianSplatGateStats
     uint8 CtlState = 0;
     int32 CtlBudgetBoundViews = 0;
     int32 CtlMemoryRecords = 0;
+    // Fix 7 iteration 4 (r.GaussianSplat.Ctl.PreRaise): while a raise is pending, the tail pages the
+    // candidate k needs at the CURRENT pose beyond the ones this tick's required set holds -- prefetch,
+    // never required, so `short` cannot see them -- and how many of those were not resident when this
+    // tick planned. The raise commits on a tick whose PreRaiseMissing is 0. Both 0 when none is pending.
+    int32 PreRaisePages = 0;
+    int32 PreRaiseMissing = 0;
     double GateMs = 0.0;
 
     // Hash of the required set (asset, cell, page count) over every group. The

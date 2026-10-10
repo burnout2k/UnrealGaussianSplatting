@@ -74,6 +74,13 @@ namespace GaussianSplatLod
     double ComputeHalfFull(double FocalPx, float PointSize, float SizeRef, double ActorScale,
                            float MaxFullDistanceM = 0.0f, bool bDetail = false);
 
+    // Fix 7 iteration 4: the same F' with the detail multiplier GIVEN rather than read from the gate,
+    // so the gate can price a pending raise's candidate k while the views keep drawing at the
+    // published one. ComputeHalfFull is a thin wrapper that passes the published k (bDetail) or 1.0;
+    // the multiply sits exactly where it did -- on the formula term, before the floor and the cap.
+    double ComputeHalfFullAt(double FocalPx, float PointSize, float SizeRef, double ActorScale,
+                             float MaxFullDistanceM, float DetailMultiplier);
+
     // r.GaussianSplat.Debug.FarField (Fix 6 measurement), for the gate's game-thread read:
     // once per gate tick, passed to every TakeAt of that tick. The selection reads the
     // CVar itself on the render thread, once per build.
