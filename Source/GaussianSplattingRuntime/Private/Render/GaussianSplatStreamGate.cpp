@@ -65,9 +65,9 @@ namespace
     // and the views compute exactly what they did before it existed (G7d).
     TAutoConsoleVariable<int32> CVarCtlEnable(
         TEXT("r.GaussianSplat.Ctl.Enable"),
-        0,
-        TEXT("1: the gate raises d_full by Ctl.Step while every limit is clear and lowers it on the windowed drop\n")
-        TEXT("rules, between Ctl.Min and Ctl.Max. 0 (default): the multiplier is 1.0 and none of it runs."),
+        1,
+        TEXT("1 (default since 2026-10-11): the gate raises d_full by Ctl.Step while every limit is clear and lowers it on the windowed drop\n")
+        TEXT("rules, between Ctl.Min and Ctl.Max. 0: the multiplier is 1.0 and none of it runs."),
         ECVF_RenderThreadSafe);
 
     TAutoConsoleVariable<float> CVarCtlMin(
