@@ -270,12 +270,12 @@ namespace
         double Distance = 0.0;      // group centre to the cell's world box, minus the radius
         double HalfFull = 1.0;
         float MinFraction = 0.02f;
-        int32 FarField = 0;         // r.GaussianSplat.Debug.FarField, read once per gate tick (Fix 6 measurement)
+        int32 FarField = 0;         // r.GaussianSplat.LodFarField, read once per gate tick (Fix 6 measurement)
 
         // How many tail pages this cell needs at a given global multiplier. The
         // multiplier scales the full distance, exactly as a view's budget bisection
         // does, so the gate thins the same way the selection would. A 0 take
-        // (Debug.FarField 1) is below the floor like any take under it: no tail pages.
+        // (LodFarField 1) is below the floor like any take under it: no tail pages.
         int32 PagesAt(double Multiplier) const
         {
             const FGaussianSplatPagedCell& Cell = Asset->Cells[CellIndex];
@@ -1499,7 +1499,7 @@ void FGaussianSplatStreamGate::RunGate(UWorld* World)
                 };
                 const auto PagesFor = [&Cell, HalfFullDraw, MinFraction, FarField](double Distance) -> int32
                 {
-                    // A 0 take (Debug.FarField 1) is under the floor: no tail pages, so a far cell is neither
+                    // A 0 take (LodFarField 1) is under the floor: no tail pages, so a far cell is neither
                     // required nor wanted.
                     const uint32 Take = GaussianSplatLod::TakeAt(Cell.Count, Distance, HalfFullDraw, MinFraction, FarField);
                     const int64 TailNeeded = static_cast<int64>(Take) - Cell.FloorCount;

@@ -470,18 +470,24 @@ namespace GaussianSplatProfiling
         TEXT("for one frame, in every view and batch."),
         ECVF_RenderThreadSafe);
 
-    // Fix 6 measurement (fix7-trace-brief.md B): what the far field costs. Applied inside
+    // The far-field knob (Fix 6 Step 0, measured 2026-10-11, fix6-fix7-plan.md section 7). Applied inside
     // GaussianSplatLod::TakeAt, so the views, the gate's required and wanted pages and the look-ahead
     // pricing all see the same take -- in mode 1 the gate stops REQUESTING far tail pages too, not only
     // the views stop drawing them. The baked floor pages stay pinned whatever this says.
-    static TAutoConsoleVariable<int32> CVarDebugFarField(
-        TEXT("r.GaussianSplat.Debug.FarField"),
+    //
+    // Mode 2 trades the decaying far-field prefix for the baked floor: 3.5-6 ms (about 10 %) and 8-26 %
+    // fewer selected splats at the measured poses, paid with visibly smeared far ends of streets (Perry front
+    // 8 % of pixels, San Juan back_right 5 %). Allan's call 2026-10-11: a stored option for a capture so dense
+    // that the pool or the bar binds and nothing else is left, never a default, not used on the current maps.
+    static TAutoConsoleVariable<int32> CVarLodFarField(
+        TEXT("r.GaussianSplat.LodFarField"),
         0,
-        TEXT("Debug, LodMode 1: what a cell beyond its full-detail distance d_full takes, in the views and the gate ")
-        TEXT("alike. 0 (default) = the (d_full / d)^2 prefix, as shipped. 1 = nothing, so the cell neither draws ")
-        TEXT("nor asks for tail pages: the ceiling of what far-field work could save. 2 = the floor take ")
-        TEXT("(LodMinFraction) instead of the decaying prefix. Other values mean 0. Whole-cell views are not ")
-        TEXT("affected."),
+        TEXT("LodMode 1: what a cell beyond its full-detail distance d_full takes, in the views and the gate alike. ")
+        TEXT("0 (default) = the (d_full / d)^2 prefix, as shipped. 2 = the baked floor take (LodMinFraction) instead ")
+        TEXT("of the decaying prefix: about 10 % faster and a quarter fewer selected splats, with the far ends of ")
+        TEXT("streets visibly smeared -- an option for an ultra-dense capture, not for ordinary maps. 1 = MEASUREMENT ")
+        TEXT("ONLY: nothing beyond d_full, the cell neither draws nor asks for tail pages (the ceiling of what any ")
+        TEXT("far-field work could save; it draws holes). Other values mean 0. Whole-cell views are not affected."),
         ECVF_RenderThreadSafe);
 
     int32 GetLodMode()
@@ -1913,7 +1919,7 @@ namespace GaussianSplatLod
         const float DebugHalf = GaussianSplatProfiling::CVarLodDebugHalfFullDistance.GetValueOnRenderThread();
         const float CullMargin = FMath::Max(0.0f, GaussianSplatProfiling::CVarLodCullMargin.GetValueOnRenderThread());
         // Fix 6 measurement: once per selection, never per cell -- TakeAt runs per cell per bisection pass.
-        const int32 FarField = GaussianSplatProfiling::CVarDebugFarField.GetValueOnRenderThread();
+        const int32 FarField = GaussianSplatProfiling::CVarLodFarField.GetValueOnRenderThread();
 
         struct FCandidate
         {
@@ -1999,7 +2005,7 @@ namespace GaussianSplatLod
             {
                 return static_cast<uint32>(Cell.Count);
             }
-            // Shared with the settle gate, so the gate's bound is the same arithmetic. With Debug.FarField 1
+            // Shared with the settle gate, so the gate's bound is the same arithmetic. With LodFarField 1
             // the take can be 0, and TakeAt stays monotone in the full distance (0, then the whole cell once
             // d_full reaches it), so the bisection below and the overflow clamp still hold.
             return GaussianSplatLod::TakeAt(
@@ -2064,7 +2070,7 @@ namespace GaussianSplatLod
         TArray<uint32> Takes;
         Takes.Reserve(Candidates.Num());
         uint64 Total = 0;
-        // Cells whose take is not 0. Before Debug.FarField a take was never 0 (TakeAt's one-splat floor), so this
+        // Cells whose take is not 0. Before LodFarField a take was never 0 (TakeAt's one-splat floor), so this
         // is Takes.Num() unless that knob is 1, and the clamp below is bit-identical without it.
         uint64 DrawingCells = 0;
         for (const FCandidate& Candidate : Candidates)
@@ -2075,7 +2081,7 @@ namespace GaussianSplatLod
         }
 
         // Mode 0's clamp, the last safety net. Only a selection that still overflows at the smallest m, or whole
-        // cells, gets here. A 0 take (Debug.FarField 1) is a cell that draws nothing: it does not count against the
+        // cells, gets here. A 0 take (LodFarField 1) is a cell that draws nothing: it does not count against the
         // one-splat floor, does not get one, and is never trimmed -- `Take - 1` on it would wrap to 4 billion.
         if (Total > Budget && DrawingCells <= Budget)
         {
@@ -2379,12 +2385,12 @@ namespace GaussianSplatLod
 
     int32 GetFarFieldMode()
     {
-        return GaussianSplatProfiling::CVarDebugFarField.GetValueOnAnyThread();
+        return GaussianSplatProfiling::CVarLodFarField.GetValueOnAnyThread();
     }
 
     uint32 TakeAt(int32 CellCount, double Distance, double FullDistance, float MinFraction, int32 FarField)
     {
-        // Fix 6 measurement (r.GaussianSplat.Debug.FarField). FullDistance here is F' = d_full / 2, so
+        // Fix 6 measurement (r.GaussianSplat.LodFarField). FullDistance here is F' = d_full / 2, so
         // Bias x Falloff below first drops under 1 -- the cell stops being whole -- at Distance > 2 x F' = d_full;
         // that is the full-detail radius. Beyond it mode 1 takes nothing and mode 2 the floor take, the same
         // expression the clamp below gives at the floor. Mode 0 never enters, so the shipped arithmetic is

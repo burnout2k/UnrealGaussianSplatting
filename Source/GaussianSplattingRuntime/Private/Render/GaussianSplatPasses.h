@@ -81,7 +81,7 @@ namespace GaussianSplatLod
     double ComputeHalfFullAt(double FocalPx, float PointSize, float SizeRef, double ActorScale,
                              float MaxFullDistanceM, float DetailMultiplier);
 
-    // r.GaussianSplat.Debug.FarField (Fix 6 measurement), for the gate's game-thread read:
+    // r.GaussianSplat.LodFarField (Fix 6 measurement), for the gate's game-thread read:
     // once per gate tick, passed to every TakeAt of that tick. The selection reads the
     // CVar itself on the render thread, once per build.
     int32 GetFarFieldMode();
@@ -90,7 +90,7 @@ namespace GaussianSplatLod
     // from the view origin (or, in the gate, from the group centre minus its
     // radius) to the cell's world box.
     //
-    // FarField is r.GaussianSplat.Debug.FarField, read by the caller ONCE per gate tick
+    // FarField is r.GaussianSplat.LodFarField, read by the caller ONCE per gate tick
     // or selection build, never per cell. 0 is the shipped take, and never 0 splats.
     // 1 returns 0 beyond the full-detail radius -- a cell that neither draws nor asks
     // for pages -- so every caller must treat a 0 take as "nothing", not as one splat.
